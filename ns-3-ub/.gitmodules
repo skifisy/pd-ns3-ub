@@ -1,0 +1,3 @@
+[submodule "scratch/ns-3-ub-tools"]
+    path = scratch/ns-3-ub-tools
+    url = https://gitcode.com/open-usim/ns-3-ub-tools.git

@@ -1,0 +1,103 @@
+*.diff
+*.orig
+*.patch
+*.rej
+
+*.o
+*.pyc
+*.pyo
+
+*.cwnd
+*.dat
+*.log
+*.mob
+*.pcap
+*.plt
+*.routes
+*.tr
+[D|U]l[A-Z][a-z]*Stats.txt
+
+\#*#
+*~
+
+testpy-output
+
+bindings/python/pybindgen/
+
+.venv/
+venv/
+
+ms_print.*
+massif.*
+coverity
+TAGS
+
+.lock-ns3_*
+.ns3rc
+
+build-dir/
+build/
+/.cproject
+/.project
+
+version.cache
+
+.gitlab-ci-local/
+.idea/
+cmake-*/
+vcpkg/
+
+.vs/
+
+# Ignore local cache used by e.g. clangd
+.cache/
+
+# Additional build and cache directories
+cmake-cache/
+__pycache__/
+testpy-output/
+
+# Simulation outputs
+**/runlog/
+**/output/
+.openusim/
+scratch/openusim-generated/
+scratch/debug*/
+scratch/archived/
+scratch/retrans/**
+!scratch/retrans/
+!scratch/retrans/README.md
+!scratch/retrans/retrans_fault_schema.md
+!scratch/retrans/SELE_fast/
+!scratch/retrans/SELE_fast/non_first_tp_packet_loss_markpsn/
+!scratch/retrans/SELE_fast/non_first_tp_packet_loss_markpsn/network_attribute.txt
+!scratch/retrans/SELE_fast/non_first_tp_packet_loss_markpsn/node.csv
+!scratch/retrans/SELE_fast/non_first_tp_packet_loss_markpsn/topology.csv
+!scratch/retrans/SELE_fast/non_first_tp_packet_loss_markpsn/routing_table.csv
+!scratch/retrans/SELE_fast/non_first_tp_packet_loss_markpsn/traffic.csv
+!scratch/retrans/SELE_fast/non_first_tp_packet_loss_markpsn/retrans_fault.csv
+
+# Temporary and backup files
+*.tmp
+*.temp
+*.bak
+*.backup
+
+# OS specific files
+.DS_Store
+Thumbs.db
+._*
+__MACOSX/
+
+# IDE files
+.vscode/
+*.sublime-*
+
+# Project-local git worktrees
+.worktrees/
+
+# Local Codex-generated docs/pages
+.codex/docs/
+
+# Local docs workspace
+docs/

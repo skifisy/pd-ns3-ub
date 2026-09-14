@@ -1,0 +1,734 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>OpenUSim Agent Skills — 专为网络仿真定制的 AI 工具配套规则</title>
+<style>
+*, *::before, *::after { margin: 0; padding: 0; box-sizing: border-box; }
+
+:root {
+    --bg: #ffffff;
+    --bg-hero: linear-gradient(135deg, #e2edfd 0%, #edf3fd 50%, #dde8fb 100%);
+    --bg-section: #f3f3f5;
+    --bg-card: #ffffff;
+    --border: #dedee3;
+    --border-light: #e8e8eb;
+    --text: #18181b;
+    --text-sec: #555c64;
+    --text-third: #8c8c94;
+    --blue: #0f71dd;
+    --blue-l: #4e97e7;
+    --blue-bg: rgba(15,113,221,.06);
+    --blue-bg-2: rgba(15,113,221,.1);
+    --teal: #0bb151;
+    --teal-bg: rgba(11,177,81,.06);
+    --amber: #fa7305;
+    --amber-bg: rgba(250,115,5,.06);
+    --rose: #e60012;
+    --rose-bg: rgba(230,0,18,.06);
+    --r: 12px;
+    --r-lg: 16px;
+    --shadow: 0 3px 8px rgba(111,111,117,.08);
+    --shadow-hover: 0 2px 24px rgba(111,111,117,.15);
+    --f: 'PingFang SC', 'Microsoft YaHei', 'Helvetica Neue', Helvetica, Arial, sans-serif;
+    --mono: 'SF Mono', 'Fira Code', Menlo, monospace;
+}
+
+html { scroll-behavior: smooth; }
+body { font-family: var(--f); background: var(--bg); color: var(--text); line-height: 1.75; }
+.w { max-width: 1080px; margin: 0 auto; padding: 0 24px; }
+
+/* ── Nav ── */
+nav {
+    position: fixed; top: 0; left: 0; right: 0; z-index: 99;
+    background: rgba(255,255,255,.92); backdrop-filter: blur(20px); -webkit-backdrop-filter: blur(20px);
+    border-bottom: 1px solid var(--border-light);
+}
+nav .w { display: flex; align-items: center; justify-content: space-between; height: 64px; }
+nav .logo { font-size: 17px; font-weight: 700; color: var(--text); text-decoration: none; letter-spacing: -.3px; }
+nav .logo em { font-style: normal; color: var(--blue); }
+nav ul { list-style: none; display: flex; gap: 32px; }
+nav a { color: var(--text-sec); text-decoration: none; font-size: 14px; font-weight: 500; transition: color .2s; }
+nav a:hover { color: var(--blue); }
+
+/* ── Hero ── */
+.hero {
+    padding: 160px 0 96px;
+    text-align: center;
+    background: var(--bg-hero);
+    position: relative; overflow: hidden;
+}
+.hero::before {
+    content: ''; position: absolute; inset: 0;
+    background: radial-gradient(ellipse 60% 50% at 50% 0%, rgba(15,113,221,.05) 0%, transparent 70%);
+    pointer-events: none;
+}
+.hero .pill {
+    display: inline-flex; align-items: center; gap: 8px;
+    background: var(--bg-card); border: 1px solid var(--border);
+    border-radius: 100px; padding: 6px 18px 6px 12px;
+    font-size: 13px; color: var(--text-sec); margin-bottom: 32px;
+    box-shadow: var(--shadow);
+}
+.hero .pill i { width: 7px; height: 7px; border-radius: 50%; background: var(--teal); animation: blink 2s infinite; }
+@keyframes blink { 0%,100%{opacity:1} 50%{opacity:.3} }
+.hero h1 { font-size: clamp(40px,5.8vw,64px); font-weight: 800; letter-spacing: -1.5px; line-height: 1.1; margin-bottom: 24px; color: var(--text); }
+.hero h1 b { font-weight: 800; color: var(--blue); }
+.hero > .w > p { font-size: 18px; color: var(--text-sec); max-width: 560px; margin: 0 auto 40px; line-height: 1.8; }
+.btns { display: flex; gap: 14px; justify-content: center; flex-wrap: wrap; }
+.btn {
+    display: inline-flex; align-items: center; gap: 8px;
+    padding: 13px 30px; border-radius: 10px; font-size: 15px; font-weight: 600;
+    text-decoration: none; border: none; cursor: pointer; transition: all .25s ease;
+}
+.btn-p { background: var(--blue); color: #fff; box-shadow: 0 2px 12px rgba(15,113,221,.25); }
+.btn-p:hover { background: var(--blue-l); transform: translateY(-2px); box-shadow: 0 6px 24px rgba(15,113,221,.3); }
+.btn-o { background: var(--bg-card); color: var(--text); border: 1.5px solid var(--border); }
+.btn-o:hover { border-color: var(--blue); color: var(--blue); background: var(--blue-bg); }
+
+/* ── Section common ── */
+section { padding: 96px 0; }
+section.alt { background: var(--bg-section); }
+.stag {
+    display: inline-block; font-size: 12px; font-weight: 700; text-transform: uppercase;
+    letter-spacing: 2px; color: var(--blue);
+    background: var(--blue-bg); padding: 6px 14px; border-radius: 6px;
+    margin-bottom: 16px;
+}
+.sh { font-size: clamp(28px,4.2vw,42px); font-weight: 800; letter-spacing: -.5px; line-height: 1.2; margin-bottom: 16px; }
+.sp { font-size: 17px; color: var(--text-sec); max-width: 560px; margin-bottom: 48px; line-height: 1.8; }
+
+/* ── Quick Start ── */
+.qs-wrap {
+    background: var(--bg-card);
+    border: 1px solid var(--border);
+    border-radius: var(--r-lg);
+    padding: 28px;
+    box-shadow: var(--shadow);
+}
+.qs-top {
+    display: flex;
+    align-items: flex-start;
+    justify-content: space-between;
+    gap: 24px;
+    margin-bottom: 22px;
+}
+.qs-top .sp {
+    margin-bottom: 0;
+    max-width: 620px;
+}
+.qs-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 18px; }
+.qs-step {
+    background: var(--bg-section);
+    border: 1px solid var(--border-light);
+    border-radius: var(--r);
+    padding: 20px;
+}
+.qs-step .num {
+    width: 30px; height: 30px;
+    display: inline-flex; align-items: center; justify-content: center;
+    border-radius: 8px;
+    background: var(--blue); color: #fff;
+    font-size: 13px; font-weight: 800;
+    margin-bottom: 12px;
+}
+.qs-step h4 { font-size: 16px; font-weight: 700; margin-bottom: 8px; }
+.qs-step p { font-size: 14px; color: var(--text-sec); line-height: 1.7; }
+.qs-note {
+    margin-top: 18px;
+    padding: 14px 16px;
+    border-radius: 10px;
+    background: var(--blue-bg);
+    border: 1px solid rgba(15,113,221,.08);
+    font-size: 13px;
+    color: var(--text-sec);
+    line-height: 1.7;
+}
+.qs-note code {
+    font-family: var(--mono);
+    font-size: 12px;
+    color: var(--text);
+}
+
+/* ── Conversation demos ── */
+.demo-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 20px; }
+.demo {
+    background: var(--bg-card); border: 1px solid var(--border);
+    border-radius: var(--r-lg); padding: 28px;
+    box-shadow: var(--shadow); transition: all .3s ease;
+}
+.demo:hover { box-shadow: var(--shadow-hover); transform: translateY(-3px); border-color: rgba(15,113,221,.18); }
+.msg { display: flex; gap: 12px; margin-bottom: 16px; }
+.msg .av {
+    width: 32px; height: 32px; border-radius: 10px;
+    display: flex; align-items: center; justify-content: center;
+    font-size: 14px; flex-shrink: 0;
+}
+.msg .av.u { background: var(--blue-bg-2); }
+.msg .av.a { background: var(--teal-bg); }
+.msg .bbl { font-size: 14.5px; line-height: 1.65; }
+.msg .bbl.ut { color: var(--text); font-weight: 500; }
+.msg .bbl.at { color: var(--text-sec); font-size: 13.5px; }
+.tag {
+    display: inline-block; font-size: 11px; font-weight: 600;
+    text-transform: uppercase; letter-spacing: .6px;
+    padding: 4px 12px; border-radius: 6px; margin-top: 4px;
+}
+.tag.t1 { background: var(--blue-bg); color: var(--blue); }
+.tag.t2 { background: var(--amber-bg); color: var(--amber); }
+.tag.t3 { background: var(--rose-bg); color: var(--rose); }
+.tag.t4 { background: var(--teal-bg); color: var(--teal); }
+
+/* ── Journey steps ── */
+.journey { counter-reset: step; }
+.jstep {
+    display: flex;
+    gap: 28px;
+    padding: 32px 0;
+    border-bottom: 1px solid var(--border-light);
+}
+.jstep:last-child { border-bottom: none; }
+.jstep .num {
+    width: 52px; height: 52px; flex-shrink: 0;
+    background: var(--blue);
+    border-radius: 14px;
+    display: flex; align-items: center; justify-content: center;
+    font-size: 20px; font-weight: 800; color: #fff;
+    box-shadow: 0 2px 10px rgba(15,113,221,.2);
+}
+.jstep .jbody { flex: 1; min-width: 0; }
+.jstep h4 { font-size: 18px; font-weight: 700; margin-bottom: 8px; }
+.jstep p { font-size: 15px; color: var(--text-sec); line-height: 1.7; }
+.jstep .eg {
+    margin-top: 14px;
+    background: var(--bg-section);
+    border: 1px solid var(--border-light);
+    border-radius: 10px;
+    padding: 16px 20px;
+    font-size: 14px; color: var(--text-sec); line-height: 1.7;
+}
+.jstep .eg strong { color: var(--text); font-weight: 600; }
+
+/* ── Features ── */
+.feat-grid { display: grid; grid-template-columns: repeat(3,1fr); gap: 20px; }
+.feat {
+    background: var(--bg-card); border: 1px solid var(--border);
+    border-radius: var(--r-lg); padding: 32px;
+    box-shadow: var(--shadow); transition: all .3s ease;
+}
+.feat:hover { box-shadow: var(--shadow-hover); transform: translateY(-3px); border-color: rgba(15,113,221,.18); }
+.feat .fi { font-size: 28px; margin-bottom: 16px; }
+.feat h3 { font-size: 17px; font-weight: 700; margin-bottom: 8px; }
+.feat p { font-size: 14px; color: var(--text-sec); line-height: 1.7; }
+
+/* ── Scenes ── */
+.scene-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 20px; }
+.scene {
+    background: var(--bg-card); border: 1px solid var(--border);
+    border-radius: var(--r-lg); padding: 28px;
+    box-shadow: var(--shadow); transition: all .3s ease;
+}
+.scene:hover { box-shadow: var(--shadow-hover); transform: translateY(-3px); border-color: rgba(15,113,221,.18); }
+.scene h4 { font-size: 16px; font-weight: 700; margin-bottom: 8px; }
+.scene p { font-size: 14px; color: var(--text-sec); line-height: 1.65; }
+.scene .prompt {
+    margin-top: 14px;
+    background: var(--blue-bg);
+    border: 1px solid rgba(15,113,221,.08);
+    border-radius: 10px;
+    padding: 12px 16px;
+    font-size: 13px; color: var(--blue); line-height: 1.6;
+    font-style: italic;
+}
+.scene .prompt::before { content: none; }
+
+/* ── Preset scenarios ── */
+.preset-grid { display: grid; grid-template-columns: repeat(4,1fr); gap: 20px; }
+.preset {
+    background: var(--bg-card); border: 1px solid var(--border);
+    border-radius: var(--r-lg); padding: 28px; text-align: center;
+    box-shadow: var(--shadow); transition: all .3s ease;
+}
+.preset:hover { box-shadow: var(--shadow-hover); transform: translateY(-3px); border-color: rgba(15,113,221,.18); }
+.preset .pi { font-size: 32px; margin-bottom: 14px; }
+.preset h4 { font-size: 15px; font-weight: 700; margin-bottom: 6px; }
+.preset p { font-size: 13px; color: var(--text-sec); line-height: 1.65; }
+.preset .ptag {
+    display: inline-block; margin-top: 12px;
+    font-size: 11px; font-weight: 600; letter-spacing: .5px;
+    padding: 4px 12px; border-radius: 6px;
+}
+.preset .ptag.p1 { background: var(--teal-bg); color: var(--teal); }
+.preset .ptag.p2 { background: var(--blue-bg); color: var(--blue); }
+.preset .ptag.p3 { background: var(--amber-bg); color: var(--amber); }
+.preset .ptag.p4 { background: var(--rose-bg); color: var(--rose); }
+
+/* ── Callout ── */
+.callout {
+    background: var(--amber-bg);
+    border: 1px solid rgba(250,115,5,.15);
+    border-left: 4px solid var(--amber);
+    border-radius: var(--r);
+    padding: 24px 28px;
+    margin-bottom: 48px;
+}
+.callout .callout-title {
+    font-size: 15px; font-weight: 700; color: var(--amber);
+    margin-bottom: 8px; display: flex; align-items: center; gap: 8px;
+}
+.callout p { font-size: 14px; color: var(--text-sec); line-height: 1.7; margin-bottom: 6px; }
+.callout code {
+    background: rgba(0,0,0,.05); padding: 2px 6px; border-radius: 4px;
+    font-family: var(--mono); font-size: 13px; color: var(--text);
+}
+.callout a { color: var(--blue); text-decoration: none; font-weight: 600; }
+.callout a:hover { text-decoration: underline; }
+.callout ol { padding-left: 20px; margin-top: 8px; }
+.callout ol li { font-size: 14px; color: var(--text-sec); line-height: 1.8; }
+
+/* ── FAQ ── */
+.faq-item { border-bottom: 1px solid var(--border-light); padding: 28px 0; }
+.faq-item:last-child { border-bottom: none; }
+.faq-item h4 { font-size: 17px; font-weight: 700; margin-bottom: 8px; }
+.faq-item p { font-size: 15px; color: var(--text-sec); line-height: 1.75; }
+
+/* ── CTA ── */
+.cta-section {
+    text-align: center;
+    padding: 96px 0;
+    background: var(--bg-hero);
+    position: relative; overflow: hidden;
+}
+.cta-section::before {
+    content: ''; position: absolute; inset: 0;
+    background: radial-gradient(ellipse 50% 60% at 50% 100%, rgba(15,113,221,.06) 0%, transparent 70%);
+    pointer-events: none;
+}
+
+/* ── Footer ── */
+footer { border-top: 1px solid var(--border-light); padding: 40px 0; background: var(--bg-section); }
+footer .w { display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 16px; }
+footer .c { font-size: 13px; color: var(--text-third); }
+footer ul { list-style: none; display: flex; gap: 24px; }
+footer a { color: var(--text-sec); text-decoration: none; font-size: 13px; transition: color .2s; }
+footer a:hover { color: var(--blue); }
+
+/* ── Icons ── */
+svg.ico { display: block; fill: none; stroke: currentColor; stroke-width: 2; stroke-linecap: round; stroke-linejoin: round; }
+.feat .fi { display: flex; align-items: center; justify-content: center; width: 44px; height: 44px; border-radius: 12px; background: var(--blue-bg); color: var(--blue); }
+.feat .fi svg { width: 22px; height: 22px; }
+.preset .pi { display: flex; align-items: center; justify-content: center; width: 52px; height: 52px; border-radius: 14px; margin: 0 auto 12px; }
+.preset .pi svg { width: 26px; height: 26px; }
+.preset .pi.c1 { background: var(--teal-bg); color: var(--teal); }
+.preset .pi.c2 { background: var(--blue-bg); color: var(--blue); }
+.preset .pi.c3 { background: var(--amber-bg); color: var(--amber); }
+.preset .pi.c4 { background: var(--rose-bg); color: var(--rose); }
+.callout .callout-title svg { width: 18px; height: 18px; flex-shrink: 0; }
+.msg .av svg { width: 16px; height: 16px; }
+.msg .av.u { color: var(--blue); }
+.msg .av.a { color: var(--teal); }
+.scene .prompt { padding-left: 14px; }
+
+/* ── Skip link ── */
+.skip-link { position: absolute; left: -9999px; top: auto; width: 1px; height: 1px; overflow: hidden; }
+.skip-link:focus { position: fixed; top: 12px; left: 12px; width: auto; height: auto; padding: 10px 20px; background: var(--blue); color: #fff; border-radius: 8px; font-size: 14px; font-weight: 600; text-decoration: none; z-index: 9999; box-shadow: 0 4px 16px rgba(0,0,0,.15); }
+
+/* ── Accessibility ── */
+:focus-visible { outline: 2px solid var(--blue); outline-offset: 2px; }
+.btn:focus-visible { outline-offset: 3px; }
+
+/* ── Hamburger ── */
+.ham { display: none; background: none; border: none; padding: 8px; cursor: pointer; color: var(--text); border-radius: 6px; transition: background .2s; }
+.ham:hover { background: var(--blue-bg); }
+.ham svg { width: 22px; height: 22px; display: block; }
+
+@media (prefers-reduced-motion: reduce) {
+    *, *::before, *::after { animation-duration: 0.01ms !important; animation-iteration-count: 1 !important; transition-duration: 0.01ms !important; }
+    html { scroll-behavior: auto; }
+}
+
+@media(max-width:768px){
+    .demo-grid, .scene-grid { grid-template-columns: 1fr; }
+    .feat-grid { grid-template-columns: 1fr; }
+    .qs-grid { grid-template-columns: 1fr; }
+    .qs-top { flex-direction: column; }
+    .preset-grid { grid-template-columns: 1fr 1fr; }
+    .hero { padding: 130px 0 72px; }
+    .hero h1 { font-size: clamp(32px,8vw,44px); letter-spacing: -1px; }
+    section { padding: 72px 0; }
+    nav ul { display: none; }
+    nav ul.open { display: flex; flex-direction: column; position: absolute; top: 64px; left: 0; right: 0; background: rgba(255,255,255,.98); backdrop-filter: blur(20px); -webkit-backdrop-filter: blur(20px); border-bottom: 1px solid var(--border); padding: 16px 24px; gap: 4px; box-shadow: 0 8px 24px rgba(0,0,0,.06); }
+    nav ul.open a { font-size: 16px; padding: 10px 0; display: block; }
+    .ham { display: flex; align-items: center; justify-content: center; }
+    .jstep { flex-direction: column; gap: 16px; }
+}
+</style>
+</head>
+<body>
+
+<svg xmlns="http://www.w3.org/2000/svg" aria-hidden="true" style="position:absolute;width:0;height:0;overflow:hidden">
+<defs>
+<symbol id="i-user" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="8" r="5"/><path d="M20 21a8 8 0 0 0-16 0"/></symbol>
+<symbol id="i-bot" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="4" y="8" width="16" height="12" rx="2"/><path d="M9 13v2M15 13v2M12 8V4"/></symbol>
+<symbol id="i-book" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 19.5v-15A2.5 2.5 0 0 1 6.5 2H20v20H6.5a2.5 2.5 0 0 1 0-5H20"/></symbol>
+<symbol id="i-folder" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 20a2 2 0 0 0 2-2V8a2 2 0 0 0-2-2h-7.9a2 2 0 0 1-1.69-.9L9.6 3.9A2 2 0 0 0 7.93 3H4a2 2 0 0 0-2 2v13a2 2 0 0 0 2 2z"/></symbol>
+<symbol id="i-scope" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="8"/><path d="m21 21-4.3-4.3M11 8v6M8 11h6"/></symbol>
+<symbol id="i-flask" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M10 2v7.527a2 2 0 0 1-.211.896L4.72 20.55a1 1 0 0 0 .9 1.45h12.76a1 1 0 0 0 .9-1.45l-5.069-10.127A2 2 0 0 1 14 9.527V2"/><path d="M8.5 2h7"/></symbol>
+<symbol id="i-search" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="8"/><path d="m21 21-4.3-4.3"/></symbol>
+<symbol id="i-shield" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 13c0 5-3.5 7.5-7.66 8.95a1 1 0 0 1-.67-.01C7.5 20.5 4 18 4 13V6a1 1 0 0 1 1-1c2 0 4.5-1.2 6.24-2.72a1.17 1.17 0 0 1 1.52 0C14.51 3.81 17 5 19 5a1 1 0 0 1 1 1z"/></symbol>
+<symbol id="i-radio" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4.9 19.1C1 15.2 1 8.8 4.9 4.9M7.8 16.2c-2.3-2.3-2.3-6.1 0-8.5"/><circle cx="12" cy="12" r="2"/><path d="M16.2 7.8c2.3 2.3 2.3 6.1 0 8.5M19.1 4.9C23 8.8 23 15.1 19.1 19"/></symbol>
+<symbol id="i-compare" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="18" cy="18" r="3"/><circle cx="6" cy="6" r="3"/><path d="M13 6h3a2 2 0 0 1 2 2v7M11 18H8a2 2 0 0 1-2-2V9"/></symbol>
+<symbol id="i-globe" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><path d="M12 2a14.5 14.5 0 0 0 0 20 14.5 14.5 0 0 0 0-20M2 12h20"/></symbol>
+<symbol id="i-hex" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 16V8a2 2 0 0 0-1-1.73l-7-4a2 2 0 0 0-2 0l-7 4A2 2 0 0 0 3 8v8a2 2 0 0 0 1 1.73l7 4a2 2 0 0 0 2 0l7-4A2 2 0 0 0 21 16z"/></symbol>
+<symbol id="i-alert" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m21.73 18-8-14a2 2 0 0 0-3.48 0l-8 14A2 2 0 0 0 4 21h16a2 2 0 0 0 1.73-3"/><path d="M12 9v4M12 17h.01"/></symbol>
+<symbol id="i-menu" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 12h16M4 6h16M4 18h16"/></symbol>
+<symbol id="i-x" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M18 6 6 18M6 6l12 12"/></symbol>
+</defs>
+</svg>
+
+<a href="#main" class="skip-link">跳到主要内容</a>
+
+<nav>
+    <div class="w">
+        <a href="#" class="logo">OpenUSim <em>Agent Skills</em></a>
+        <ul id="nav-menu">
+            <li><a href="#start">如何开始</a></li>
+            <li><a href="#explore">能做什么</a></li>
+            <li><a href="#faq">常见问题</a></li>
+        </ul>
+        <button class="ham" aria-label="菜单" aria-expanded="false" onclick="var m=document.getElementById('nav-menu');var o=m.classList.toggle('open');this.setAttribute('aria-expanded',o);this.querySelector('use').setAttribute('href',o?'#i-x':'#i-menu')"><svg class="ico"><use href="#i-menu"/></svg></button>
+    </div>
+</nav>
+
+<!-- ═══ Hero ═══ -->
+<main id="main">
+<section class="hero">
+    <div class="w">
+        <div class="pill"><i></i>OpenUSim 配套 Agent Skills</div>
+        <h1>网络仿真专项<br><b>Agent Skills</b></h1>
+        <p>Agent Skills 是随代码迭代演进的规则文件。支持这套机制的 AI 工具在打开仓库后，就能直接读取规则、调用 tools、复用知识卡，再按项目事实给建议。</p>
+        <div class="btns">
+            <a href="openusim-landing.html" class="btn btn-p">返回平台首页</a>
+            <a href="#quickstart" class="btn btn-o">看看怎么用</a>
+        </div>
+    </div>
+</section>
+
+<!-- ═══ Quick Start ═══ -->
+<section id="quickstart">
+    <div class="w">
+        <div class="qs-wrap">
+            <div class="qs-top">
+                <div>
+                    <div class="stag">Quick Start</div>
+                    <h2 class="sh" style="margin-bottom:10px;">打开仓库后，三步开始用 skills</h2>
+                </div>
+                <p class="sp">重点不是先学一套新命令，而是直接在仓库里提问题、给目标、看结果。支持这套机制的 AI 工具会顺着仓库内的技能文件和规则继续往下做。</p>
+            </div>
+            <div class="qs-grid">
+                <div class="qs-step">
+                    <div class="num">1</div>
+                    <h4>打开仓库</h4>
+                    <p>用支持规则和 skills 的 AI 工具打开这个仓库。进入仓库后，相关技能文件、知识卡和规则就能接入上下文。</p>
+                </div>
+                <div class="qs-step">
+                    <div class="num">2</div>
+                    <h4>直接说目标</h4>
+                    <p>不用先背目录。直接说你想跑什么、比较什么、哪里看不懂，例如想改 case、查参数、读结果或理解协议行为。</p>
+                </div>
+                <div class="qs-step">
+                    <div class="num">3</div>
+                    <h4>让 skills 接着做</h4>
+                    <p>后续会按仓库规则继续推进：该调 tools 就调 tools，该复用知识卡就复用知识卡，需要时再回到源码、参数和结果文件核对。</p>
+                </div>
+            </div>
+            <div class="qs-note">
+                可以直接这样开始：<code>我想比较 CBFC 和 PFC 的队列行为</code>、<code>帮我看看这个 case 该从哪里改</code>、<code>这个结果为什么吞吐掉下来了</code>。
+            </div>
+        </div>
+    </div>
+</section>
+
+<!-- ═══ 能加速什么 ═══ -->
+<section>
+    <div class="w">
+        <div style="text-align:center; margin-bottom:40px;">
+            <div class="stag">能加速什么</div>
+            <h2 class="sh" style="margin:0 auto 12px;">定位入口、组织实验、解释结果</h2>
+        </div>
+        <div class="demo-grid">
+            <div class="demo">
+                <div class="msg"><div class="av u"><svg class="ico"><use href="#i-user"/></svg></div><div class="bbl ut">帮我跑一下 32 节点 Clos 网络的 Pod 间流量，看看吞吐量</div></div>
+                <div class="msg"><div class="av a"><svg class="ico"><use href="#i-bot"/></svg></div><div class="bbl at">我先把你的目标映射到现有场景。`clos_32hosts_pod2pod` 最接近；如果沿用默认 400Gbps 和 ECMP，我接下来会整理运行命令并说明要看哪些输出文件。</div></div>
+                <span class="tag t1">场景定位与实验入口</span>
+            </div>
+            <div class="demo">
+                <div class="msg"><div class="av u"><svg class="ico"><use href="#i-user"/></svg></div><div class="bbl ut">帮我对比 Clos 网络下包喷洒和默认 Hash 路由的表现差异</div></div>
+                <div class="msg"><div class="av a"><svg class="ico"><use href="#i-bot"/></svg></div><div class="bbl at">这是一个很适合复用现成 case 的对比实验。我会把 `pod2pod` 和 `pod2pod_packet-spray` 两组配置对应起来，再按相同指标整理结果，避免比较口径不一致。</div></div>
+                <span class="tag t2">对比实验组织</span>
+            </div>
+            <div class="demo">
+                <div class="msg"><div class="av u"><svg class="ico"><use href="#i-user"/></svg></div><div class="bbl ut">UB 的传输层拥塞控制是怎么工作的？</div></div>
+                <div class="msg"><div class="av a"><svg class="ico"><use href="#i-bot"/></svg></div><div class="bbl at">我会把规范里的机制和代码入口对起来讲清楚。当前实现里，C-AQM 走的是交换机标记、接收端聚合反馈、发送端调窗这条闭环，关键代码在 `ub-caqm` 和 `ub-transport`。</div></div>
+                <span class="tag t3">规范与代码对读</span>
+            </div>
+            <div class="demo">
+                <div class="msg"><div class="av u"><svg class="ico"><use href="#i-user"/></svg></div><div class="bbl ut">我有个新的自适应路由想法，根据队列深度动态调权重，帮我实现并验证</div></div>
+                <div class="msg"><div class="av a"><svg class="ico"><use href="#i-bot"/></svg></div><div class="bbl at">我能先帮你定位算法入口、梳理参数和验证路径。比如当前路由逻辑的关键入口在 `SelectAdaptiveOutPort()`，后续再基于 `routing-adaptive` 场景设计验证步骤。</div></div>
+                <span class="tag t4">实现入口与验证路径</span>
+            </div>
+        </div>
+    </div>
+</section>
+
+<!-- ═══ 快速上手 ═══ -->
+<section id="start" class="alt">
+    <div class="w">
+        <div class="stag">如何开始</div>
+        <h2 class="sh">从打开仓库到推进一组实验</h2>
+        <p class="sp">Agent Skills 把目标、入口、参数和输出文件串起来，让你少花时间翻目录，多花时间做实验。</p>
+
+        <div class="callout">
+            <div class="callout-title"><svg class="ico"><use href="#i-alert"/></svg>涉及协议细节时，建议先准备规范文档</div>
+            <p>如果你的任务涉及协议语义解释、实现补齐或和规范逐条对照，建议先把相关 PDF 放进仓库。这样 Agent 的解释更有依据；如果你只是先跑现成场景，这一步不是前提。</p>
+            <ol>
+                <li>前往 <a href="https://www.unifiedbus.com/zh" target="_blank">灵衢官网 (unifiedbus.com)</a> 下载《灵衢基础规范》PDF</li>
+                <li>将 PDF 放入项目的 <code>dev-knowledge/specification/</code> 目录</li>
+                <li>如果研究会涉及 CHI，也可以把对应规范放到同一目录</li>
+            </ol>
+            <p style="margin-top:8px;">准备好之后，Agent 在解释协议问题或辅助实现时，就能把代码、文档和实验现象放在一起交叉核对。</p>
+        </div>
+
+        <div class="journey">
+            <div class="jstep">
+                <div class="num">1</div>
+                <div class="jbody">
+                    <h4>先说明你的研究目标</h4>
+                    <p>先把目标说清楚，例如你想比较哪种路由、观察哪类结果、或者理解哪段实现。Agent Skills 会帮助你把问题映射到仓库里的现有入口。</p>
+                    <div class="eg">
+                        <strong>你说：</strong>"我想看看 Clos 网络里 Pod 间通信的吞吐量表现"<br>
+                        <strong>Agent：</strong>先定位 `clos_32hosts_pod2pod`，再说明应该如何运行以及输出里该看什么
+                    </div>
+                </div>
+            </div>
+            <div class="jstep">
+                <div class="num">2</div>
+                <div class="jbody">
+                    <h4>让 Agent 帮你对齐入口和参数</h4>
+                    <p>Agent 会帮助你识别现成场景、相关脚本、关键参数和结果目录，避免你一上来就在配置文件和源码之间来回跳。</p>
+                    <div class="eg">
+                        <strong>你说：</strong>"把带宽改成 200Gbps，跑 10 个流"<br>
+                        <strong>Agent：</strong>指出这些参数分别落在哪些配置项里，并整理新的运行命令与检查点
+                    </div>
+                </div>
+            </div>
+            <div class="jstep">
+                <div class="num">3</div>
+                <div class="jbody">
+                    <h4>围绕结果继续追问</h4>
+                    <p>仿真跑完后，Agent 可以把 `task_statistics.csv`、`throughput.csv` 和源码中的相关逻辑一起串起来，帮助你判断哪些现象有证据支持，哪些还需要继续验证。</p>
+                    <div class="eg">
+                        <strong>你说：</strong>"第 3 个流为什么慢了 2 倍？"<br>
+                        <strong>Agent：</strong>先对比端口吞吐和任务完成时间，再提示可能的拥塞热点与还需补查的证据
+                    </div>
+                </div>
+            </div>
+            <div class="jstep">
+                <div class="num">4</div>
+                <div class="jbody">
+                    <h4>在人工确认下继续迭代</h4>
+                    <p>后续可以让 Agent 帮你整理下一轮实验、定位实现入口、补充验证命令，但策略是否合理、结论是否成立，仍然由研究者自己把关。</p>
+                    <div class="eg">
+                        <strong>你说：</strong>"换成自适应路由再跑一遍，和刚才的结果对比"<br>
+                        <strong>Agent：</strong>切到 `routing-adaptive` 相关入口，并按相同指标组织两组结果对比
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+</section>
+
+<!-- ═══ 为什么有用 ═══ -->
+<section>
+    <div class="w">
+        <div class="stag">为什么更准</div>
+        <h2 class="sh">先查项目事实，再给建议</h2>
+        <p class="sp">普通对话常按通用经验回答。Agent Skills 先读仓库规则、定位实验入口、调用项目内 tools、核对输出文件，再给建议；同时复用知识卡里的项目经验与判断规则。这样更容易减少大模型幻觉，也更方便追溯结论依据。</p>
+        <div class="feat-grid">
+            <div class="feat">
+                <div class="fi"><svg class="ico"><use href="#i-book"/></svg></div>
+                <h3>读取项目约束</h3>
+                <p>进入仓库后，先读取规则和说明文件，对齐目录职责、命令口径和修改边界，再继续往下做。</p>
+            </div>
+            <div class="feat">
+                <div class="fi"><svg class="ico"><use href="#i-folder"/></svg></div>
+                <h3>识别现成入口</h3>
+                <p>先把你的问题映射到现成 case、脚本和结果文件，不用每次都从文件树里重新找入口。</p>
+            </div>
+            <div class="feat">
+                <div class="fi"><svg class="ico"><use href="#i-scope"/></svg></div>
+                <h3>优先使用 tools</h3>
+                <p>在仿真配置生成、真实参数查询和输出整理上，优先调用项目内 tools，少靠大模型凭空补全，做事更稳也更快。</p>
+            </div>
+            <div class="feat">
+                <div class="fi"><svg class="ico"><use href="#i-flask"/></svg></div>
+                <h3>解释实验输出</h3>
+                <p>仿真完成后，围绕任务完成时间、链路吞吐等结果文件组织解释，并把判断尽量落到具体输出和代码路径上。</p>
+            </div>
+            <div class="feat">
+                <div class="fi"><svg class="ico"><use href="#i-search"/></svg></div>
+                <h3>复用知识卡经验</h3>
+                <p>知识卡沉淀项目里的专家经验、稳定结论和排查规则。问到相关问题时，可直接复用这些经验，不必每次从零梳理。</p>
+            </div>
+            <div class="feat">
+                <div class="fi"><svg class="ico"><use href="#i-shield"/></svg></div>
+                <h3>提示风险边界</h3>
+                <p>已有证据和暂时猜测会分开说明，避免把一次结果、示例配置或局部现象直接当成最终结论。</p>
+            </div>
+        </div>
+    </div>
+</section>
+
+<!-- ═══ 研究记忆 ═══ -->
+<section class="alt">
+    <div class="w">
+        <div class="stag">研究记忆</div>
+        <h2 class="sh">让每次实验的发现都留下来</h2>
+        <p class="sp">仿真研究的价值在于不断积累。Agent Skills 可以把每次对话里重要的判断和发现写成知识卡，留给下一轮实验继续复用，不必每次都从零交代背景。</p>
+        <div class="feat-grid" style="margin-bottom:32px;">
+            <div class="feat">
+                <div class="fi"><svg class="ico"><use href="#i-book"/></svg></div>
+                <h3>重要发现可以留存</h3>
+                <p>每次实验里形成的关键结论、配置边界和现象规律，都可以写进知识卡，以后随时调出来用，不会随着对话窗口关闭而消失。</p>
+            </div>
+            <div class="feat">
+                <div class="fi"><svg class="ico"><use href="#i-compare"/></svg></div>
+                <h3>新实验关联旧经验</h3>
+                <p>下一轮实验开始时，当前问题可以先和已有知识卡对上，之前记下的关键线索能直接继续用，不需要重新交代背景。</p>
+            </div>
+            <div class="feat">
+                <div class="fi"><svg class="ico"><use href="#i-scope"/></svg></div>
+                <h3>知识卡会持续充实</h3>
+                <p>随着知识卡持续充实，后续对话能直接复用更多项目经验；新的稳定结论也可以继续写回知识卡。</p>
+            </div>
+        </div>
+        <div class="skill-demo">
+            <div class="msg">
+                <div class="av u"><svg class="ico"><use href="#i-user"/></svg></div>
+                <div class="bbl ut">我想继续看 CBFC 满负载下的时延问题</div>
+            </div>
+            <div class="msg">
+                <div class="av a"><svg class="ico"><use href="#i-bot"/></svg></div>
+                <div class="bbl at">上一轮实验记录了：满负载下 P99 偏高，初步判断和流控水线设置有关。你想从这个结论继续推进，还是先换一组参数对比确认？</div>
+            </div>
+            <div class="msg">
+                <div class="av u"><svg class="ico"><use href="#i-user"/></svg></div>
+                <div class="bbl ut">先换参数对比确认</div>
+            </div>
+            <div class="msg">
+                <div class="av a"><svg class="ico"><use href="#i-bot"/></svg></div>
+                <div class="bbl at">好，我把上次的水线配置和新参数并排列出来，结果出来之后可以直接对比，看差异是否和水线有关。</div>
+            </div>
+        </div>
+    </div>
+</section>
+
+<!-- ═══ 深入探索 ═══ -->
+<section id="explore" class="alt" style="background:var(--bg);">
+    <div class="w">
+        <div class="stag">能做什么</div>
+        <h2 class="sh">覆盖从上手到深入的常见任务</h2>
+        <p class="sp">Agent Skills 补足了 AI 工具缺少的项目上下文。下面这些场景里，更适合先拿它来定位入口、对齐参数和解释结果。</p>
+        <div class="scene-grid">
+            <div class="scene">
+                <h4>解释规范与代码的对应关系</h4>
+                <p>遇到这类问题时，会先把规范条款和代码入口对起来，再解释语义，不用你手动来回翻文档。</p>
+                <div class="prompt">UB 的流量控制是怎么实现的？信用机制和 PFC 有什么区别？</div>
+            </div>
+            <div class="scene">
+                <h4>定位代码插入点</h4>
+                <p>遇到实现问题时，会先找路由、拥塞控制和调度相关入口，再说明改动大概会影响哪些模块。</p>
+                <div class="prompt">实现一个基于端口负载差异的加权路由，入口在哪？影响哪些模块？</div>
+            </div>
+            <div class="scene">
+                <h4>生成仿真 case 配置</h4>
+                <p>结合 case 目录结构和文件格式约束，可以先帮你整理出新的实验 case 草稿，再继续补参数和检查点。</p>
+                <div class="prompt">参考 user_topo_2layer_clos.py，帮我生成一个更大规模的 Clos 拓扑</div>
+            </div>
+            <div class="scene">
+                <h4>解读结果文件</h4>
+                <p>拿到 trace 和结果文件后，会先看关键字段，再把数字和协议行为对起来，而不是只给通用排查建议。</p>
+                <div class="prompt">哪些端口的吞吐远低于链路带宽？帮我从 throughput.csv 里找出来</div>
+            </div>
+            <div class="scene">
+                <h4>核查参数配置</h4>
+                <p>对这类问题，先核对规范默认值和参数约束，再帮你看 network_attribute.txt 里哪些设置可能冲突，哪些偏离基线。</p>
+                <div class="prompt">我的 PFC 水线设置合理吗？和缓存大小之间有没有冲突？</div>
+            </div>
+            <div class="scene">
+                <h4>识别现有 case 入口</h4>
+                <p>先把现有 scratch case 的用途和场景对上，再建议从哪个 case 起步、哪些参数值得先调整。</p>
+                <div class="prompt">我想测试多路径下的拥塞行为，从哪个现有 case 开始最合适？</div>
+            </div>
+        </div>
+    </div>
+</section>
+
+<!-- ═══ FAQ ═══ -->
+<section id="faq" class="alt">
+    <div class="w">
+        <div class="stag">常见问题</div>
+        <h2 class="sh">使用前须知</h2>
+        <div style="margin-top:32px;">
+            <div class="faq-item">
+                <h4>我完全不懂 ns-3 或 C++，能用吗？</h4>
+                <p>可以。先拿它找场景、看结果、理目录，进入项目会快很多；后面再慢慢补自己的工程判断就行。</p>
+            </div>
+            <div class="faq-item">
+                <h4>Agent Skills 和普通的 AI 对话有什么区别？</h4>
+                <p>区别在于它不只靠大模型临场回答，还会先读规则、调 tools、复用知识卡，再结合实验入口、参数语义和结果文件给建议。</p>
+            </div>
+            <div class="faq-item">
+                <h4>支持哪些 AI 工具？</h4>
+                <p>当前主要面向 Cursor、Claude Code 和 Codex 这类能读取仓库规则的工具。打开仓库后，它们会通过仓库内的技能文件和相关规则直接接入这套能力。</p>
+            </div>
+            <div class="faq-item">
+                <h4>我能添加自己的规则吗？</h4>
+                <p>可以。你可以在仓库里补充或修改相关技能文件和规则，把实验习惯、目录职责和团队约定写进去，让工具在更局部的范围内遵循这些约束。</p>
+            </div>
+            <div class="faq-item">
+                <h4>仿真结果可靠吗？</h4>
+                <p>仿真结果是否可靠，最终还是看平台建模精度、参数设置和验证过程。Agent Skills 主要帮助你少走弯路，把实验组织、参数定位和结果解读做得更清楚。</p>
+            </div>
+        </div>
+    </div>
+</section>
+
+<!-- ═══ CTA ═══ -->
+<section class="cta-section">
+    <div class="w">
+        <h2 class="sh" style="margin-bottom:12px;">把 AI 变成项目内助手</h2>
+        <p class="sp" style="max-width:420px;margin:0 auto 32px;">先从现成场景开始，再让它帮你对参数、跑实验、读结果，把每轮实验的发现继续接下去。</p>
+        <div class="btns">
+            <a href="openusim-landing.html" class="btn btn-p">回到平台首页</a>
+            <a href="https://gitcode.com/open-usim/ns-3-ub" class="btn btn-o">获取源码</a>
+        </div>
+    </div>
+</section>
+
+</main>
+
+<footer>
+    <div class="w">
+        <div class="c">&copy; 2025–2026 OpenUSim &middot; Agent Skills 专题 &middot; GPL v2</div>
+        <ul>
+            <li><a href="https://gitcode.com/open-usim/ns-3-ub">GitCode</a></li>
+            <li><a href="https://www.unifiedbus.com/zh">灵衢规范</a></li>
+            <li><a href="https://www.nsnam.org/">ns-3</a></li>
+        </ul>
+    </div>
+</footer>
+
+</body>
+</html>

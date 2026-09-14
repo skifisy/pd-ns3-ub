@@ -1,0 +1,3 @@
+nodeId1,portId1,tpn1,nodeId2,portId2,tpn2,priority,metric
+0,0,0,1,0,0,7,4
+0,0,1,1,0,1,8,4

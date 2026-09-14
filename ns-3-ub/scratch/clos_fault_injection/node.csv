@@ -1,0 +1,4 @@
+nodeId,nodeType,portNum
+0..7,DEVICE,1
+8..15,SWITCH,6
+16..17,SWITCH,4

@@ -1,0 +1,2 @@
+taskId,faultType,dropRate(%),delay(ns),lowerDataRate(node port datrate(Mbps)),shutdownDropPackets(start end),OccasionalDropRate(%)
+0,2,0,0,8 0 1000,0,0

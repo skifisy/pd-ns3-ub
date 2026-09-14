@@ -1,0 +1,23 @@
+default ns3::UbApp::EnableMultiPath "false"
+default ns3::UbApp::UseShortestPaths "true"
+default ns3::UbPort::UbDataRate "400Gbps"
+default ns3::UbPort::UbInterframeGap "+0ns"
+default ns3::UbSwitch::FlowControl "NONE"
+default ns3::UbTransportChannel::EnableRetrans "false"
+default ns3::UbTransportChannel::UsePacketSpray "false"
+default ns3::UbTransportChannel::UseShortestPaths "true"
+default ns3::UbSwitchAllocator::AllocationTime "+1ns"
+
+global UB_FAULT_ENABLE "false"
+global UB_PRIORITY_NUM "16"
+global UB_VL_NUM "16"
+global UB_CC_ALGO "CAQM"
+global UB_CC_ENABLED "false"
+
+global UB_TRACE_ENABLE "false"
+global UB_TASK_TRACE_ENABLE "false"
+global UB_PACKET_TRACE_ENABLE "false"
+global UB_PORT_TRACE_ENABLE "false"
+global UB_RECORD_PKT_TRACE "false"
+
+global UB_PARSE_TRACE_ENABLE "false"

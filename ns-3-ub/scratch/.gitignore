@@ -1,0 +1,11 @@
+# Ignore everything on scratch by default, except the provided examples
+# 忽略所有 runlog 和 output 目录
+**/runlog/
+**/output/
+
+!.gitignore
+
+!nested-subdir/
+!subdir/
+!scratch-simulator.cc
+!CMakeLists.txt

@@ -1,0 +1,3 @@
+taskId,sourceNode,destNode,dataSize(Byte),opType,priority,delay,phaseId,dependOnPhases,srcEntityId,dstEntityId
+0,0,1,64,URMA_WRITE,7,10ns,0,,0,0
+1,0,1,64,URMA_WRITE,7,10ns,0,,0,1

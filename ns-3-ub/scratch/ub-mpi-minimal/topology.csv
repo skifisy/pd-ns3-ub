@@ -1,0 +1,2 @@
+nodeId1,portId1,nodeId2,portId2,bandwidth,delay
+0,0,1,0,400Gbps,20ns

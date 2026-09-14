@@ -1,0 +1,55 @@
+name: Per Commit (Ubuntu)
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  ubuntu-linux:
+    name: Build and Smoke Test on Ubuntu
+    runs-on: ubuntu-22.04
+    timeout-minutes: 60
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Sync and update submodules
+        run: |
+          git submodule sync --recursive
+          git submodule update --init --recursive
+          git submodule status --recursive
+
+      - name: Install required packages
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            g++ \
+            cmake \
+            ninja-build \
+            libgsl-dev \
+            libxml2-dev \
+            ca-certificates
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install Python dependencies for ns-3-ub-tools
+        run: |
+          python -m pip install -r scratch/ns-3-ub-tools/requirements.txt
+
+      - name: Configure and build (Quick Start)
+        run: |
+          ./ns3 configure --enable-asserts --enable-examples --enable-tests --disable-werror -d release -G Ninja
+          ./ns3 build
+
+      - name: Run smoke scenario (Quick Start)
+        run: |
+          ./ns3 run 'scratch/ub-quick-example scratch/2nodes_single-tp'
