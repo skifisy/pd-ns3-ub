@@ -2,6 +2,7 @@
 """Small end-to-end checks on the generated OCS topology and the TE LP."""
 
 import csv
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -58,6 +59,24 @@ class JupiterTeTest(unittest.TestCase):
         self.assertEqual(self.host_leaf[16, 0], 53)
         self.assertEqual(len(seen[37]), 4)
         self.assertEqual(len(seen[53]), 1)
+
+    def test_standalone_routing_generator_cli_matches_library_output(self):
+        output = Path(self.tmp.name) / "routing_table_cli.csv"
+        script = Path(__file__).resolve().parent / "generate_routing_table.py"
+        subprocess.run(
+            [
+                sys.executable,
+                str(script),
+                "--topology",
+                str(self.topology),
+                "--output",
+                str(output),
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(output.read_text(), self.routing.read_text())
 
     def test_lp_limits_utilization_and_s_one_enforces_equal_capacity_shares(self):
         demand = {(37, 53): 0.8e12, (38, 53): 0.8e12}
