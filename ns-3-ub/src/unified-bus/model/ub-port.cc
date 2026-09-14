@@ -489,6 +489,7 @@ UbPort::TransmitPacketDetached(Ptr<Packet> packet)
 
     TraComEventNotify(packet, txTime);
     UpdateTxBytes(packet->GetSize());
+    UbTeController::Get().OnHostTransmit(GetNode()->GetId(), m_portId, packet);
 }
 
 void UbPort::Receive(Ptr<Packet> packet)
