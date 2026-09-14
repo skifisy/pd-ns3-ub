@@ -1,6 +1,8 @@
 # Mooncake 流量的历史预测 TE 仿真
 
-本实现仅对 `tools/generate_ocs_topology.py` 的静态 OCS 拓扑启用：37–56 每个 leaf 是一个 block。每对跨组 leaf 的 4 条 400 Gbps 物理链路在 LP 中是一条 1.6 Tbps **有向**逻辑边；不同组有直达路径和 12 条一跳中转路径，同组没有直达路径、有 16 条一跳中转路径。拓扑生成脚本同时生成 `node.csv`、`topology.csv` 和逐个目的 host 端口精确匹配的 `routing_table.csv`。
+具体的脚本执行顺序、`routing_table.csv` 单独生成方式、ns-3 编译/运行命令和结果分析步骤见 [`JUPITER_TE_RUN.md`](./JUPITER_TE_RUN.md)。本文档主要说明 TE/WCMP 的实现语义。
+
+本实现仅对 `tools/generate_ocs_topology.py` 的静态 OCS 拓扑启用：37–56 每个 leaf 是一个 block。每对跨组 leaf 的 4 条 400 Gbps 物理链路在 LP 中是一条 1.6 Tbps **有向**逻辑边；不同组有直达路径和 12 条一跳中转路径，同组没有直达路径、有 16 条一跳中转路径。拓扑生成脚本同时生成 `node.csv`、`topology.csv` 和逐个目的 host 端口精确匹配的 `routing_table.csv`。已有 `topology.csv` 时也可用 `tools/generate_routing_table.py` 单独重建路由表。
 
 `--jupiter-te=1` 从源主机端口**成功发出**的 URMA 数据包统计业务载荷字节；读取实际发出的源端口及报文的目的端口，按 `topology.csv` 映射到 leaf。无载荷请求、ACK、控制包和同一 `(host, TPN, PSN)` 的重传不进入矩阵。另在 OCS 物理端口计数所有成功发出的线速字节，汇总到有向逻辑边，以便分析最忙链路（这项数据包含头部和重传）。统计窗口固定 30 秒；在每次重算时，取过去 `--te-history-windows` 个已完成窗口各 OD 的最大值作为预测，默认 120 个窗口（最多 1 小时）。重算间隔 `--te-recompute-seconds` 默认 30 秒。未观测到业务的 OD 走直达，直达不存在时按候选路径的瓶颈容量比例走单中转备份；前 30 秒也是这套策略。前 600 秒仍执行控制，但评估时应排除这个预热阶段。
 
