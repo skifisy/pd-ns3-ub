@@ -7,6 +7,7 @@
 #include "ns3/ub-port.h"
 #include "ns3/ub-queue-manager.h"
 #include "ns3/ub-routing-process.h"
+#include "ns3/ub-te-controller.h"
 #include "ns3/udp-header.h"
 #include "ns3/ipv4-header.h"
 using namespace utils;
@@ -455,6 +456,17 @@ int UbRoutingProcess::SelectOutPort(RoutingKey &rtKey, const std::vector<uint16_
 // 3. 如果找不到出端口，报错
 int UbRoutingProcess::GetOutPort(RoutingKey &rtKey, bool &selectedShortestPath, uint16_t inPort)
 {
+    if (rtKey.teEligible && UbTeController::Get().Enabled()) {
+        const uint32_t salt = utils::NodeIdToIp(m_nodeId).Get();
+        // The same per-flow hash key as SelectOutPort, including the existing
+        // optional transport-port mode. Pinning and WCMP consume this hash.
+        const uint64_t hash = rtKey.hashIncludesTransportPorts
+            ? CalcHash(rtKey.sip, rtKey.dip, rtKey.sport, rtKey.dport, rtKey.priority, salt)
+            : CalcHash(rtKey.sip, rtKey.dip, 0, 0, rtKey.priority, salt);
+        const int tePort = UbTeController::Get().SelectLeafOutPort(m_nodeId, rtKey, hash,
+                                                                    inPort, selectedShortestPath);
+        if (tePort != -2) return tePort;
+    }
     uint32_t sip = rtKey.sip;
     uint32_t dip = rtKey.dip;
     uint16_t sport = rtKey.sport;

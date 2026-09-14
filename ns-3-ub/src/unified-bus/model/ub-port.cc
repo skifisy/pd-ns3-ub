@@ -6,6 +6,7 @@
 #include "ns3/ub-caqm.h"
 #include "ns3/ub-tag.h"
 #include "ns3/ub-utils.h"
+#include "ns3/ub-te-controller.h"
 #ifdef NS3_MPI
 #include "ns3/mpi-receiver.h"
 #endif
@@ -457,6 +458,7 @@ void UbPort::TransmitPacket(Ptr<Packet> packet, Time delay)
     Simulator::Schedule(txCompleteTime, &UbPort::TransmitComplete, this);
     NS_LOG_DEBUG("[UbFc DequeueAndTransmit] will send pkt size: " << packet->GetSize());
     UpdateTxBytes(packet->GetSize());
+    UbTeController::Get().OnHostTransmit(GetNode()->GetId(), m_portId, packet);
 
     return;
 }
