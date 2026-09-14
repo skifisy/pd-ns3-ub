@@ -1,3 +1,11 @@
+# 运行说明
+
+> 完整、可复现且不依赖个人机器绝对路径的运行步骤，请优先参考仓库根目录的 [`RUNNING.md`](../RUNNING.md)。其中包含 OCS topology、独立 `routing_table.csv` 生成、Mooncake DAG/traffic 转换，以及 ns-3 / MTP 仿真命令。
+>
+> 下面保留的是早期实验笔记，其中的 `/home/liujiaxin/...` 和 `/mnt/liujiaxin/...` 路径仅适用于当时的机器环境，不建议直接复制执行。
+
+## 历史实验笔记
+
 生成task_dag的命令：
 python3 /home/liujiaxin/pd-ns3-ub/tools/mooncake_trace_to_pd_store_dag_v6_layer_pipeline.py \
 conversation_trace.jsonl \
