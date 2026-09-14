@@ -92,10 +92,10 @@ void UbTeController::Configure(const std::string& casePath, const std::string& s
     m_s = s;
     m_outputDir = outputDir.empty() ? casePath + "/jupiter_te" : outputDir;
     std::filesystem::create_directories(m_outputDir);
-    std::ofstream(m_outputDir + "/observed.csv") << "window,src_leaf,dst_leaf,bytes\n";
+    std::ofstream(m_outputDir + "/observed.csv") << "window,src_leaf,dst_leaf,bytes,complete\n";
     std::ofstream(m_outputDir + "/prediction.csv") << "epoch,src_leaf,dst_leaf,bps\n";
     std::ofstream(m_outputDir + "/weights.csv") << "epoch,src_leaf,dst_leaf,transit_leaf,weight\n";
-    std::ofstream(m_outputDir + "/link_bytes.csv") << "window,src_leaf,dst_leaf,wire_bytes\n";
+    std::ofstream(m_outputDir + "/link_bytes.csv") << "window,src_leaf,dst_leaf,wire_bytes,complete\n";
     m_enabled = true;
     Simulator::Schedule(Seconds(m_intervalSeconds), &UbTeController::Recompute, this);
 }
@@ -161,10 +161,10 @@ void UbTeController::FlushFinalWindow()
     std::ofstream edges(m_outputDir + "/link_bytes.csv", std::ios::app);
     for (const auto& [window, traffic] : m_observed)
         for (const auto& [od, bytes] : traffic)
-            observed << window << ',' << od.first << ',' << od.second << ',' << bytes << '\n';
+            observed << window << ',' << od.first << ',' << od.second << ',' << bytes << ",0\n";
     for (const auto& [window, traffic] : m_linkObserved)
         for (const auto& [edge, bytes] : traffic)
-            edges << window << ',' << edge.first << ',' << edge.second << ',' << bytes << '\n';
+            edges << window << ',' << edge.first << ',' << edge.second << ',' << bytes << ",0\n";
     m_observed.clear();
     m_linkObserved.clear();
 }
@@ -278,10 +278,10 @@ void UbTeController::Recompute()
     std::ofstream edges(m_outputDir + "/link_bytes.csv", std::ios::app);
     for (const auto& [window, traffic] : completed)
         for (const auto& [od, bytes] : traffic)
-            observed << window << ',' << od.first << ',' << od.second << ',' << bytes << '\n';
+            observed << window << ',' << od.first << ',' << od.second << ',' << bytes << ",1\n";
     for (const auto& [window, traffic] : completedLinks)
         for (const auto& [edge, bytes] : traffic)
-            edges << window << ',' << edge.first << ',' << edge.second << ',' << bytes << '\n';
+            edges << window << ',' << edge.first << ',' << edge.second << ',' << bytes << ",1\n";
     for (const auto& [window, traffic] : m_history)
         if (window < complete && window + m_historyWindows >= complete)
             for (const auto& [od, bytes] : traffic)

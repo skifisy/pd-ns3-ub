@@ -14,6 +14,7 @@ from generate_ocs_topology import (generate_compute_links, generate_ids,
                                    generate_topology_csv)
 from generate_ocs_routing_table import generate_routing_table
 from jupiter_te_solver import candidates, read_topology, solve
+from analyze_jupiter_te import summarize
 
 
 class JupiterTeTest(unittest.TestCase):
@@ -77,6 +78,22 @@ class JupiterTeTest(unittest.TestCase):
         paths = candidates(37, 38, self.capacity)
         self.assertTrue(all(transit != -1 for _, _, transit, _ in paths))
         self.assertEqual(len(paths), 16)
+
+    def test_utilization_excludes_warmup_and_partial_window(self):
+        link_bytes = Path(self.tmp.name) / "link_bytes.csv"
+        output = Path(self.tmp.name) / "utilization.csv"
+        with open(link_bytes, "w", newline="") as stream:
+            writer = csv.writer(stream)
+            writer.writerow(("window", "src_leaf", "dst_leaf", "wire_bytes", "complete"))
+            writer.writerow((19, 37, 53, 10**12, 1))
+            writer.writerow((20, 37, 53, int(0.25 * 30 * self.capacity[37, 53] / 8), 1))
+            writer.writerow((21, 37, 53, 10**12, 0))
+        summarize(self.topology, link_bytes, output)
+        with open(output, newline="") as stream:
+            rows = list(csv.DictReader(stream))
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["window"], "20")
+        self.assertAlmostEqual(float(rows[0]["max_utilization"]), 0.25)
 
 
 if __name__ == "__main__":

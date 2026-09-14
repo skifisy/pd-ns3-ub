@@ -13,7 +13,9 @@ python3 ../tools/generate_ocs_topology.py
 ./ns3 run 'scratch/ub-quick-example --case-path=scratch/mooncake_pd_storage_ocs_topology --jupiter-te=1 --te-recompute-seconds=30 --te-history-windows=120 --te-s=0 --mtp-threads=8'
 ```
 
-使用任意其他 case 目录时，指定该目录中的 `topology.csv`、`routing_table.csv` 等完整配置，并传 `--te-solver=/absolute/path/to/tools/jupiter_te_solver.py`。也可用 `--te-output=/path/to/result` 修改输出路径。默认写在 `<case>/jupiter_te/`：`observed.csv` 是实际源端业务字节，`link_bytes.csv` 是逻辑边的实际线速字节，`prediction.csv` 是每次控制周期的预测速率，`weights.csv` 是对应 leaf 对和直达/中转路径权重；最后一个不足 30 秒的观测窗口也会写出，但不会用于预测。当前矩阵及权重文件供在线求解器交互。实验中应只对 600 秒之后的有效区间比较网络指标；流量没有运行到 30 秒时不会有历史矩阵。
+使用任意其他 case 目录时，指定该目录中的 `topology.csv`、`routing_table.csv` 等完整配置，并传 `--te-solver=/absolute/path/to/tools/jupiter_te_solver.py`。也可用 `--te-output=/path/to/result` 修改输出路径。默认写在 `<case>/jupiter_te/`：`observed.csv` 是实际源端业务字节，`link_bytes.csv` 是逻辑边的实际线速字节，`prediction.csv` 是每次控制周期的预测速率，`weights.csv` 是对应 leaf 对和直达/中转路径权重；最后一个不足 30 秒的观测窗口也会写出，`complete=0`，不会用于预测。当前矩阵及权重文件供在线求解器交互。实验中应只对 600 秒之后的有效区间比较网络指标；流量没有运行到 30 秒时不会有历史矩阵。
+
+跑完后可用 `python3 ../tools/analyze_jupiter_te.py --topology=<case>/topology.csv --link-bytes=<case>/jupiter_te/link_bytes.csv --output=<case>/jupiter_te/utilization.csv` 输出已完成且处于 600 秒预热期之后的每窗口最忙有向链路利用率。这里用的是 OCS 发送线速字节，包含报文头和重传；LP 用的是源端业务字节，因此两者不会严格相等。
 
 源 leaf 对路径按已有 `CalcHash` 的逐流哈希键做 WCMP，并在固定流的生命周期内保留已选路径。选到单中转后，包头的 `RoutingPolicy` 在源 leaf 被置为 shortest；中转 leaf 只允许直达目标 leaf，末端 leaf 按准确的目的 host 端口交付。四条并行物理链路仍按该流哈希做 ECMP。一个 TPN 使用 packet spray 时 TE 会拒绝该流；TE 当前只支持单 MPI rank，MTP 可通过线程锁保护矩阵和策略发布。实验控制只配置一路历史预测 TE，不做 oracle 重放。
 
