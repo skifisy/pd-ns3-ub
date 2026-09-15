@@ -8,6 +8,7 @@
 #include "ns3/ub-link.h"
 #include "ns3/ub-port.h"
 #include "ns3/ub-traffic-gen.h"
+#include "ns3/ub-te-controller.h"
 #include "ns3/ub-transport.h"
 #include "ns3/ub-utils.h"
 
@@ -52,6 +53,12 @@ struct QuickExampleOptions
     std::string linkDelayOffsetWindow = "0ps";
     uint32_t timingOffsetSeed = 1;
     std::string canonicalOutputPath;
+    bool jupiterTe = false;
+    double teRecomputeSeconds = 30.0;
+    uint32_t teHistoryWindows = 120;
+    double teS = 0.0;
+    std::string teSolver;
+    std::string teOutput;
 };
 
 struct DropAbortState
@@ -442,6 +449,17 @@ BuildScenarioFromConfig(const QuickExampleOptions& options, const RuntimeSelecti
                                                         linkOffsetWindow,
                                                         options.timingOffsetSeed);
     UbUtils::Get()->AddRoutingTable(configPath + "/routing_table.csv");
+    if (options.jupiterTe) {
+        NS_ABORT_MSG_IF(runtime.enableMpi,
+                        "Jupiter TE requires a single MPI rank for a globally observed matrix");
+        std::string solver = options.teSolver;
+        if (solver.empty()) {
+            solver = std::filesystem::exists("../tools/jupiter_te_solver.py")
+                         ? "../tools/jupiter_te_solver.py" : "tools/jupiter_te_solver.py";
+        }
+        UbTeController::Get().Configure(configPath, solver, options.teRecomputeSeconds,
+                                        options.teHistoryWindows, options.teS, options.teOutput);
+    }
     UbUtils::Get()->CreateTp(configPath + "/transport_channel.csv");
     UbUtils::Get()->TopoTraceConnect();
 
@@ -714,6 +732,15 @@ QuickExampleOptions ParseOptions(int argc, char* argv[])
     cmd.AddValue("canonical-output",
                  "Write deterministic UbTrafficGen canonical events to this output basename",
                  options.canonicalOutputPath);
+    cmd.AddValue("jupiter-te", "Enable historical-window Jupiter TE and per-flow WCMP", options.jupiterTe);
+    cmd.AddValue("te-recompute-seconds", "TE policy recomputation interval (default 30s)",
+                 options.teRecomputeSeconds);
+    cmd.AddValue("te-history-windows", "Max lookback in 30s windows (default 120)",
+                 options.teHistoryWindows);
+    cmd.AddValue("te-s", "Jupiter hedge parameter S in [0,1] (default 0)", options.teS);
+    cmd.AddValue("te-solver", "Path to tools/jupiter_te_solver.py", options.teSolver);
+    cmd.AddValue("te-output", "Directory for observed bytes, predictions, WCMP weights",
+                 options.teOutput);
     cmd.AddNonOption("casePath",
                      "Required unified-bus case directory when --case-path is omitted",
                      positionalCasePath);
@@ -853,6 +880,8 @@ PhaseTiming RunScenario(const QuickExampleOptions& options,
         Simulator::Stop(MilliSeconds(options.stopMs));
     }
     Simulator::Run();
+    UbTeController::Get().FlushFinalWindow();
+    UbTeController::Get().Disable();
     timing.simulationEnd = std::chrono::high_resolution_clock::now();
 
     UbUtils::Get()->Destroy();

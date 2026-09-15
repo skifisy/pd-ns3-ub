@@ -295,6 +295,8 @@ def generate_topology_csv(links, path):
 # Main
 # ============================================================
 def main():
+    from generate_ocs_routing_table import generate_routing_table
+
     CASE_DIR.mkdir(parents=True, exist_ok=True)
 
     compute_server_ids, storage_server_ids, compute_leaf_ids, storage_leaf_ids = generate_ids()
@@ -340,11 +342,13 @@ def main():
         storage_leaf_ids,
     )
     generate_topology_csv(links, topology_file)
+    generate_routing_table(topology_file, CASE_DIR / "routing_table.csv")
 
     print()
     print("Generated:")
     print(" ", node_file)
     print(" ", topology_file)
+    print(" ", CASE_DIR / "routing_table.csv")
     print(f"Total physical links: {len(links)}")
 
 

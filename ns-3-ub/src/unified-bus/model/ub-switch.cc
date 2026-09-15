@@ -971,6 +971,7 @@ void UbSwitch::ParseCtpPacketHeader(Ptr<Packet> packet, ParsedCtpHeaders &header
 
 void UbSwitch::GetURMARoutingKey(const ParsedURMAHeaders &headers, RoutingKey &rtKey)
 {
+    rtKey.teEligible = true;
     rtKey.sip = headers.ipv4Header.GetSource().Get();
     rtKey.dip = headers.ipv4Header.GetDestination().Get();
     rtKey.sport = headers.udpHeader.GetSourcePort();

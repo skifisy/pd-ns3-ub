@@ -23,6 +23,7 @@ struct RoutingKey {
     bool useShortestPath;
     bool usePacketSpray;
     bool hashIncludesTransportPorts{false};
+    bool teEligible{false}; // IP-based URMA data only; never reroute LDST/CTP control.
 };
 
 /**
