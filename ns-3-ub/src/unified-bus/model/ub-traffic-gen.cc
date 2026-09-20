@@ -903,6 +903,7 @@ UbTrafficGen::ApplyTaskCompletion(uint32_t taskId)
         NS_ABORT_MSG_IF(completedTask == nullptr, "Unknown completed taskId " << taskId);
 
         *state = TaskState::COMPLETED;
+        ++m_completedTaskCount;
         RecordCanonicalCompletionLocked(*completedTask);
         NS_LOG_DEBUG("Task " << taskId << " completion visible");
 
@@ -954,47 +955,59 @@ UbTrafficGen::ApplyTaskCompletion(uint32_t taskId)
 bool UbTrafficGen::IsCompleted() const
 {
     std::lock_guard<std::mutex> lock(m_mutex);
-    if (m_useDenseTaskState) {
-        for (const TaskState state : m_denseTaskStates) {
-            if (state != TaskState::COMPLETED) {
-                return false;
-            }
-        }
-        return true;
-    }
-
-    for (const auto &statePair : m_taskStates)
-        if (statePair.second != TaskState::COMPLETED) {
-            return false;
-        }
-
-    return true;
+    const size_t total = m_useDenseTaskState ? m_denseTaskStates.size() : m_taskStates.size();
+    return m_completedTaskCount == total;
 }
 
 uint32_t UbTrafficGen::GetCompletedTaskCount() const
 {
     std::lock_guard<std::mutex> lock(m_mutex);
-    uint32_t completedTasks = 0;
+    return m_completedTaskCount;
+}
+
+uint32_t UbTrafficGen::GetTotalTaskCount() const
+{
+    std::lock_guard<std::mutex> lock(m_mutex);
+    const size_t total = m_useDenseTaskState ? m_denseTaskStates.size() : m_taskStates.size();
+    return static_cast<uint32_t>(total);
+}
+
+UbTrafficGen::TaskStateCounts UbTrafficGen::GetTaskStateCounts() const
+{
+    std::lock_guard<std::mutex> lock(m_mutex);
+    TaskStateCounts counts;
+    const auto add = [&counts](TaskState state)
+    {
+        ++counts.total;
+        switch (state)
+        {
+        case TaskState::PENDING:
+            ++counts.pending;
+            break;
+        case TaskState::READY:
+            ++counts.ready;
+            break;
+        case TaskState::RUNNING:
+            ++counts.running;
+            break;
+        case TaskState::COMPLETED:
+            ++counts.completed;
+            break;
+        }
+    };
     if (m_useDenseTaskState)
     {
         for (const TaskState state : m_denseTaskStates)
         {
-            if (state == TaskState::COMPLETED)
-            {
-                ++completedTasks;
-            }
+            add(state);
         }
-        return completedTasks;
+        return counts;
     }
-
     for (const auto& statePair : m_taskStates)
     {
-        if (statePair.second == TaskState::COMPLETED)
-        {
-            ++completedTasks;
-        }
+        add(statePair.second);
     }
-    return completedTasks;
+    return counts;
 }
 
 uint64_t

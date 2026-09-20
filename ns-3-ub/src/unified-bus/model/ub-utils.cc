@@ -641,24 +641,36 @@ UbUtils::GetTraceFile(const std::string& fileName)
             fs::create_directories(parent, ec);
             NS_ASSERT_MSG(!ec, "Failed to create trace parent dir: " << parent << " err=" << ec.message());
         }
-        it->second.stream.open(fileName.c_str(), std::ios::out | std::ios::app);
-        NS_ASSERT_MSG(it->second.stream.is_open(), "Can not open File: " << fileName);
+        it->second.path = fileName;
         it->second.pending.reserve(TRACE_FLUSH_THRESHOLD_BYTES);
     }
     return it->second;
 }
 
 void
-UbUtils::FlushTraceFile(TraceFileState& fileState)
+UbUtils::FlushTraceFileLocked(TraceFileState& fileState)
 {
-    std::lock_guard<std::mutex> fileGuard(fileState.mutex);
     if (fileState.pending.empty())
     {
         return;
     }
-    fileState.stream.write(fileState.pending.data(),
-                           static_cast<std::streamsize>(fileState.pending.size()));
+    // A large topology can create thousands of distinct trace files. Keeping
+    // one ofstream open for every file exhausts RLIMIT_NOFILE and can also
+    // prevent optional post-processing helpers from starting.
+    // Open only while flushing a bounded in-memory buffer.
+    std::ofstream stream(fileState.path, std::ios::out | std::ios::app);
+    NS_ABORT_MSG_IF(!stream.is_open(), "Can not open File: " << fileState.path);
+    stream.write(fileState.pending.data(),
+                 static_cast<std::streamsize>(fileState.pending.size()));
+    NS_ABORT_MSG_IF(!stream.good(), "Can not write File: " << fileState.path);
     fileState.pending.clear();
+}
+
+void
+UbUtils::FlushTraceFile(TraceFileState& fileState)
+{
+    std::lock_guard<std::mutex> fileGuard(fileState.mutex);
+    FlushTraceFileLocked(fileState);
 }
 
 bool
@@ -830,15 +842,7 @@ void UbUtils::Destroy()
     std::lock_guard<std::mutex> filesGuard(files_mutex);
     for (auto& pair : files) {
         std::lock_guard<std::mutex> fileGuard(pair.second.mutex);
-        if (!pair.second.pending.empty())
-        {
-            pair.second.stream.write(pair.second.pending.data(),
-                                     static_cast<std::streamsize>(pair.second.pending.size()));
-            pair.second.pending.clear();
-        }
-        if (pair.second.stream.is_open()) {
-            pair.second.stream.close();
-        }
+        FlushTraceFileLocked(pair.second);
     }
     files.clear();
 }
@@ -1007,9 +1011,7 @@ void UbUtils::PrintTraceInfo(const string& fileName, const string& info)
     fileState.pending += info;
     fileState.pending.push_back('\n');
     if (fileState.pending.size() >= TRACE_FLUSH_THRESHOLD_BYTES) {
-        fileState.stream.write(fileState.pending.data(),
-                               static_cast<std::streamsize>(fileState.pending.size()));
-        fileState.pending.clear();
+        FlushTraceFileLocked(fileState);
     }
 }
 
@@ -1020,9 +1022,7 @@ void UbUtils::PrintTraceInfoNoTs(const string& fileName, const string& info)
     fileState.pending += info;
     fileState.pending.push_back('\n');
     if (fileState.pending.size() >= TRACE_FLUSH_THRESHOLD_BYTES) {
-        fileState.stream.write(fileState.pending.data(),
-                               static_cast<std::streamsize>(fileState.pending.size()));
-        fileState.pending.clear();
+        FlushTraceFileLocked(fileState);
     }
 }
 

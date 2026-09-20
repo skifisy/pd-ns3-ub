@@ -23,7 +23,7 @@ LINK_RATE_GBPS = 400
 LINK_DELAY_US = 1.0
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
-CASE_DIR = PROJECT_ROOT / "ns-3-ub" / "scratch" / "mooncake_pd_storage_ocs_topology"
+CASE_DIR = PROJECT_ROOT / "ns-3-ub" / "scratch" / "mooncake_pd_ocs"
 
 
 def generate_ids():

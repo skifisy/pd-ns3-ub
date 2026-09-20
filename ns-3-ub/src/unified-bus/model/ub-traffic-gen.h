@@ -90,6 +90,15 @@ public:
         uint8_t priority{0};
     };
 
+    struct TaskStateCounts
+    {
+        uint32_t total{0};
+        uint32_t pending{0};
+        uint32_t ready{0};
+        uint32_t running{0};
+        uint32_t completed{0};
+    };
+
     static bool IsMultiProcessRuntimeUnsupported();
 
     static inline std::string GetMultiProcessUnsupportedMessage()
@@ -146,6 +155,10 @@ public:
     bool IsCompleted() const;
 
     uint32_t GetCompletedTaskCount() const;
+
+    uint32_t GetTotalTaskCount() const;
+
+    TaskStateCounts GetTaskStateCounts() const;
 
     /**
      * @brief 任务完成回调
@@ -217,6 +230,7 @@ public:
     std::unordered_map<uint32_t, PhaseState> m_phaseStates{};
     std::vector<uint32_t> m_readyTasks{};
     bool m_readyTasksSorted{true};
+    uint32_t m_completedTaskCount{0};
     std::vector<Ptr<UbApp>> m_sourceApps{};
     std::unordered_map<std::string, Time> m_delayParseCache{};
     std::optional<Time> m_dependencyVisibilityDelay{};

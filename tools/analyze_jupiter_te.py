@@ -7,11 +7,29 @@ import statistics
 from collections import defaultdict
 from pathlib import Path
 
-from jupiter_te_solver import read_topology
+
+def read_topology(path):
+    """Read directed logical OCS capacities from topology.csv."""
+    capacities = defaultdict(float)
+    with open(path, newline="") as stream:
+        for row in csv.DictReader(stream):
+            a, b = int(row["nodeId1"]), int(row["nodeId2"])
+            if a < 37 or b < 37:
+                continue
+            rate = row["bandwidth"].strip()
+            if rate.endswith("Gbps"):
+                bps = float(rate[:-4]) * 1e9
+            elif rate.endswith("Mbps"):
+                bps = float(rate[:-4]) * 1e6
+            else:
+                raise ValueError(f"unsupported bandwidth: {rate}")
+            capacities[a, b] += bps
+            capacities[b, a] += bps
+    return capacities
 
 
 def summarize(topology, observed_link_bytes, output, warmup_seconds=600):
-    _, capacities, _ = read_topology(topology)
+    capacities = read_topology(topology)
     windows = defaultdict(dict)
     with open(observed_link_bytes, newline="") as stream:
         for row in csv.DictReader(stream):

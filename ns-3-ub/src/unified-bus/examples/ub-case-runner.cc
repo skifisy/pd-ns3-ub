@@ -53,11 +53,12 @@ struct QuickExampleOptions
     std::string linkDelayOffsetWindow = "0ps";
     uint32_t timingOffsetSeed = 1;
     std::string canonicalOutputPath;
+    std::string progressInterval = "10ms";
     bool jupiterTe = false;
+    bool debugTe = false;
     double teRecomputeSeconds = 30.0;
     uint32_t teHistoryWindows = 120;
     double teS = 0.0;
-    std::string teSolver;
     std::string teOutput;
 };
 
@@ -128,22 +129,25 @@ std::string FormatSummaryLine(const std::string& label, double time_us)
     return oss.str();
 }
 
-void CheckNoProgress(double sim_time_us, std::ostringstream& oss)
+void CheckNoProgress(double sim_time_us,
+                     uint32_t completedTasks,
+                     uint32_t totalTasks,
+                     std::ostringstream& oss)
 {
     static uint32_t last_completed_tasks = 0;
     static double last_progress_time_us = 0;
-    uint32_t completed_tasks = UbTrafficGen::Get()->GetCompletedTaskCount();
 
-    if (completed_tasks > last_completed_tasks)
+    if (completedTasks > last_completed_tasks)
     {
-        last_completed_tasks = completed_tasks;
+        last_completed_tasks = completedTasks;
         last_progress_time_us = sim_time_us;
     }
 
     if (sim_time_us - last_progress_time_us > 10000 && sim_time_us > 10000)
     {
         oss << " [WARNING: No task completed for "
-            << FormatTime(sim_time_us - last_progress_time_us) << "]";
+            << FormatTime(sim_time_us - last_progress_time_us) << "; tasks=" << completedTasks
+            << '/' << totalTasks << "]";
     }
 }
 
@@ -197,7 +201,7 @@ void CheckDropWithoutRetrans(std::ostringstream& oss)
     Simulator::Stop();
 }
 
-void CheckExampleProcess()
+void CheckExampleProcess(Time progressInterval)
 {
     double sim_time_us = Simulator::Now().GetMicroSeconds();
     auto now = std::chrono::system_clock::now();
@@ -209,20 +213,50 @@ void CheckExampleProcess()
     oss << "[" << std::put_time(&tm_buf, "%H:%M:%S") << "] "
         << "Simulation time progress: " << FormatTime(sim_time_us);
 
-    CheckNoProgress(sim_time_us, oss);
+    const uint32_t completedTasks = UbTrafficGen::Get()->GetCompletedTaskCount();
+    const uint32_t totalTasks = UbTrafficGen::Get()->GetTotalTaskCount();
+    CheckNoProgress(sim_time_us, completedTasks, totalTasks, oss);
     CheckDropWithoutRetrans(oss);
+
+    static int64_t lastTeHeartbeatSecond = -1;
+    const int64_t heartbeatSecond = static_cast<int64_t>(sim_time_us / 1e6);
+    if (heartbeatSecond != lastTeHeartbeatSecond)
+    {
+        lastTeHeartbeatSecond = heartbeatSecond;
+        if (UbTeController::Get().DebugEnabled())
+        {
+            const auto counts = UbTrafficGen::Get()->GetTaskStateCounts();
+            UbTeController::Get().OnSimulationProgress(counts.total,
+                                                        counts.pending,
+                                                        counts.ready,
+                                                        counts.running,
+                                                        counts.completed);
+        }
+    }
 
     std::cout << "\r" << oss.str() << std::flush;
     if (GetDropAbortState().triggered)
     {
         return;
     }
-    if (!UbTrafficGen::Get()->IsCompleted())
+    if (completedTasks < totalTasks)
     {
-        Simulator::Schedule(MicroSeconds(100), &CheckExampleProcess);
+        Simulator::Schedule(progressInterval, &CheckExampleProcess, progressInterval);
         return;
     }
-    std::cout << std::endl;
+
+    // Persist an exact final task snapshot before stopping.  Jupiter TE owns
+    // self-rescheduling control-plane events, so cancel them explicitly as
+    // part of the normal all-tasks-completed path.
+    const auto finalCounts = UbTrafficGen::Get()->GetTaskStateCounts();
+    UbTeController::Get().OnSimulationProgress(finalCounts.total,
+                                                finalCounts.pending,
+                                                finalCounts.ready,
+                                                finalCounts.running,
+                                                finalCounts.completed);
+    UbTeController::Get().StopPeriodicEvents("all-tasks-completed");
+    std::cout << " [COMPLETED: tasks=" << finalCounts.completed << '/' << finalCounts.total << ']'
+              << std::endl;
     Simulator::Stop();
 }
 
@@ -452,13 +486,9 @@ BuildScenarioFromConfig(const QuickExampleOptions& options, const RuntimeSelecti
     if (options.jupiterTe) {
         NS_ABORT_MSG_IF(runtime.enableMpi,
                         "Jupiter TE requires a single MPI rank for a globally observed matrix");
-        std::string solver = options.teSolver;
-        if (solver.empty()) {
-            solver = std::filesystem::exists("../tools/jupiter_te_solver.py")
-                         ? "../tools/jupiter_te_solver.py" : "tools/jupiter_te_solver.py";
-        }
-        UbTeController::Get().Configure(configPath, solver, options.teRecomputeSeconds,
-                                        options.teHistoryWindows, options.teS, options.teOutput);
+        UbTeController::Get().Configure(configPath, options.teRecomputeSeconds,
+                                        options.teHistoryWindows, options.teS,
+                                        options.teOutput, options.debugTe);
     }
     UbUtils::Get()->CreateTp(configPath + "/transport_channel.csv");
     UbUtils::Get()->TopoTraceConnect();
@@ -587,8 +617,11 @@ ConfigureInitialTaskStartOffset(const QuickExampleOptions& options,
 uint32_t ActivateTrafficFromConfig(const std::string& configPath,
                                    bool activateLocalOwnedTasksOnly,
                                    uint32_t mpiRank,
-                                   bool requirePositiveDependencyVisibilityDelay)
+                                   bool requirePositiveDependencyVisibilityDelay,
+                                   Time progressInterval)
 {
+    NS_ABORT_MSG_IF(!progressInterval.IsStrictlyPositive(),
+                    "--progress-interval must be strictly positive");
     const std::string trafficPath = configPath + "/traffic.csv";
     const auto trafficStats =
         UbUtils::Get()->RegisterTrafficPhaseDependenciesAndGetStats(trafficPath);
@@ -654,7 +687,7 @@ uint32_t ActivateTrafficFromConfig(const std::string& configPath,
     UbTrafficGen::Get()->ScheduleNextTasks();
     UbUtils::Get()->PrintTimestamp("[traffic] Scheduled local tasks: " +
                                    std::to_string(localTaskCount));
-    CheckExampleProcess();
+    CheckExampleProcess(progressInterval);
     return localTaskCount;
 }
 
@@ -732,19 +765,29 @@ QuickExampleOptions ParseOptions(int argc, char* argv[])
     cmd.AddValue("canonical-output",
                  "Write deterministic UbTrafficGen canonical events to this output basename",
                  options.canonicalOutputPath);
-    cmd.AddValue("jupiter-te", "Enable historical-window Jupiter TE and per-flow WCMP", options.jupiterTe);
+    cmd.AddValue("progress-interval",
+                 "Simulation-time interval between task progress checks (default 10ms)",
+                 options.progressInterval);
+    cmd.AddValue("jupiter-te",
+                 "Enable historical-window Jupiter TE and per-flow WCMP",
+                 options.jupiterTe);
+    cmd.AddValue("debug-te", "Write Jupiter TE audit logs and CSV files", options.debugTe);
     cmd.AddValue("te-recompute-seconds", "TE policy recomputation interval (default 30s)",
                  options.teRecomputeSeconds);
     cmd.AddValue("te-history-windows", "Max lookback in 30s windows (default 120)",
                  options.teHistoryWindows);
     cmd.AddValue("te-s", "Jupiter hedge parameter S in [0,1] (default 0)", options.teS);
-    cmd.AddValue("te-solver", "Path to tools/jupiter_te_solver.py", options.teSolver);
-    cmd.AddValue("te-output", "Directory for observed bytes, predictions, WCMP weights",
+    cmd.AddValue("te-output", "Debug directory for TE audit logs and CSV files",
                  options.teOutput);
     cmd.AddNonOption("casePath",
                      "Required unified-bus case directory when --case-path is omitted",
                      positionalCasePath);
     cmd.Parse(argc, argv);
+    if (options.debugTe && !options.jupiterTe)
+    {
+        std::cerr << "--debug-te requires --jupiter-te=1" << std::endl;
+        std::exit(1);
+    }
     if (!casePathArg.empty() && !positionalCasePath.empty() &&
         NormalizeCasePath(casePathArg) != NormalizeCasePath(positionalCasePath))
     {
@@ -874,7 +917,8 @@ PhaseTiming RunScenario(const QuickExampleOptions& options,
     ActivateTrafficFromConfig(options.configPath,
                               runtime.enableMpi,
                               runtime.mpiRank,
-                              runtime.enableMpi || ModeUsesMtp(runtime.mode));
+                              runtime.enableMpi || ModeUsesMtp(runtime.mode),
+                              Time(options.progressInterval));
     if (options.stopMs > 0)
     {
         Simulator::Stop(MilliSeconds(options.stopMs));

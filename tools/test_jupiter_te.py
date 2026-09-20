@@ -14,8 +14,19 @@ from generate_ocs_topology import (generate_compute_links, generate_ids,
                                    generate_ocs_links, generate_storage_links,
                                    generate_topology_csv)
 from generate_ocs_routing_table import generate_routing_table
-from jupiter_te_solver import candidates, read_topology, solve
-from analyze_jupiter_te import summarize
+from analyze_jupiter_te import read_topology, summarize
+
+
+def candidates(src, dst, capacities):
+    paths = []
+    if (src, dst) in capacities:
+        paths.append((src, dst, -1, ((src, dst),)))
+    leaves = sorted({node for edge in capacities for node in edge})
+    for middle in leaves:
+        if (middle != src and middle != dst and
+                (src, middle) in capacities and (middle, dst) in capacities):
+            paths.append((src, dst, middle, ((src, middle), (middle, dst))))
+    return paths
 
 
 class JupiterTeTest(unittest.TestCase):
@@ -31,7 +42,19 @@ class JupiterTeTest(unittest.TestCase):
         generate_ocs_links(links, link_id, compute_leaves + storage_leaves)
         generate_topology_csv(links, cls.topology)
         generate_routing_table(cls.topology, cls.routing)
-        cls.ports, cls.capacity, cls.host_leaf = read_topology(cls.topology)
+        cls.capacity = read_topology(cls.topology)
+        cls.ports = defaultdict(list)
+        cls.host_leaf = {}
+        with open(cls.topology, newline="") as stream:
+            for row in csv.DictReader(stream):
+                a, ap = int(row["nodeId1"]), int(row["portId1"])
+                b, bp = int(row["nodeId2"]), int(row["portId2"])
+                if a >= 37 and b >= 37:
+                    cls.ports[a, b].append(ap)
+                    cls.ports[b, a].append(bp)
+                else:
+                    host, hp, leaf = (a, ap, b) if a < 37 else (b, bp, a)
+                    cls.host_leaf[host, hp] = leaf
 
     @classmethod
     def tearDownClass(cls):
@@ -78,21 +101,6 @@ class JupiterTeTest(unittest.TestCase):
         )
         self.assertEqual(output.read_text(), self.routing.read_text())
 
-    def test_lp_limits_utilization_and_s_one_enforces_equal_capacity_shares(self):
-        demand = {(37, 53): 0.8e12, (38, 53): 0.8e12}
-        for s in (0, 0.5, 1):
-            weights, util = solve(self.capacity, demand, s)
-            loads = defaultdict(float)
-            for (src, dst, transit), weight in weights.items():
-                path = next(p for p in candidates(src, dst, self.capacity) if p[2] == transit)
-                for edge in path[3]:
-                    loads[edge] += demand[src, dst] * weight
-            for od in demand:
-                self.assertAlmostEqual(sum(w for k, w in weights.items() if k[:2] == od), 1, places=7)
-            self.assertLessEqual(max(loads[e] / self.capacity[e] for e in loads), util + 1e-6)
-            if s == 1:
-                self.assertAlmostEqual(weights[37, 53, -1], 1 / 13, places=6)
-
     def test_no_direct_with_zero_history_has_sixteen_backup_paths(self):
         paths = candidates(37, 38, self.capacity)
         self.assertTrue(all(transit != -1 for _, _, transit, _ in paths))
@@ -113,6 +121,149 @@ class JupiterTeTest(unittest.TestCase):
         self.assertEqual(len(rows), 1)
         self.assertEqual(rows[0]["window"], "20")
         self.assertAlmostEqual(float(rows[0]["max_utilization"]), 0.25)
+
+    def test_smoke_traffic_crosses_two_te_boundaries(self):
+        traffic = Path(__file__).resolve().parent / "jupiter_te_smoke_traffic.csv"
+        with open(traffic, newline="") as stream:
+            rows = list(csv.DictReader(stream))
+        self.assertEqual(len(rows), 24)
+        self.assertEqual([int(row["taskId"]) for row in rows], list(range(24)))
+        self.assertEqual({row["opType"] for row in rows}, {"URMA_WRITE"})
+        self.assertEqual({int(row["dataSize(Byte)"]) for row in rows}, {1048576})
+        self.assertEqual({int(row["phaseId"]) for row in rows[:8]}, {0})
+        self.assertEqual({row["dependOnPhases"] for row in rows[:8]}, {""})
+        self.assertEqual({int(row["phaseId"]) for row in rows[8:16]}, {1})
+        self.assertEqual({int(row["phaseId"]) for row in rows[16:]}, {2})
+        self.assertEqual({row["dependOnPhases"] for row in rows}, {""})
+        self.assertEqual(
+            [row["delay"] for row in rows[8:16]],
+            ["31s", "31100ms", "31200ms", "31300ms", "31400ms", "31500ms",
+             "31600ms", "31700ms"],
+        )
+        self.assertEqual(
+            [row["delay"] for row in rows[16:]],
+            ["62s", "62100ms", "62200ms", "62300ms", "62400ms", "62500ms",
+             "62600ms", "62700ms"],
+        )
+
+    def test_wcmp_trace_drives_directed_task_intervals_and_hotspot_matrices(self):
+        case = Path(self.tmp.name) / "wcmp-analysis-case"
+        output = case / "output"
+        te_output = case / "jupiter_te"
+        output.mkdir(parents=True)
+        te_output.mkdir(parents=True)
+
+        with (output / "task_statistics.csv").open("w", newline="") as stream:
+            writer = csv.writer(stream)
+            writer.writerow(
+                (
+                    "taskId",
+                    "sourceNode",
+                    "destNode",
+                    "taskStartTime(us)",
+                    "taskCompletesTime(us)",
+                    "opType",
+                )
+            )
+            writer.writerow((1, 1, 2, 0, 20_000_000, "URMA_WRITE"))
+            writer.writerow((2, 1, 2, 10_000_000, 30_000_000, "URMA_READ"))
+
+        with (case / "traffic.csv").open("w", newline="") as stream:
+            writer = csv.writer(stream)
+            writer.writerow(("taskId", "opType"))
+            writer.writerow((1, "URMA_WRITE"))
+            writer.writerow((2, "URMA_READ"))
+
+        with (te_output / "WcmpSelectionTrace.csv").open("w", newline="") as stream:
+            writer = csv.writer(stream)
+            writer.writerow(
+                (
+                    "sim_time_seconds",
+                    "task_id",
+                    "epoch",
+                    "flow_hash",
+                    "sip",
+                    "dip",
+                    "sport",
+                    "dport",
+                    "priority",
+                    "src_leaf",
+                    "dst_leaf",
+                    "transit_leaf",
+                    "next_leaf",
+                    "out_port",
+                    "decision_source",
+                )
+            )
+            writer.writerow(
+                (0.0, 1, 0, 101, "10.0.1.1", "10.0.2.1", 1, 2, 7,
+                 37, 53, -1, 53, 1, "fallback")
+            )
+            # A second transport flow for one task must not double-count its lifetime.
+            writer.writerow(
+                (0.1, 1, 0, 102, "10.0.1.1", "10.0.2.1", 3, 4, 7,
+                 37, 53, -1, 53, 2, "pinned")
+            )
+            # READ payload travels from the task destination back to its source.
+            writer.writerow(
+                (10.0, 2, 0, 201, "10.0.2.1", "10.0.1.1", 5, 6, 7,
+                 53, 37, -1, 37, 3, "fallback")
+            )
+
+        analysis_script = Path(__file__).resolve().parent / "leaf_pair_active_flow_analysis.py"
+        subprocess.run(
+            [sys.executable, str(analysis_script), str(case), "--leaf-nodes=37,53"],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        analysis_output = output / "leaf_pair_active_flow_analysis"
+        with (analysis_output / "task_leaf_mapping.csv").open(newline="") as stream:
+            mappings = list(csv.DictReader(stream))
+        self.assertEqual(
+            [(row["taskId"], row["leaf_a"], row["leaf_b"]) for row in mappings],
+            [("1", "37", "53"), ("2", "53", "37")],
+        )
+        with (analysis_output / "leaf_pair_active_flow_intervals.csv").open(
+            newline=""
+        ) as stream:
+            intervals = list(csv.DictReader(stream))
+        self.assertEqual(len(intervals), 2)
+        self.assertEqual({float(row["duration_us"]) for row in intervals}, {20_000_000.0})
+
+        plot_script = (
+            Path(__file__).resolve().parent
+            / "analyze_leaf_pair_hotspot_duration_matrix_60s.py"
+        )
+        subprocess.run(
+            [
+                sys.executable,
+                str(plot_script),
+                str(case),
+                "--leaf-nodes=37,53",
+                "--threshold=1",
+                "--bin-s=20",
+                "--origin=zero",
+                "--no-annotate",
+                "--dpi=40",
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        hotspot_output = output / "leaf_pair_hotspot_duration_60s"
+        with (hotspot_output / "leaf_pair_hotspot_duration_long.csv").open(
+            newline=""
+        ) as stream:
+            hotspot_rows = list(csv.DictReader(stream))
+        self.assertEqual(len(hotspot_rows), 3)
+        self.assertEqual(
+            sum(float(row["hotspot_duration_s"]) for row in hotspot_rows),
+            40.0,
+        )
+        self.assertTrue(
+            (hotspot_output / "00_all_leaf_pair_hotspot_duration_20s.png").exists()
+        )
 
 
 if __name__ == "__main__":

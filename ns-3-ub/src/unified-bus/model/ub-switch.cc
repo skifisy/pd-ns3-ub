@@ -9,6 +9,7 @@
 #include "ns3/ub-caqm.h"
 #include "ns3/ub-port.h"
 #include "ns3/ub-switch.h"
+#include "ns3/ub-tag.h"
 #include "ns3/ub-controller.h"
 #include "ns3/ub-utils.h"
 
@@ -802,6 +803,11 @@ void UbSwitch::ForwardDataPacket(Ptr<UbPort> port, Ptr<Packet> packet, const Par
     // Get routing key from parsed headers
     RoutingKey rtKey;
     GetURMARoutingKey(headers, rtKey);
+    UbFlowTag flowTag;
+    if (packet->PeekPacketTag(flowTag)) {
+        rtKey.taskId = flowTag.GetFlowId();
+        rtKey.hasTaskId = true;
+    }
 
     // Route
     bool selectedShortestPath = false;
@@ -931,7 +937,12 @@ void UbSwitch::ParseURMAPacketHeader(Ptr<Packet> packet, ParsedURMAHeaders &head
     packet->RemoveHeader(headers.networkHeader);
     packet->RemoveHeader(headers.ipv4Header);
     packet->RemoveHeader(headers.udpHeader);
-    packet->PeekHeader(headers.transportHeader);
+    packet->RemoveHeader(headers.transportHeader);
+    if (headers.transportHeader.GetTPOpcode() ==
+        static_cast<uint8_t>(TpOpcode::TP_OPCODE_RELIABLE_TA)) {
+        packet->PeekHeader(headers.transactionHeader);
+    }
+    packet->AddHeader(headers.transportHeader);
     packet->AddHeader(headers.udpHeader);
     packet->AddHeader(headers.ipv4Header);
     packet->AddHeader(headers.networkHeader);
@@ -971,7 +982,12 @@ void UbSwitch::ParseCtpPacketHeader(Ptr<Packet> packet, ParsedCtpHeaders &header
 
 void UbSwitch::GetURMARoutingKey(const ParsedURMAHeaders &headers, RoutingKey &rtKey)
 {
-    rtKey.teEligible = true;
+    const auto taOpcode = static_cast<TaOpcode>(headers.transactionHeader.GetTaOpcode());
+    rtKey.teEligible =
+        headers.transportHeader.GetTPOpcode() ==
+            static_cast<uint8_t>(TpOpcode::TP_OPCODE_RELIABLE_TA) &&
+        (taOpcode == TaOpcode::TA_OPCODE_WRITE ||
+         taOpcode == TaOpcode::TA_OPCODE_READ_RESPONSE);
     rtKey.sip = headers.ipv4Header.GetSource().Get();
     rtKey.dip = headers.ipv4Header.GetDestination().Get();
     rtKey.sport = headers.udpHeader.GetSourcePort();

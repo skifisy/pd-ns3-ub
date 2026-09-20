@@ -2,6 +2,7 @@
 #ifndef UB_PORT_H
 #define UB_PORT_H
 
+#include <atomic>
 #include <map>
 #include <vector>
 #include <string>
@@ -130,6 +131,7 @@ public:
     bool EnqueueToEgress(PacketEntry packetEntry);
 
     uint64_t GetTxBytes();
+    uint64_t GetTxPackets();
 
     void SetIfIndex(const uint32_t index) override;
 
@@ -210,7 +212,8 @@ private:
 
     Ptr<UbLink> m_channel;
 
-    uint64_t m_txBytes;
+    std::atomic<uint64_t> m_txBytes;
+    std::atomic<uint64_t> m_txPackets;
 
     DataRate m_bps;
 

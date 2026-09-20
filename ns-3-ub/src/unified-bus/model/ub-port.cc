@@ -6,7 +6,6 @@
 #include "ns3/ub-caqm.h"
 #include "ns3/ub-tag.h"
 #include "ns3/ub-utils.h"
-#include "ns3/ub-te-controller.h"
 #ifdef NS3_MPI
 #include "ns3/mpi-receiver.h"
 #endif
@@ -246,7 +245,8 @@ UbPort::UbPort()
     NS_LOG_FUNCTION(this);
     m_ubEQ = CreateObject<UbEgressQueue>();
     m_sendState = SendState::READY;
-    m_txBytes = 0;
+    m_txBytes.store(0, std::memory_order_relaxed);
+    m_txPackets.store(0, std::memory_order_relaxed);
     m_mpiReceiveEnabled = false;
     BooleanValue val;
     if (GlobalValue::GetValueByNameFailSafe("UB_RECORD_PKT_TRACE", val)) {
@@ -458,7 +458,6 @@ void UbPort::TransmitPacket(Ptr<Packet> packet, Time delay)
     Simulator::Schedule(txCompleteTime, &UbPort::TransmitComplete, this);
     NS_LOG_DEBUG("[UbFc DequeueAndTransmit] will send pkt size: " << packet->GetSize());
     UpdateTxBytes(packet->GetSize());
-    UbTeController::Get().OnHostTransmit(GetNode()->GetId(), m_portId, packet);
 
     return;
 }
@@ -489,7 +488,6 @@ UbPort::TransmitPacketDetached(Ptr<Packet> packet)
 
     TraComEventNotify(packet, txTime);
     UpdateTxBytes(packet->GetSize());
-    UbTeController::Get().OnHostTransmit(GetNode()->GetId(), m_portId, packet);
 }
 
 void UbPort::Receive(Ptr<Packet> packet)
@@ -679,12 +677,18 @@ uint8_t UbPort::GetCredits(int index)
 
 void UbPort::UpdateTxBytes(uint64_t bytes)
 {
-    m_txBytes += bytes;
+    m_txBytes.fetch_add(bytes, std::memory_order_relaxed);
+    m_txPackets.fetch_add(1, std::memory_order_relaxed);
 }
 
 uint64_t UbPort::GetTxBytes()
 {
-    return m_txBytes;
+    return m_txBytes.load(std::memory_order_relaxed);
+}
+
+uint64_t UbPort::GetTxPackets()
+{
+    return m_txPackets.load(std::memory_order_relaxed);
 }
 
 bool UbPort::IsReady()

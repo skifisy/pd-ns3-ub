@@ -18,7 +18,7 @@ from pathlib import Path
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
-DEFAULT_CASE_DIR = PROJECT_ROOT / "ns-3-ub" / "scratch" / "mooncake_pd_storage_ocs_topology"
+DEFAULT_CASE_DIR = PROJECT_ROOT / "ns-3-ub" / "scratch" / "mooncake_pd_ocs"
 FIRST_LEAF_ID = 37
 
 
@@ -131,7 +131,7 @@ def parse_args() -> argparse.Namespace:
         default=DEFAULT_CASE_DIR,
         help=(
             "case directory containing topology.csv; default: "
-            "ns-3-ub/scratch/mooncake_pd_storage_ocs_topology"
+            "ns-3-ub/scratch/mooncake_pd_ocs"
         ),
     )
     parser.add_argument(

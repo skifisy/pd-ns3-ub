@@ -3,8 +3,13 @@
 #define UB_ROUTING_PROCESS_H
 
 #include "ns3/node.h"
+#include <cstdint>
 #include <map>
+#include <mutex>
+#include <shared_mutex>
 #include <set>
+#include <unordered_map>
+#include <unordered_set>
 namespace ns3 {
 
 class UbQueueManager;
@@ -24,6 +29,30 @@ struct RoutingKey {
     bool usePacketSpray;
     bool hashIncludesTransportPorts{false};
     bool teEligible{false}; // IP-based URMA data only; never reroute LDST/CTP control.
+    uint32_t taskId{0};
+    bool hasTaskId{false};
+};
+
+enum class TeRouteDecisionSource : uint8_t
+{
+    NONE = 0,
+    FALLBACK,
+    HISTORICAL_POLICY,
+    PINNED,
+    TRANSIT_FORWARD,
+};
+
+struct TeRouteDecision
+{
+    bool managed{false};
+    bool sourceDecision{false};
+    uint64_t epoch{0};
+    uint32_t sourceLeaf{0};
+    uint32_t destinationLeaf{0};
+    int32_t transitLeaf{-1};
+    uint32_t nextLeaf{0};
+    uint16_t outPort{0};
+    TeRouteDecisionSource source{TeRouteDecisionSource::NONE};
 };
 
 /**
@@ -91,6 +120,55 @@ private:
         ADAPTIVE = 1   // Adaptive routing
     };
 
+    struct TeRouteCacheKey
+    {
+        uint64_t flowHash;
+        uint16_t inPort;
+
+        bool operator==(const TeRouteCacheKey& other) const
+        {
+            return flowHash == other.flowHash && inPort == other.inPort;
+        }
+    };
+
+    struct TeRouteCacheKeyHash
+    {
+        size_t operator()(const TeRouteCacheKey& key) const
+        {
+            return std::hash<uint64_t>{}(key.flowHash) ^
+                   (std::hash<uint16_t>{}(key.inPort) << 1);
+        }
+    };
+
+    struct TeRouteCacheEntry
+    {
+        int outPort;
+        bool selectedShortestPath;
+        TeRouteDecision decision;
+        uint32_t firstTaskId;
+        bool hasFirstTaskId;
+    };
+
+    struct TeTaskTraceKey
+    {
+        uint32_t taskId;
+        uint64_t flowHash;
+
+        bool operator==(const TeTaskTraceKey& other) const
+        {
+            return taskId == other.taskId && flowHash == other.flowHash;
+        }
+    };
+
+    struct TeTaskTraceKeyHash
+    {
+        size_t operator()(const TeTaskTraceKey& key) const
+        {
+            return std::hash<uint32_t>{}(key.taskId) ^
+                   (std::hash<uint64_t>{}(key.flowHash) << 1);
+        }
+    };
+
     uint32_t m_nodeId;
     UbRoutingAlgorithm m_routingAlgorithm = UbRoutingAlgorithm::HASH;
     uint64_t CalcHash(uint32_t sip, uint32_t dip, uint16_t sport, uint16_t dport, uint8_t priority, uint32_t salt);
@@ -110,6 +188,9 @@ private:
     void GetRangeOutPorts(const RouteRangeByPortMap& routeRangesByPort,
                           const uint32_t destIP,
                           std::vector<uint16_t>& outPorts);
+    void MaybeTraceWcmpTask(const RoutingKey& key,
+                            uint64_t flowHash,
+                            const TeRouteDecision& decision);
 
     // 全局端口集合池：存储所有唯一的端口集合
     std::unordered_map<std::vector<uint16_t>, std::shared_ptr<std::vector<uint16_t> >, VectorHash> m_portSetPool;
@@ -119,6 +200,15 @@ private:
     std::unordered_map<uint32_t, std::shared_ptr<std::vector<uint16_t> > > m_rtOther;
     RouteRangeByPortMap m_rtShortestRanges;
     RouteRangeByPortMap m_rtOtherRanges;
+
+    // Jupiter pins a flow to the path selected by its first packet. Keep the
+    // resulting physical port locally; an outPort of -2 caches that the hop
+    // uses ordinary routing (normally destination leaf -> host). Both forms
+    // keep subsequent packets out of the process-wide TE controller.
+    mutable std::shared_mutex m_teRouteCacheMutex;
+    std::unordered_map<TeRouteCacheKey, TeRouteCacheEntry, TeRouteCacheKeyHash> m_teRouteCache;
+    std::mutex m_teTaskTraceMutex;
+    std::unordered_set<TeTaskTraceKey, TeTaskTraceKeyHash> m_tracedTeTasks;
     
     // 辅助函数：标准化端口集合（排序去重）
     std::vector<uint16_t> normalizePorts(const std::vector<uint16_t>& ports)

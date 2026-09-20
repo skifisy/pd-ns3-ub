@@ -33,6 +33,7 @@
 #include "ns3/ub-switch-allocator.h"
 #include "ns3/ub-switch.h"
 #include "ns3/ub-tag.h"
+#include "ns3/ub-te-solver.h"
 #include "ns3/ub-traffic-gen.h"
 #include "ns3/ub-transaction.h"
 #include "ns3/ub-utils.h"
@@ -1687,14 +1688,23 @@ class UbTrafficGenRecordViewDependencyTest : public TestCase
         NS_TEST_ASSERT_MSG_EQ(gen.GetPendingPhaseCountForTesting(2),
                               2u,
                               "record view should deduplicate repeated dependency phases");
+        NS_TEST_ASSERT_MSG_EQ(gen.GetTotalTaskCount(), 3u, "task total should be cached");
+        NS_TEST_ASSERT_MSG_EQ(gen.GetCompletedTaskCount(), 0u, "no task is complete yet");
+        const auto initialCounts = gen.GetTaskStateCounts();
+        NS_TEST_ASSERT_MSG_EQ(initialCounts.pending, 1u, "one task should wait on phases");
+        NS_TEST_ASSERT_MSG_EQ(initialCounts.ready, 2u, "two tasks should initially be ready");
 
         gen.ScheduleNextTasks();
         gen.ApplyTaskCompletion(0);
+        NS_TEST_ASSERT_MSG_EQ(gen.GetCompletedTaskCount(), 1u,
+                              "completed-task cache should advance exactly once");
         NS_TEST_ASSERT_MSG_EQ(gen.GetPendingPhaseCountForTesting(2),
                               1u,
                               "record view dependent task should still wait for the second phase");
 
         gen.ApplyTaskCompletion(1);
+        NS_TEST_ASSERT_MSG_EQ(gen.GetCompletedTaskCount(), 2u,
+                              "completed-task cache should track both completions");
         NS_TEST_ASSERT_MSG_EQ(gen.GetPendingPhaseCountForTesting(2),
                               0u,
                               "record view dependent task should release after all phases complete");
@@ -12285,6 +12295,99 @@ class UbCompactTransportChannelRejectsNullPacketTest : public TestCase
                               "Null CTP packet enqueue should fail with SIGABRT");
     }
 };
+#endif
+
+#ifdef NS3_UB_HAVE_HIGHS
+class UbTeSolverTwoStageLpTest : public TestCase
+{
+  public:
+    UbTeSolverTwoStageLpTest()
+        : TestCase("UnifiedBus - in-process Jupiter TE solves the two-stage LP")
+    {
+    }
+
+  private:
+    using Od = UbTeSolver::Od;
+
+    static std::map<Od, double> BuildJupiterCapacities()
+    {
+        std::map<Od, double> capacities;
+        for (uint32_t src = 37; src <= 56; ++src)
+        {
+            for (uint32_t dst = 37; dst <= 56; ++dst)
+            {
+                if (src != dst && (src - 37) / 4 != (dst - 37) / 4)
+                {
+                    capacities[{src, dst}] = 1.6e12;
+                }
+            }
+        }
+        return capacities;
+    }
+
+    void DoRun() override
+    {
+        const auto capacities = BuildJupiterCapacities();
+        const std::map<Od, double> demands{{{37, 53}, 0.8e12}, {{38, 53}, 0.8e12}};
+        const auto result = UbTeSolver::Solve(capacities, demands, 1.0);
+
+        NS_TEST_ASSERT_MSG_EQ(result.policy.size(), 2u, "both active ODs need a policy");
+        NS_TEST_ASSERT_MSG_EQ(result.pathCount, 26u, "each OD should have thirteen paths");
+        std::map<Od, double> loads;
+        for (const auto& [od, weights] : result.policy)
+        {
+            double total = 0.0;
+            for (const auto& [transit, weight] : weights)
+            {
+                total += weight;
+                if (transit < 0)
+                {
+                    loads[od] += demands.at(od) * weight;
+                }
+                else
+                {
+                    loads[{od.first, static_cast<uint32_t>(transit)}] +=
+                        demands.at(od) * weight;
+                    loads[{static_cast<uint32_t>(transit), od.second}] +=
+                        demands.at(od) * weight;
+                }
+            }
+            NS_TEST_ASSERT_MSG_EQ_TOL(total, 1.0, 1e-9, "path fractions must sum to one");
+        }
+        NS_TEST_ASSERT_MSG_EQ_TOL(result.policy.at({37, 53}).at(-1),
+                                  1.0 / 13.0,
+                                  1e-7,
+                                  "S=1 should enforce equal shares for equal-capacity paths");
+        for (const auto& [edge, load] : loads)
+        {
+            NS_TEST_ASSERT_MSG_LT_OR_EQ(load / capacities.at(edge),
+                                        result.minMaxUtilization + 1e-7,
+                                        "reported U must bound every directed edge");
+        }
+
+        const auto tiny = UbTeSolver::Solve(capacities, {{{37, 53}, 4.266666666666667}}, 0.0);
+        double tinyTotal = 0.0;
+        for (const auto& [transit, weight] : tiny.policy.at({37, 53}))
+        {
+            (void)transit;
+            tinyTotal += weight;
+        }
+        NS_TEST_ASSERT_MSG_EQ_TOL(tinyTotal, 1.0, 1e-12, "tiny OD policy must stay normalized");
+        NS_TEST_ASSERT_MSG_GT(tiny.minMaxUtilization, 0.0, "tiny demand must remain nonzero");
+    }
+};
+
+class UbTeSolverTestSuite : public TestSuite
+{
+  public:
+    UbTeSolverTestSuite()
+        : TestSuite("unified-bus-jupiter-te-solver", Type::UNIT)
+    {
+        AddTestCase(new UbTeSolverTwoStageLpTest(), TestCase::Duration::QUICK);
+    }
+};
+
+static UbTeSolverTestSuite g_ubTeSolverTestSuite;
 #endif
 
 /**

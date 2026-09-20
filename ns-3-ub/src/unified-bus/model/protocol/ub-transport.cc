@@ -8,6 +8,7 @@
 #include "../ub-network-address.h"
 #include "ns3/node.h"
 #include "ns3/ub-switch.h"
+#include "ns3/ub-te-controller.h"
 #include "ns3/ub-queue-manager.h"
 #include "ns3/ub-transport.h"
 #include "ns3/ub-utils.h"
@@ -38,6 +39,17 @@ IsZeroPayloadReadRequest(const Ptr<UbWqeSegment>& segment)
 {
     return segment != nullptr && segment->GetType() == TaOpcode::TA_OPCODE_READ &&
            segment->GetSegmentKind() == UbTransactionSegmentKind::REQUEST;
+}
+
+bool
+IsTeBusinessDataSegment(const Ptr<UbWqeSegment>& segment)
+{
+    if (segment == nullptr) {
+        return false;
+    }
+    const TaOpcode opcode = segment->GetType();
+    return opcode == TaOpcode::TA_OPCODE_WRITE ||
+           opcode == TaOpcode::TA_OPCODE_READ_RESPONSE;
 }
 
 uint32_t
@@ -748,6 +760,13 @@ UbTransportChannel::SendNewDataPacket(const NewDataSendContext& ctx)
                                        ctx.payloadBytes,
                                        ctx.wireLengthBytes,
                                        ctx.progressBytes);
+    if (IsTeBusinessDataSegment(ctx.segment)) {
+        UbTeController::Get().OnNewDataPacket(m_nodeId,
+                                              m_sport,
+                                              m_dest,
+                                              m_dport,
+                                              ctx.payloadBytes);
+    }
     NotifyNewDataPacketSent(ctx, packet);
     AdvanceNewDataSendState(ctx, packet);
     return packet;

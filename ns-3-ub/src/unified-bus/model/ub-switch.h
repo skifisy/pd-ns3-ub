@@ -50,6 +50,7 @@ struct ParsedURMAHeaders {
     Ipv4Header ipv4Header;
     UdpHeader udpHeader;
     UbTransportHeader transportHeader;
+    UbDummyTransactionHeader transactionHeader;
 };
 
 /**

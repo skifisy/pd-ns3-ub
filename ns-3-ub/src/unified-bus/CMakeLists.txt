@@ -2,6 +2,23 @@ set(mpi_sources)
 set(mpi_headers)
 set(mpi_libraries)
 set(mtp_libraries)
+set(te_solver_libraries)
+
+# Jupiter TE solves its two-stage LP in process. HiGHS is optional for a
+# normal unified-bus build, but --jupiter-te fails immediately at runtime when
+# this backend was not found during configuration.
+find_package(highs CONFIG QUIET)
+if(TARGET highs::highs)
+  set(te_solver_libraries highs::highs)
+  add_compile_definitions(NS3_UB_HAVE_HIGHS=1)
+  message(STATUS "UnifiedBus Jupiter TE: in-process HiGHS backend enabled")
+elseif(TARGET highs)
+  set(te_solver_libraries highs)
+  add_compile_definitions(NS3_UB_HAVE_HIGHS=1)
+  message(STATUS "UnifiedBus Jupiter TE: in-process HiGHS backend enabled")
+else()
+  message(STATUS "UnifiedBus Jupiter TE: HiGHS not found; --jupiter-te will be unavailable")
+endif()
 
 if(${ENABLE_MPI})
   set(mpi_sources
@@ -42,6 +59,7 @@ build_lib(
 	model/protocol/ub-transport.cc
 	model/protocol/ub-retrans.cc
 	model/protocol/ub-routing-process.cc
+	model/protocol/ub-te-solver.cc
 	model/protocol/ub-te-controller.cc
 	model/ub-switch-allocator.cc
 	model/ub-utils.cc
@@ -76,6 +94,7 @@ build_lib(
 	model/protocol/ub-transport.h
 	model/protocol/ub-retrans.h
 	model/protocol/ub-routing-process.h
+	model/protocol/ub-te-solver.h
 	model/protocol/ub-te-controller.h
 	model/ub-switch-allocator.h
 	model/ub-utils.h
@@ -96,6 +115,7 @@ build_lib(
                     ${libapplications}
                     ${libpoint-to-point}
                     ${libconfig-store}
+                    ${te_solver_libraries}
                     ${mtp_libraries}
                     ${mpi_libraries}
   TEST_SOURCES test/ub-test.cc

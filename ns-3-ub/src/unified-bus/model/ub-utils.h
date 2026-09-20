@@ -255,7 +255,7 @@ private:
 
     struct TraceFileState
     {
-        std::ofstream stream;
+        std::string path;
         std::string pending;
         std::mutex mutex;
     };
@@ -265,7 +265,7 @@ private:
     // Runtime trace state shared by current process.
     inline static std::string trace_path;
 
-    inline static std::map<std::string, TraceFileState> files;  // 存储文件名和对应的文件句柄/缓冲
+    inline static std::map<std::string, TraceFileState> files;  // Per-file path, buffer and lock.
     inline static std::mutex files_mutex;
     inline static std::mutex runtime_drop_mutex;
     inline static uint64_t runtime_packet_drop_count = 0;
@@ -425,6 +425,8 @@ private:
     static void PrintTraceInfoNoTs(const std::string& fileName, const std::string& info);
 
     static TraceFileState& GetTraceFile(const std::string& fileName);
+
+    static void FlushTraceFileLocked(TraceFileState& fileState);
 
     static void FlushTraceFile(TraceFileState& fileState);
 

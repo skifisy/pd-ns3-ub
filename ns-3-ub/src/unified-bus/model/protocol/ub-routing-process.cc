@@ -42,6 +42,26 @@ UbRoutingProcess::UbRoutingProcess()
 {
 }
 
+void
+UbRoutingProcess::MaybeTraceWcmpTask(const RoutingKey& key,
+                                     uint64_t flowHash,
+                                     const TeRouteDecision& decision)
+{
+    if (!key.hasTaskId || !decision.sourceDecision ||
+        !UbTeController::Get().DebugEnabled())
+    {
+        return;
+    }
+    {
+        std::lock_guard<std::mutex> lock(m_teTaskTraceMutex);
+        if (!m_tracedTeTasks.insert({key.taskId, flowHash}).second)
+        {
+            return;
+        }
+    }
+    UbTeController::Get().WriteWcmpSelectionTrace(key.taskId, key, flowHash, decision);
+}
+
 std::shared_ptr<std::vector<uint16_t> >
 UbRoutingProcess::GetOrCreatePortSet(const std::vector<uint16_t>& ports)
 {
@@ -463,9 +483,68 @@ int UbRoutingProcess::GetOutPort(RoutingKey &rtKey, bool &selectedShortestPath, 
         const uint64_t hash = rtKey.hashIncludesTransportPorts
             ? CalcHash(rtKey.sip, rtKey.dip, rtKey.sport, rtKey.dport, rtKey.priority, salt)
             : CalcHash(rtKey.sip, rtKey.dip, 0, 0, rtKey.priority, salt);
-        const int tePort = UbTeController::Get().SelectLeafOutPort(m_nodeId, rtKey, hash,
-                                                                    inPort, selectedShortestPath);
-        if (tePort != -2) return tePort;
+        const TeRouteCacheKey cacheKey{hash, inPort};
+        bool useNormalRouting = false;
+        bool foundCachedRoute = false;
+        TeRouteCacheEntry cachedRoute{};
+        {
+            std::shared_lock<std::shared_mutex> lock(m_teRouteCacheMutex);
+            const auto cached = m_teRouteCache.find(cacheKey);
+            if (cached != m_teRouteCache.end()) {
+                if (cached->second.outPort >= 0) {
+                    cachedRoute = cached->second;
+                    foundCachedRoute = true;
+                }
+                // -2 means that this flow/hop is outside the TE-managed OCS
+                // path (normally the destination leaf forwarding to a host).
+                // Cache that negative lookup, but still run the ordinary
+                // routing algorithm for every packet.
+                useNormalRouting = cached->second.outPort == -2;
+            }
+        }
+        if (foundCachedRoute) {
+            selectedShortestPath = cachedRoute.selectedShortestPath;
+            TeRouteDecision traceDecision = cachedRoute.decision;
+            if (rtKey.hasTaskId && cachedRoute.hasFirstTaskId &&
+                rtKey.taskId != cachedRoute.firstTaskId)
+            {
+                traceDecision.source = TeRouteDecisionSource::PINNED;
+            }
+            MaybeTraceWcmpTask(rtKey, hash, traceDecision);
+            return cachedRoute.outPort;
+        }
+        if (!useNormalRouting) {
+            TeRouteDecision decision;
+            bool teSelectedDirect = false;
+            const int tePort = UbTeController::Get().SelectLeafOutPort(
+                m_nodeId, rtKey, hash, inPort, teSelectedDirect, decision);
+            if (tePort >= 0 || tePort == -2) {
+                TeRouteCacheEntry publishedRoute{};
+                std::unique_lock<std::shared_mutex> lock(m_teRouteCacheMutex);
+                const auto result = m_teRouteCache.emplace(
+                    cacheKey,
+                    TeRouteCacheEntry{
+                        tePort, teSelectedDirect, decision, rtKey.taskId, rtKey.hasTaskId});
+                if (result.first->second.outPort >= 0) {
+                    // Concurrent first packets must use the first published
+                    // WCMP decision for the flow.
+                    publishedRoute = result.first->second;
+                    lock.unlock();
+                    selectedShortestPath = publishedRoute.selectedShortestPath;
+                    TeRouteDecision traceDecision = publishedRoute.decision;
+                    if (rtKey.hasTaskId && publishedRoute.hasFirstTaskId &&
+                        rtKey.taskId != publishedRoute.firstTaskId)
+                    {
+                        traceDecision.source = TeRouteDecisionSource::PINNED;
+                    }
+                    MaybeTraceWcmpTask(rtKey, hash, traceDecision);
+                    return publishedRoute.outPort;
+                }
+            }
+            if (tePort == -1) {
+                return -1;
+            }
+        }
     }
     uint32_t sip = rtKey.sip;
     uint32_t dip = rtKey.dip;
