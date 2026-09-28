@@ -2,7 +2,7 @@
 
 本文档说明如何从脚本生成 case、单独生成 `routing_table.csv`、准备 Mooncake 流量、编译 ns-3，以及运行 Jupiter historical-TE/WCMP 仿真。
 
-算法和实现细节见 [`JUPITER_TE.md`](./JUPITER_TE.md)。本文档只关注“命令怎么跑”。
+技术思路和优化模型见 [`JUPITER_TE_DESIGN.md`](./JUPITER_TE_DESIGN.md)，实现摘要见 [`JUPITER_TE.md`](./JUPITER_TE.md)。本文档只关注“命令怎么跑”。
 
 ## 1. 工作目录和依赖
 

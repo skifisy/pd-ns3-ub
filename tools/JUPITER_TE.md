@@ -1,6 +1,6 @@
 # Mooncake 流量的历史预测 TE 仿真
 
-具体的脚本执行顺序、`routing_table.csv` 单独生成方式、ns-3 编译/运行命令和结果分析步骤见 [`JUPITER_TE_RUN.md`](./JUPITER_TE_RUN.md)。本文档主要说明 TE/WCMP 的实现语义。
+整体技术思路、控制闭环和优化模型见 [`JUPITER_TE_DESIGN.md`](./JUPITER_TE_DESIGN.md)。具体的脚本执行顺序、`routing_table.csv` 单独生成方式、ns-3 编译/运行命令和结果分析步骤见 [`JUPITER_TE_RUN.md`](./JUPITER_TE_RUN.md)。本文档保留 TE/WCMP 的实现摘要。
 
 本实现仅对 `tools/generate_ocs_topology.py` 的静态 OCS 拓扑启用：37–56 每个 leaf 是一个 block。每对跨组 leaf 的 4 条 400 Gbps 物理链路在 LP 中是一条 1.6 Tbps **有向**逻辑边；不同组有直达路径和 12 条一跳中转路径，同组没有直达路径、有 16 条一跳中转路径。拓扑生成脚本同时生成 `node.csv`、`topology.csv` 和逐个目的 host 端口精确匹配的 `routing_table.csv`。已有 `topology.csv` 时也可用 `tools/generate_routing_table.py` 单独重建路由表。
 
