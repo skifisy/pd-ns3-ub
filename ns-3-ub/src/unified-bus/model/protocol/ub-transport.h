@@ -329,6 +329,7 @@ public:
     uint64_t GetPsnSndUna() const;
     void SetPsnSndUna(uint64_t psn);
     uint64_t GetPsnSndNxt() const;
+    bool HasPendingControlForTopologyChange() const;
     void SetPsnSndNxt(uint64_t psn);
     uint64_t GetPsnRecvNxt() const;
     uint32_t GetGbnRetransmissionProgressBytesFromPsn(uint64_t psn) const;

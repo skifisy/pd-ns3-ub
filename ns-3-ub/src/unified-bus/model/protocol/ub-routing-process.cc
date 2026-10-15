@@ -8,6 +8,7 @@
 #include "ns3/ub-queue-manager.h"
 #include "ns3/ub-routing-process.h"
 #include "ns3/ub-te-controller.h"
+#include "ns3/ub-toe-controller.h"
 #include "ns3/udp-header.h"
 #include "ns3/ipv4-header.h"
 using namespace utils;
@@ -40,6 +41,14 @@ TypeId UbRoutingProcess::GetTypeId(void)
 
 UbRoutingProcess::UbRoutingProcess()
 {
+}
+
+void UbRoutingProcess::ClearTeRouteCache()
+{
+    std::unique_lock<std::shared_mutex> lock(m_teRouteCacheMutex);
+    m_teRouteCache.clear();
+    std::lock_guard<std::mutex> traceLock(m_teTaskTraceMutex);
+    m_tracedTeTasks.clear();
 }
 
 void
@@ -476,6 +485,27 @@ int UbRoutingProcess::SelectOutPort(RoutingKey &rtKey, const std::vector<uint16_
 // 3. 如果找不到出端口，报错
 int UbRoutingProcess::GetOutPort(RoutingKey &rtKey, bool &selectedShortestPath, uint16_t inPort)
 {
+    if (UbToeController::Get().UsesEcmp()) {
+        const uint32_t salt = utils::NodeIdToIp(m_nodeId).Get();
+        uint64_t hash = 0;
+        if (rtKey.usePacketSpray)
+        {
+            const uint64_t flowBase = CalcHash(rtKey.sip, rtKey.dip, 0, rtKey.dport,
+                                               rtKey.priority, salt);
+            const uint64_t packetSalt = CalcHash(0, 0, rtKey.sport, 0, 0, salt);
+            hash = flowBase + packetSalt;
+        }
+        else
+        {
+            hash = rtKey.hashIncludesTransportPorts
+                       ? CalcHash(rtKey.sip, rtKey.dip, rtKey.sport, rtKey.dport,
+                                  rtKey.priority, salt)
+                       : CalcHash(rtKey.sip, rtKey.dip, 0, 0, rtKey.priority, salt);
+        }
+        const int toePort = UbToeController::Get().SelectEcmpOutPort(
+            m_nodeId, rtKey, hash, inPort, selectedShortestPath);
+        if (toePort >= 0 || toePort == -1) return toePort;
+    }
     if (rtKey.teEligible && UbTeController::Get().Enabled()) {
         const uint32_t salt = utils::NodeIdToIp(m_nodeId).Get();
         // The same per-flow hash key as SelectOutPort, including the existing

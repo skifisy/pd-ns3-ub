@@ -105,6 +105,9 @@ public:
     void PushPacketToVoq(Ptr<Packet> p, uint32_t outPort, uint32_t priority, uint32_t inPort);
     static bool IsValidVoqIndices(uint32_t outPort, uint32_t priority, uint32_t inPort, uint32_t portsNum, uint32_t vlNum);
     uint64_t GetAllocatedVoqCountForTest() const;
+    bool IsQuiescentForTopologyChange() const;
+    bool IsPortQuiescentForTopologyChange(uint32_t portId) const;
+    void InitPortFlowControl(uint32_t portId);
     bool HasVoqForTest(uint32_t outPort, uint32_t priority, uint32_t inPort) const;
     void RemoveTpFromAllocator(Ptr<UbIngressQueue> tp);
     Ptr<UbSwitchAllocator> GetAllocator();

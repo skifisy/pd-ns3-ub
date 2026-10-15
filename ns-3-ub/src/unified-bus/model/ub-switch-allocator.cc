@@ -299,27 +299,40 @@ void UbRoundRobinAllocator::AllocateNextPacket(Ptr<UbPort> outPort)
         }
 
         auto packet = ingressQueue->GetNextPacket();
-        auto inPortId = ingressQueue->GetInPortId();
-        auto priority = ingressQueue->GetIngressPriority();
-        auto packetEntry = std::make_tuple(inPortId, priority, packet);
-        auto context = MakeAllocatorFlowControlEventContext(packet,
-                                                            ingressQueue,
-                                                            inPortId,
-                                                            outPortId,
-                                                            priority);
-        const bool enqueueOk = outPort->EnqueueToEgress(packetEntry);
-        NS_ASSERT_MSG(enqueueOk,
-                      "allocator pre-check promised egress queue capacity, but DoEnqueue still failed");
-        outPort->GetFlowControl()->OnEgressEnqueued(context);
+        // The queue can become temporarily unable to provide a packet after
+        // GetNextPacketSize() succeeds (for example, ToE pauses new business
+        // data while an allocation event is already scheduled). Keep the
+        // ingress item queued and let the normal completion/retrigger path
+        // run; EnqueueToEgress must never receive a null packet.
+        if (packet == nullptr)
+        {
+            NS_LOG_DEBUG("[UbRoundRobinAllocator AllocateNextPacket] selected queue returned no packet"
+                         << " outPortId=" << outPortId);
+        }
+        else
+        {
+            auto inPortId = ingressQueue->GetInPortId();
+            auto priority = ingressQueue->GetIngressPriority();
+            auto packetEntry = std::make_tuple(inPortId, priority, packet);
+            auto context = MakeAllocatorFlowControlEventContext(packet,
+                                                                ingressQueue,
+                                                                inPortId,
+                                                                outPortId,
+                                                                priority);
+            const bool enqueueOk = outPort->EnqueueToEgress(packetEntry);
+            NS_ASSERT_MSG(enqueueOk,
+                          "allocator pre-check promised egress queue capacity, but DoEnqueue still failed");
+            outPort->GetFlowControl()->OnEgressEnqueued(context);
 
-        // Packet moved from VOQ to EgressQueue, notify Switch to update buffer statistics
-        if (ingressQueue->GetIngressQueueType() != IngressQueueType::TP &&
-            !ingressQueue->IsGeneratedDataPacket()) {
-            // Forwarded packet (not locally generated)
-            auto node = NodeList::GetNode(m_nodeId);
-            auto inPort = DynamicCast<UbPort>(node->GetDevice(inPortId));
-            node->GetObject<UbSwitch>()->NotifySwitchDequeue(inPortId, outPortId, priority, packet);
-            inPort->GetFlowControl()->OnIngressReleased(context);
+            // Packet moved from VOQ to EgressQueue, notify Switch to update buffer statistics
+            if (ingressQueue->GetIngressQueueType() != IngressQueueType::TP &&
+                !ingressQueue->IsGeneratedDataPacket()) {
+                // Forwarded packet (not locally generated)
+                auto node = NodeList::GetNode(m_nodeId);
+                auto inPort = DynamicCast<UbPort>(node->GetDevice(inPortId));
+                node->GetObject<UbSwitch>()->NotifySwitchDequeue(inPortId, outPortId, priority, packet);
+                inPort->GetFlowControl()->OnIngressReleased(context);
+            }
         }
     }
     m_isRunning[outPortId] = false;
@@ -493,6 +506,7 @@ void UbDwrrAllocator::AllocateNextPacket(Ptr<UbPort> outPort)
 
     // 标记这轮调度是否实际发出了至少一个包
     bool sentAny = false;
+    bool packetUnavailable = false;
 
     auto ingressQueue = SelectNextIngressQueue(outPort);
     if (ingressQueue != nullptr) {
@@ -534,6 +548,15 @@ void UbDwrrAllocator::AllocateNextPacket(Ptr<UbPort> outPort)
                 }
 
                 auto packet = q->GetNextPacket();
+                if (packet == nullptr)
+                {
+                    // A queue may report a packet size during allocator
+                    // preflight, then be temporarily gated before dequeue.
+                    // Do not enqueue a null packet or spin while the gate is
+                    // active; resume will trigger the port again.
+                    packetUnavailable = true;
+                    break;
+                }
                 auto inPortId = q->GetInPortId();
                 auto packetEntry = std::make_tuple(inPortId, priority, packet);
                 auto context = MakeAllocatorFlowControlEventContext(packet,
@@ -587,7 +610,7 @@ void UbDwrrAllocator::AllocateNextPacket(Ptr<UbPort> outPort)
         }
     }
 
-    if (ingressQueue != nullptr && !sentAny) {
+    if (ingressQueue != nullptr && !sentAny && !packetUnavailable) {
         Simulator::Schedule(m_allocationTime,
                             &UbDwrrAllocator::AllocateNextPacket,
                             this, outPort);

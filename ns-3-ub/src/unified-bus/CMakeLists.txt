@@ -60,7 +60,9 @@ build_lib(
 	model/protocol/ub-retrans.cc
 	model/protocol/ub-routing-process.cc
 	model/protocol/ub-te-solver.cc
+	model/protocol/ub-toe-solver.cc
 	model/protocol/ub-te-controller.cc
+	model/protocol/ub-toe-controller.cc
 	model/ub-switch-allocator.cc
 	model/ub-utils.cc
 	model/protocol/ub-ldst-api.cc
@@ -95,7 +97,10 @@ build_lib(
 	model/protocol/ub-retrans.h
 	model/protocol/ub-routing-process.h
 	model/protocol/ub-te-solver.h
+	model/protocol/ub-toe-solver.h
 	model/protocol/ub-te-controller.h
+	model/protocol/ub-toe-controller.h
+	model/protocol/ub-toe-reconfiguration.h
 	model/ub-switch-allocator.h
 	model/ub-utils.h
 	model/ub-network-address.h

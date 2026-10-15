@@ -64,6 +64,7 @@ public:
     ~UbRoutingProcess() {}
     static TypeId GetTypeId(void);
     void SetNodeId(uint32_t nodeId) {m_nodeId = nodeId;}
+    void ClearTeRouteCache();
 
     // 添加路由条目
     void AddShortestRoute(const uint32_t destIP, const std::vector<uint16_t>& outPorts);

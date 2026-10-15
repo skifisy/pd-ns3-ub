@@ -2,6 +2,7 @@
 #include "ns3/ub-te-controller.h"
 #include "ns3/ub-network-address.h"
 #include "ns3/ub-port.h"
+#include "ns3/ub-link.h"
 #include "ns3/ub-routing-process.h"
 #include "ns3/ub-te-solver.h"
 #include "ns3/node-list.h"
@@ -324,6 +325,64 @@ void UbTeController::Disable()
     m_epoch = 0;
     m_casePath.clear();
     m_outputDir.clear();
+}
+
+void UbTeController::RefreshTopology()
+{
+    if (!m_enabled.load(std::memory_order_acquire)) return;
+    std::lock_guard<std::mutex> lock(m_mutex);
+    const auto endpoints = m_leafPortToPeer;
+    m_leafPorts.clear();
+    m_edgeCapacityBps.clear();
+    m_leafPortToPeer.clear();
+    m_linkCounters.clear();
+    for (const auto& [endpoint, oldPeer] : endpoints)
+    {
+        (void)oldPeer;
+        const uint32_t leaf = endpoint.first;
+        const uint16_t portId = endpoint.second;
+        if (leaf >= NodeList::GetNNodes()) continue;
+        Ptr<UbPort> port = DynamicCast<UbPort>(NodeList::GetNode(leaf)->GetDevice(portId));
+        Ptr<UbLink> link = port ? DynamicCast<UbLink>(port->GetChannel()) : nullptr;
+        Ptr<UbPort> peerPort = link && port ? link->GetDestination(port) : nullptr;
+        if (!peerPort || peerPort->GetNode()->GetId() < 37 ||
+            peerPort->GetNode()->GetId() > 56) continue;
+        const uint32_t peer = peerPort->GetNode()->GetId();
+        m_leafPorts[{leaf, peer}].push_back(portId);
+        m_leafPortToPeer[endpoint] = peer;
+        const double capacity = static_cast<double>(port->GetDataRate().GetBitRate());
+        m_edgeCapacityBps[{leaf, peer}] += capacity;
+        m_linkCounters.push_back({leaf, peer, portId, port->GetTxBytes(), port->GetTxPackets()});
+    }
+    for (auto& [edge, ports] : m_leafPorts)
+    {
+        (void)edge;
+        std::sort(ports.begin(), ports.end());
+    }
+    m_policy.clear();
+    m_flowTransit.clear();
+    m_loggedTransitFlows.clear();
+}
+
+void UbTeController::RecomputeForTopologyChange()
+{
+    if (!m_enabled.load(std::memory_order_acquire)) return;
+    if (m_recomputeEvent.IsPending()) Simulator::Cancel(m_recomputeEvent);
+    Recompute();
+}
+
+void UbTeController::PauseForTopologyChange()
+{
+    if (m_recomputeEvent.IsPending()) Simulator::Cancel(m_recomputeEvent);
+}
+
+void UbTeController::ResumeAfterAbortedTopologyChange()
+{
+    if (!m_enabled.load(std::memory_order_acquire) ||
+        !m_periodicEventsActive.load(std::memory_order_acquire)) return;
+    if (m_recomputeEvent.IsPending()) Simulator::Cancel(m_recomputeEvent);
+    m_recomputeEvent = Simulator::Schedule(Seconds(m_intervalSeconds),
+                                            &UbTeController::Recompute, this);
 }
 
 void UbTeController::Configure(const std::string& casePath, double recomputeSeconds,

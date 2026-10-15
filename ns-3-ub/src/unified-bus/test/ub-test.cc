@@ -34,6 +34,8 @@
 #include "ns3/ub-switch.h"
 #include "ns3/ub-tag.h"
 #include "ns3/ub-te-solver.h"
+#include "ns3/ub-toe-solver.h"
+#include "ns3/ub-toe-reconfiguration.h"
 #include "ns3/ub-traffic-gen.h"
 #include "ns3/ub-transaction.h"
 #include "ns3/ub-utils.h"
@@ -256,6 +258,11 @@ class UbTestIngressQueue : public UbIngressQueue
 
     Ptr<Packet> GetNextPacket() override
     {
+        if (m_returnNullOnNextPacket)
+        {
+            m_returnNullOnNextPacket = false;
+            return nullptr;
+        }
         if (m_packets.empty())
         {
             return nullptr;
@@ -288,9 +295,15 @@ class UbTestIngressQueue : public UbIngressQueue
         m_limited = limited;
     }
 
+    void SetReturnNullOnNextPacket()
+    {
+        m_returnNullOnNextPacket = true;
+    }
+
   private:
     std::vector<Ptr<Packet>> m_packets;
     bool m_limited{false};
+    bool m_returnNullOnNextPacket{false};
     IngressQueueType m_queueType{IngressQueueType::TP};
 };
 
@@ -10320,6 +10333,121 @@ class UbRoundRobinAllocatorSeedsDifferentInitialPhasesPerOutPortTest : public Te
     }
 };
 
+class UbRoundRobinAllocatorHandlesPacketUnavailableAfterPreflightTest : public TestCase
+{
+  public:
+    UbRoundRobinAllocatorHandlesPacketUnavailableAfterPreflightTest()
+        : TestCase("UnifiedBus - round robin allocator tolerates a packet becoming unavailable after preflight")
+    {
+    }
+
+    void DoRun() override
+    {
+        Config::Reset();
+        Ptr<Node> node = CreateObject<Node>(0);
+        InitNode(node, UB_SWITCH, 4);
+
+        Ptr<UbSwitch> sw = node->GetObject<UbSwitch>();
+        Ptr<UbRoundRobinAllocator> allocator =
+            DynamicCast<UbRoundRobinAllocator>(sw->GetAllocator());
+        NS_TEST_ASSERT_MSG_NE(allocator, nullptr, "Default switch allocator should be round robin");
+
+        constexpr uint32_t kOutPort = 1;
+        constexpr uint32_t kPriority = 1;
+        Ptr<UbTestIngressQueue> queue = CreateObject<UbTestIngressQueue>();
+        queue->SetInPortId(0);
+        queue->SetOutPortId(kOutPort);
+        queue->SetIngressPriority(kPriority);
+        queue->PushPacket(64);
+        queue->SetReturnNullOnNextPacket();
+        allocator->RegisterUbIngressQueue(queue, kOutPort, kPriority);
+
+        Ptr<UbPort> outPort = DynamicCast<UbPort>(node->GetDevice(kOutPort));
+        allocator->AllocateNextPacket(outPort);
+        Simulator::Stop(NanoSeconds(1));
+        Simulator::Run();
+
+        NS_TEST_ASSERT_MSG_EQ(queue->IsEmpty(), false,
+                              "The temporarily unavailable packet should remain queued");
+        NS_TEST_ASSERT_MSG_EQ(outPort->GetUbQueue()->IsEmpty(), true,
+                              "A null packet must not enter the egress queue");
+
+        Simulator::Destroy();
+        Config::Reset();
+    }
+};
+
+class UbToeSelectivePortDrainTest : public TestCase
+{
+  public:
+    UbToeSelectivePortDrainTest()
+        : TestCase("UnifiedBus - ToE local drain sees input processing and excludes unrelated ports")
+    {
+    }
+
+    void DoRun() override
+    {
+        Config::Reset();
+        Ptr<Node> node = CreateObject<Node>(0);
+        InitNode(node, UB_SWITCH, 4);
+        auto sw = node->GetObject<UbSwitch>();
+        auto queues = sw->GetQueueManager();
+        // The packet is admitted but not visible to the allocator yet.
+        queues->PushToInPortProcessing(0, 1, 1, 64);
+        NS_TEST_ASSERT_MSG_EQ(sw->IsPortQuiescentForTopologyChange(0), false,
+                              "changed ingress must include processing bytes");
+        NS_TEST_ASSERT_MSG_EQ(sw->IsPortQuiescentForTopologyChange(1), false,
+                              "changed egress must include processing bytes");
+        NS_TEST_ASSERT_MSG_EQ(sw->IsPortQuiescentForTopologyChange(2), true,
+                              "unrelated in-flight traffic must not block local drain");
+        // Locally generated credit frames must also hold the port in the drain set.
+        queues->PushToVoq(2, 2, 0, 32);
+        NS_TEST_ASSERT_MSG_EQ(sw->IsPortQuiescentForTopologyChange(2), false,
+                              "pending credit frame must prevent reattachment");
+        NS_TEST_ASSERT_MSG_EQ(sw->IsPortQuiescentForTopologyChange(3), true,
+                              "unused port must remain quiescent");
+        Simulator::Destroy();
+        Config::Reset();
+    }
+};
+
+class UbToeCircuitPreservationTest : public TestCase
+{
+  public:
+    UbToeCircuitPreservationTest()
+        : TestCase("UnifiedBus - ToE retains physical circuits and isolates changed ECMP pairs")
+    {
+    }
+
+    void DoRun() override
+    {
+        using Planner = UbToeReconfiguration;
+        // A four-leaf degree-preserving move: remove AC/BD, add AD/BC.
+        const std::vector<Planner::Circuit> current{{37, 0, 41, 0}, {37, 1, 41, 1},
+                                                     {38, 0, 42, 0}, {38, 1, 42, 1},
+                                                     {37, 2, 42, 2}, {38, 2, 41, 2}};
+        const UbToeSolver::Topology target{{{37, 41}, 1}, {{38, 42}, 1},
+                                            {{37, 42}, 2}, {{38, 41}, 2}};
+        const auto plan = Planner::Build(current, target);
+        NS_TEST_ASSERT_MSG_EQ(plan.retained.size(), 4u, "retain every reusable circuit");
+        NS_TEST_ASSERT_MSG_EQ(plan.removed.size(), 2u, "release only surplus endpoints");
+        NS_TEST_ASSERT_MSG_EQ(plan.added.size(), 2u, "reconnect only released endpoints");
+        for (const auto& circuit : plan.retained)
+            NS_TEST_ASSERT_MSG_EQ((std::find(current.begin(), current.end(), circuit) != current.end()),
+                                  true, "retained endpoint pairs must be identical");
+        const std::map<uint32_t, uint32_t> groups{{37, 0}, {38, 0}, {41, 1}, {42, 1},
+                                                   {45, 2}, {49, 3}, {50, 3}};
+        NS_TEST_ASSERT_MSG_EQ(Planner::AffectsEcmpOd(37, 41, groups, plan.changedPairs),
+                              true, "changed direct bundle must pause");
+        NS_TEST_ASSERT_MSG_EQ(Planner::AffectsEcmpOd(41, 37, groups, plan.changedPairs),
+                              true, "reverse TP and READ response must also pause");
+        NS_TEST_ASSERT_MSG_EQ(Planner::AffectsEcmpOd(37, 45, groups, plan.changedPairs),
+                              false, "unchanged direct bundle continues, even on an affected leaf");
+        NS_TEST_ASSERT_MSG_EQ(Planner::AffectsEcmpOd(49, 50, groups, plan.changedPairs),
+                              true, "same-group traffic may transit a removed circuit");
+    }
+};
+
 class UbSwitchCreatesVoqsOnDemandTest : public TestCase
 {
   public:
@@ -12377,6 +12505,102 @@ class UbTeSolverTwoStageLpTest : public TestCase
     }
 };
 
+class UbToeSolverIntegerTopologyTest : public TestCase
+{
+  public:
+    UbToeSolverIntegerTopologyTest()
+        : TestCase("UnifiedBus - ToE returns a degree-constrained integer OCS topology")
+    {
+    }
+
+  private:
+    void DoRun() override
+    {
+        std::vector<uint32_t> leaves;
+        std::map<uint32_t, uint32_t> groups;
+        UbToeSolver::Topology current;
+        for (uint32_t leaf = 37; leaf <= 56; ++leaf)
+        {
+            leaves.push_back(leaf);
+            groups[leaf] = (leaf - 37) / 4;
+        }
+        for (uint32_t a = 37; a <= 56; ++a)
+        {
+            for (uint32_t b = a + 1; b <= 56; ++b)
+            {
+                if (groups.at(a) != groups.at(b)) current[{a, b}] = 4;
+            }
+        }
+        const std::map<UbToeSolver::Od, double> demands{{{37, 41}, 100e9},
+                                                        {{41, 37}, 60e9},
+                                                        {{37, 38}, 20e9}};
+        for (const auto mode : {UbToeSolver::RoutingMode::ECMP,
+                                UbToeSolver::RoutingMode::WCMP})
+        {
+            const auto result = UbToeSolver::Solve(leaves, groups, current, demands, mode,
+                                                   0.01, 10.0);
+            NS_TEST_ASSERT_MSG_EQ(result.topology.size(), current.size(),
+                                  "all cross-group pairs must be represented");
+            std::map<uint32_t, uint32_t> degree;
+            for (const auto& [pair, count] : result.topology)
+            {
+                NS_TEST_ASSERT_MSG_GT_OR_EQ(count, 1u,
+                                            "every cross-group OD pair retains a circuit");
+                degree[pair.first] += count;
+                degree[pair.second] += count;
+            }
+            for (uint32_t leaf : leaves)
+                NS_TEST_ASSERT_MSG_EQ(degree[leaf], 64u,
+                                      "every leaf must use its 64 OCS ports");
+            NS_TEST_ASSERT_MSG_LT(result.minMaxUtilization, 0.0625,
+                                  "ToE should improve on the four-circuit starting topology");
+            if (mode == UbToeSolver::RoutingMode::ECMP)
+            {
+                std::map<UbToeSolver::Od, double> loads;
+                for (const auto& [od, demand] : demands)
+                {
+                    if (groups.at(od.first) != groups.at(od.second))
+                    {
+                        loads[od] += demand;
+                        continue;
+                    }
+                    for (uint32_t middle : leaves)
+                    {
+                        if (groups.at(od.first) == groups.at(middle)) continue;
+                        const auto firstPair = std::minmax(od.first, middle);
+                        const double share =
+                            demand * result.topology.at(firstPair) / 64.0;
+                        loads[{od.first, middle}] += share;
+                        loads[{middle, od.second}] += share;
+                    }
+                }
+                for (const auto& [edge, load] : loads)
+                {
+                    const auto pair = std::minmax(edge.first, edge.second);
+                    const double utilization =
+                        load / (400e9 * result.topology.at(pair));
+                    NS_TEST_ASSERT_MSG_LT_OR_EQ(
+                        utilization, result.appliedUtilizationBound + 1e-6,
+                        "ECMP predicted load must fit the resulting circuit capacity");
+                }
+            }
+        }
+
+        // A low-rate, single-OD trace must still expose the benefit of moving
+        // circuits. This catches MLU searches whose absolute tolerance is
+        // larger than the offered load and would otherwise report a no-op.
+        const std::map<UbToeSolver::Od, double> hotspotDemand{{{37, 41}, 100e6}};
+        const auto hotspot = UbToeSolver::Solve(leaves, groups, current, hotspotDemand,
+                                                UbToeSolver::RoutingMode::ECMP, 0.01, 10.0);
+        NS_TEST_ASSERT_MSG_GT(hotspot.topology.at({37, 41}), 4u,
+                              "a single hot OD should receive additional circuits");
+        NS_TEST_ASSERT_MSG_GT(hotspot.changedCircuits, 0u,
+                              "ToE should request a real topology change for a hot OD");
+        NS_TEST_ASSERT_MSG_LT(hotspot.minMaxUtilization, 1e-5,
+                              "MLU precision should scale with low offered demand");
+    }
+};
+
 class UbTeSolverTestSuite : public TestSuite
 {
   public:
@@ -12384,6 +12608,7 @@ class UbTeSolverTestSuite : public TestSuite
         : TestSuite("unified-bus-jupiter-te-solver", Type::UNIT)
     {
         AddTestCase(new UbTeSolverTwoStageLpTest(), TestCase::Duration::QUICK);
+        AddTestCase(new UbToeSolverIntegerTopologyTest(), TestCase::Duration::QUICK);
     }
 };
 
@@ -12979,6 +13204,10 @@ UbSwitchVoqTestSuite::UbSwitchVoqTestSuite()
 {
     AddTestCase(new UbRoundRobinAllocatorSeedsDifferentInitialPhasesPerOutPortTest(),
                 TestCase::Duration::QUICK);
+    AddTestCase(new UbRoundRobinAllocatorHandlesPacketUnavailableAfterPreflightTest(),
+                TestCase::Duration::QUICK);
+    AddTestCase(new UbToeSelectivePortDrainTest(), TestCase::Duration::QUICK);
+    AddTestCase(new UbToeCircuitPreservationTest(), TestCase::Duration::QUICK);
     AddTestCase(new UbSwitchCreatesVoqsOnDemandTest(), TestCase::Duration::QUICK);
     AddTestCase(new UbVoqAllocatorPreservesIngressQueueSlotPhaseTest(), TestCase::Duration::QUICK);
     AddTestCase(new UbDwrrAllocatorPreservesIngressQueueSlotsAcrossVlTest(),

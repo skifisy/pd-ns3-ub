@@ -278,10 +278,15 @@ void UbSwitch::InitNodePortsFlowControl()
                 << " m_flowControlType: " << static_cast<int>(m_flowControlType));
 
     for (uint32_t pidx = 0; pidx < m_portsNum; pidx++) {
-        Ptr<UbPort> port = DynamicCast<ns3::UbPort>(GetObject<Node>()->GetDevice(pidx));
-        ApplyLocalPortFlowControlConfig(port);
-        port->CreateAndInitFc(m_flowControlType);
+        InitPortFlowControl(pidx);
     }
+}
+
+void UbSwitch::InitPortFlowControl(uint32_t portId)
+{
+    Ptr<UbPort> port = DynamicCast<UbPort>(GetObject<Node>()->GetDevice(portId));
+    ApplyLocalPortFlowControlConfig(port);
+    port->CreateAndInitFc(m_flowControlType);
 }
 
 /**
@@ -510,6 +515,28 @@ uint64_t UbSwitch::GetAllocatedVoqCountForTest() const
         }
     }
     return count;
+}
+
+bool UbSwitch::IsQuiescentForTopologyChange() const
+{
+    for (const auto& event : m_inPortProcessingEvents)
+        if (event.IsPending()) return false;
+    for (const auto& group : m_voq.groups)
+        for (const auto& entry : group)
+            if (entry.queue != nullptr && !entry.queue->IsEmpty()) return false;
+    return true;
+}
+
+bool UbSwitch::IsPortQuiescentForTopologyChange(uint32_t portId) const
+{
+    // These occupancy views include admitted packets still in input processing.
+    // Both ingress and egress must drain before the peer-specific credits reset.
+    if (m_queueManager->GetIngressPortOccupancy(portId).total_bytes != 0 ||
+        m_queueManager->GetTotalOutPortBufferUsed(portId) != 0) return false;
+    for (uint32_t priority = 0; priority < m_vlNum; ++priority)
+        if (m_queueManager->GetIngressControlBytes(portId, priority) != 0 ||
+            m_queueManager->GetOutPortControlBytes(portId, priority) != 0) return false;
+    return true;
 }
 
 bool UbSwitch::HasVoqForTest(uint32_t outPort, uint32_t priority, uint32_t inPort) const

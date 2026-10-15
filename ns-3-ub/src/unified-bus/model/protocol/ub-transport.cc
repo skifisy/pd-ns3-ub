@@ -9,6 +9,7 @@
 #include "ns3/node.h"
 #include "ns3/ub-switch.h"
 #include "ns3/ub-te-controller.h"
+#include "ns3/ub-toe-controller.h"
 #include "ns3/ub-queue-manager.h"
 #include "ns3/ub-transport.h"
 #include "ns3/ub-utils.h"
@@ -480,6 +481,13 @@ UbTransportChannel::GetPsnSndNxt() const
     return m_psnSndNxt;
 }
 
+bool
+UbTransportChannel::HasPendingControlForTopologyChange() const
+{
+    return !m_ackQ.empty() || !m_cnpQ.empty() ||
+           (IsRetransEnabled() && HasPendingSelectiveRetransmissionWork());
+}
+
 void
 UbTransportChannel::SetPsnSndNxt(uint64_t psn)
 {
@@ -761,6 +769,8 @@ UbTransportChannel::SendNewDataPacket(const NewDataSendContext& ctx)
                                        ctx.wireLengthBytes,
                                        ctx.progressBytes);
     if (IsTeBusinessDataSegment(ctx.segment)) {
+        UbToeController::Get().OnNewDataPacket(m_nodeId, m_sport, m_dest, m_dport,
+                                               ctx.payloadBytes);
         UbTeController::Get().OnNewDataPacket(m_nodeId,
                                               m_sport,
                                               m_dest,
@@ -775,6 +785,9 @@ UbTransportChannel::SendNewDataPacket(const NewDataSendContext& ctx)
 Ptr<Packet>
 UbTransportChannel::TryGetNextNewDataPacket()
 {
+    if (UbToeController::Get().PauseNewBusinessData(m_nodeId, m_sport, m_dest, m_dport)) {
+        return nullptr;
+    }
     if (!CanTrySendNewDataPacket()) {
         return nullptr;
     }
@@ -904,6 +917,9 @@ uint32_t UbTransportChannel::GetNextPacketSize()
             : 0;
     if (selectiveRetransmissionSize > 0) {
         return selectiveRetransmissionSize;
+    }
+    if (UbToeController::Get().PauseNewBusinessData(m_nodeId, m_sport, m_dest, m_dport)) {
+        return 0;
     }
     for (size_t i = 0; i < m_wqeSegmentVector.size(); ++i) {
         Ptr<UbWqeSegment> currentSegment = m_wqeSegmentVector[i];
@@ -2136,6 +2152,11 @@ bool UbTransportChannel::IsLimited()
             return true;
         }
         return false;
+    }
+    // A paused TP must be skipped during preflight so another TP on the same
+    // host port can keep using RR/DWRR. ACK/CNP/selective retransmits stay eligible.
+    if (UbToeController::Get().PauseNewBusinessData(m_nodeId, m_sport, m_dest, m_dport)) {
+        return true;
     }
     if (IsInflightLimited()) {
         m_sendWindowLimited = true;

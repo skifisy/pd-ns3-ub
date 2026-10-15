@@ -31,6 +31,10 @@ public:
                    const std::string& outputDir, bool debug);
     void Disable();
     void FlushFinalWindow();
+    void RefreshTopology();
+    void RecomputeForTopologyChange();
+    void PauseForTopologyChange();
+    void ResumeAfterAbortedTopologyChange();
     void StopPeriodicEvents(const std::string& reason);
     bool Enabled() const { return m_enabled.load(std::memory_order_acquire); }
     bool DebugEnabled() const;

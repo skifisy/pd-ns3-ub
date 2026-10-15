@@ -9,6 +9,7 @@
 #include "ns3/ub-port.h"
 #include "ns3/ub-traffic-gen.h"
 #include "ns3/ub-te-controller.h"
+#include "ns3/ub-toe-controller.h"
 #include "ns3/ub-transport.h"
 #include "ns3/ub-utils.h"
 
@@ -60,6 +61,13 @@ struct QuickExampleOptions
     uint32_t teHistoryWindows = 120;
     double teS = 0.0;
     std::string teOutput;
+    std::string toeMode = "off";
+    std::string toeReconfiguration = "auto";
+    double toeRecomputeSeconds = 300.0;
+    uint32_t toeHistoryWindows = 20;
+    double toeMluSlack = 0.01;
+    double toeSwitchDelaySeconds = 0.0;
+    std::string toeOutput;
 };
 
 struct DropAbortState
@@ -483,12 +491,36 @@ BuildScenarioFromConfig(const QuickExampleOptions& options, const RuntimeSelecti
                                                         linkOffsetWindow,
                                                         options.timingOffsetSeed);
     UbUtils::Get()->AddRoutingTable(configPath + "/routing_table.csv");
-    if (options.jupiterTe) {
+    NS_ABORT_MSG_IF(options.toeMode != "off" &&
+                        (runtime.enableMpi || ModeUsesMtp(runtime.mode)),
+                    "ToE currently requires a single-process, single-thread run");
+    NS_ABORT_MSG_IF(options.toeMode != "off" && options.jupiterTe,
+                    "use --toe-mode=te instead of combining ToE with --jupiter-te");
+    const bool useJupiterTe = options.jupiterTe || options.toeMode == "te";
+    if (useJupiterTe) {
         NS_ABORT_MSG_IF(runtime.enableMpi,
                         "Jupiter TE requires a single MPI rank for a globally observed matrix");
         UbTeController::Get().Configure(configPath, options.teRecomputeSeconds,
                                         options.teHistoryWindows, options.teS,
                                         options.teOutput, options.debugTe);
+    }
+    if (options.toeMode == "only" || options.toeMode == "te") {
+        const auto toeAppDefaults = CreateObject<UbApp>();
+        NS_ABORT_MSG_IF(toeAppDefaults->GetTransportMode() != TransportMode::RTP,
+                        "ToE drain/resume currently requires RTP transport");
+        NS_ABORT_MSG_IF(options.toeMode == "only" && options.toeReconfiguration != "global" &&
+                            !toeAppDefaults->GetUseShortestPaths(),
+                        "selective ToE requires UbApp::UseShortestPaths=true; use global otherwise");
+        UbToeController::Get().Configure(
+            configPath,
+            options.toeMode == "only" ? UbToeController::Mode::ONLY
+                                        : UbToeController::Mode::WITH_TE,
+            options.toeRecomputeSeconds, options.toeHistoryWindows, options.toeMluSlack,
+            options.toeSwitchDelaySeconds, options.toeOutput,
+            options.toeReconfiguration == "global" ? UbToeController::ReconfigurationMode::GLOBAL
+                : options.toeReconfiguration == "selective"
+                    ? UbToeController::ReconfigurationMode::SELECTIVE
+                    : UbToeController::ReconfigurationMode::AUTO);
     }
     UbUtils::Get()->CreateTp(configPath + "/transport_channel.csv");
     UbUtils::Get()->TopoTraceConnect();
@@ -779,13 +811,45 @@ QuickExampleOptions ParseOptions(int argc, char* argv[])
     cmd.AddValue("te-s", "Jupiter hedge parameter S in [0,1] (default 0)", options.teS);
     cmd.AddValue("te-output", "Debug directory for TE audit logs and CSV files",
                  options.teOutput);
+    cmd.AddValue("toe-mode", "Dynamic topology mode: off, only (ECMP), or te (ToE + Jupiter TE)",
+                 options.toeMode);
+    cmd.AddValue("toe-reconfiguration", "Drain scope: auto (selective for only, global for te), global, selective",
+                 options.toeReconfiguration);
+    cmd.AddValue("toe-recompute-seconds", "ToE topology recomputation interval (default 300s)",
+                 options.toeRecomputeSeconds);
+    cmd.AddValue("toe-history-windows", "ToE lookback in complete 30s windows (default 20)",
+                 options.toeHistoryWindows);
+    cmd.AddValue("toe-mlu-slack",
+                 "Relative MLU slack allowed to reduce topology changes (default 0.01)",
+                 options.toeMluSlack);
+    cmd.AddValue("toe-switch-delay-seconds", "OCS reconnection delay (default 0s)",
+                 options.toeSwitchDelaySeconds);
+    cmd.AddValue("toe-output", "ToE audit output directory", options.toeOutput);
     cmd.AddNonOption("casePath",
                      "Required unified-bus case directory when --case-path is omitted",
                      positionalCasePath);
     cmd.Parse(argc, argv);
     if (options.debugTe && !options.jupiterTe)
     {
-        std::cerr << "--debug-te requires --jupiter-te=1" << std::endl;
+        if (options.toeMode != "te") {
+            std::cerr << "--debug-te requires Jupiter TE or --toe-mode=te" << std::endl;
+            std::exit(1);
+        }
+    }
+    if (options.toeReconfiguration != "auto" && options.toeReconfiguration != "global" &&
+        options.toeReconfiguration != "selective")
+    {
+        std::cerr << "--toe-reconfiguration must be auto, global, or selective" << std::endl;
+        std::exit(EXIT_FAILURE);
+    }
+    if (options.toeMode == "te" && options.toeReconfiguration == "selective")
+    {
+        std::cerr << "--toe-reconfiguration=selective requires --toe-mode=only" << std::endl;
+        std::exit(EXIT_FAILURE);
+    }
+    if (options.toeMode != "off" && options.toeMode != "only" && options.toeMode != "te")
+    {
+        std::cerr << "--toe-mode must be off, only, or te" << std::endl;
         std::exit(1);
     }
     if (!casePathArg.empty() && !positionalCasePath.empty() &&
