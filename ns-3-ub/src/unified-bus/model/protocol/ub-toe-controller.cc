@@ -154,6 +154,10 @@ void UbToeController::Configure(const std::string& casePath,
            "unpaused_new_payload_bytes,pause_seconds\n";
     std::ofstream(m_outputDir + "/toe_circuits.csv")
         << "epoch,time_seconds,status,src_leaf,src_port,dst_leaf,dst_port\n";
+    std::ofstream(m_outputDir + "/toe_demand.csv")
+        << "epoch,decision_seconds,src_leaf,dst_leaf,demand_bps,demand_gbps,"
+           "peak_window_bytes,latest_window_bytes,latest_gbps,sample_window_seconds,"
+           "history_windows,completed_window,matrix_complete,matrix_kind\n";
     WriteCircuits(m_currentCircuits, "initial");
     m_windowEvent = Simulator::Schedule(Seconds(30), &UbToeController::SampleWindow, this);
     m_recomputeEvent = Simulator::Schedule(Seconds(intervalSeconds) + NanoSeconds(1),
@@ -225,6 +229,39 @@ void UbToeController::Recompute()
     std::map<Od, double> demand;
     for (const auto& [od, bytes] : peak) demand[od] = 8.0 * bytes / 30.0;
     ++m_epoch;
+    // Export the exact directional input to Solve before drain/apply changes time.
+    // Complete matrices include explicit zeros; OD peaks need not share a window.
+    {
+        std::ofstream output(m_outputDir + "/toe_demand.csv", std::ios::app);
+        NS_ABORT_MSG_IF(!output, "Cannot write ToE solver-demand matrix");
+        output << std::setprecision(17);
+        const auto latestWindow = completedWindow > 0
+            ? m_history.find(completedWindow - 1) : m_history.end();
+        for (const auto& [src, srcGroup] : m_groups)
+        {
+            (void)srcGroup;
+            for (const auto& [dst, dstGroup] : m_groups)
+            {
+                (void)dstGroup;
+                const Od od{src, dst};
+                const auto demandIt = demand.find(od);
+                const double bps = demandIt == demand.end() ? 0.0 : demandIt->second;
+                const auto peakIt = peak.find(od);
+                const uint64_t peakBytes = peakIt == peak.end() ? 0 : peakIt->second;
+                uint64_t latestBytes = 0;
+                if (latestWindow != m_history.end())
+                {
+                    const auto latest = latestWindow->second.find(od);
+                    if (latest != latestWindow->second.end()) latestBytes = latest->second;
+                }
+                output << m_epoch << ',' << Simulator::Now().GetSeconds() << ','
+                       << src << ',' << dst << ',' << bps << ',' << bps / 1e9 << ','
+                       << peakBytes << ',' << latestBytes << ',' << 8.0 * latestBytes / 30.0 / 1e9
+                       << ",30," << m_historyWindows << ',' << completedWindow
+                       << ",1,solver_input\n";
+            }
+        }
+    }
     try
     {
         auto result = UbToeSolver::Solve({37,38,39,40,41,42,43,44,45,46,
@@ -583,3 +620,4 @@ int UbToeController::SelectEcmpOutPort(uint32_t leaf,
 }
 
 } // namespace ns3
+

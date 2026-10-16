@@ -119,6 +119,7 @@ ToE 仅支持单进程、单线程：不要通过 `mpirun` 启动，也不要传
 <case>/toe/toe_topology.csv
 <case>/toe/toe_reconfiguration.csv
 <case>/toe/toe_circuits.csv
+<case>/toe/toe_demand.csv
 <case>/toe/toe_errors.log
 ```
 
@@ -150,6 +151,23 @@ awk -F, '$1 == 1 { print }' "$CASE_DIR/toe/toe_topology.csv"
 4. 检查 `<case>/toe/toe_errors.log` 中的 solver error 或 `drain-timeout`。
 
 ToE 的预测 MLU 是由 30 秒窗口业务需求和路径模型计算的值。应结合应用完成时间和链路利用率评估结果；有限 flow 的哈希分布与模型期望可能不同。
+
+`toe_demand.csv` 在每轮调用求解器前记录完整的有向需求矩阵，包括零值和没有改变拓扑的决策。
+`decision_seconds` 是求解决策时刻，`demand_bps` 是实际传给求解器的预测需求；它不是拓扑生效时的瞬时流量。
+需求由历史窗口逐 OD 取峰值，因此不同单元的峰值不一定来自同一个窗口。
+
+使用单文件脚本比较 ECMP 与 ToE 的任务完成时间、重配代价、链路分组变化和热点：
+
+```bash
+# 从仓库根目录运行，输出目录须为新的或空的目录。
+python3 tools/analyze_toe_v3.py \
+  --baseline /path/to/ecmp_case --toe /path/to/toe_case \
+  --output /path/to/new_analysis_result
+```
+
+ECMP case 无需 ToE 日志。默认在一次任务对比遍历中完成汇总，并生成最多 1500 行的 `toe_ai_summary_v3.txt`。
+需求日志存在时还会生成 `demand_heatmaps.html` 和 SVG 热力图；旧实验缺少矩阵时会明确标记，不能从拓扑反推补齐。
+完整参数、输出和测试命令见[分析说明](./TOE_ANALYSIS.md)与[需求矩阵热力图说明](./TOE_DEMAND_HEATMAPS_V3.md)。
 
 ## 8. 从 v4 升级与局部重配检查
 
@@ -198,3 +216,4 @@ python3 ../tools/make_toe_local_smoke.py --case-path scratch/mooncake_pd_ocs --o
 将输出用于单独的测试 case 的 `traffic.csv`。trace 含热点预热、29.999999 秒启动的热点任务、30 秒之后每 100us 开始的其它跨组 pair 流量及 31 秒收尾任务。用 `--toe-history-windows=1 --toe-recompute-seconds=30 --toe-switch-delay-seconds=0.002` 做检查。热点优化可能同时调整其它 pair，因此日志中的计数才是判断依据，不假定某个指定 pair 必然不变。
 
 本工作环境没有完整 ns-3 构建工具和运行产物：已执行端口规划回归、修改文件语法检查和 patch 应用检查；未执行此 trace 或大规模仿真。应用后先完成短 trace，再比较相同输入和参数下的 global/selective FCT。
+
