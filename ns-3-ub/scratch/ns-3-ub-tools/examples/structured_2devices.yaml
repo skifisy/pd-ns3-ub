@@ -1,0 +1,19 @@
+version: 1
+
+defaults:
+  node:
+    allocationDelay: 1ns
+    forwardDelay: 0ns
+  link:
+    bandwidth: 400Gbps
+    delay: 20ns
+
+nodeGroups:
+  - name: device
+    type: device
+    count: 2
+
+groupConnections:
+  - pattern: fullMesh
+    endpoints:
+      - group: device
