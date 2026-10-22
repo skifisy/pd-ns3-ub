@@ -600,14 +600,16 @@ uint32_t TpConnectionManager::ReconstructTp(Connection conn)
 
 void TpConnectionManager::RemoveUselessTps(uint32_t jettyNum, uint32_t src, uint32_t dst, uint32_t priority)
 {
-    if (!m_removeUselessTp) { // 仅在开启了删除无用tp模式下才进行此操作
-        return;
-    }
     std::lock_guard<std::mutex> controlLock(g_tpConnectionControlLock);
     auto ctrl = NodeList::GetNode(src)->GetObject<UbController>();
     auto sendTa = ctrl->GetUbTransaction();
-    // 事务层删除与该jetty绑定的tp记录
+    // Every completed RTP task retires its one-task Jetty. The setting below
+    // controls whether now-unused TPs are also destroyed, not whether the
+    // completed Jetty is detached from the transaction scheduler.
     sendTa->DestroyJettyTpMap(jettyNum);
+    if (!m_removeUselessTp) {
+        return;
+    }
     // 获取当前已经没有jetty与之绑定的tp
     auto tpns = sendTa->GetUselessTpns();
     for (uint32_t i = 0; i < tpns.size(); i++) {

@@ -7,6 +7,24 @@
 
 namespace ns3 {
 
+/** Simulation-only initiator identity; does not change the 20-bit wire RCID. */
+class UbSimOriginJettyTag : public Tag {
+public:
+    UbSimOriginJettyTag() = default;
+    explicit UbSimOriginJettyTag(uint32_t originJetty);
+
+    static TypeId GetTypeId();
+    TypeId GetInstanceTypeId() const override;
+    uint32_t GetSerializedSize() const override;
+    void Serialize(TagBuffer buffer) const override;
+    void Deserialize(TagBuffer buffer) override;
+    void Print(std::ostream& os) const override;
+    uint32_t GetOriginJetty() const;
+
+private:
+    uint32_t m_originJetty{0};
+};
+
 enum class PacketType {
     PACKET,
     ACK,

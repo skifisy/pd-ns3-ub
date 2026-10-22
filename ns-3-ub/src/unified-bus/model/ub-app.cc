@@ -390,10 +390,13 @@ void UbApp::OnTaskCompleted(uint32_t taskId, uint32_t jettyNum)
     NS_LOG_INFO("[APPLICATION INFO] taskId: " << taskId << ",finish time:" << Simulator::Now().GetNanoSeconds() << "ns");
     if (m_transportMode == TransportMode::RTP)
     {
-        // 删除无用tp
+        // RTP creates one Jetty per task. Detach its TP state and release the
+        // Jetty after its final WQE completion; the CTP mode keeps shared Jetties.
         auto cleanup = UbTrafficGen::Get()->GetTaskCleanupInfoById(taskId);
-        GetNode()->GetObject<UbController>()->GetTpConnManager()->RemoveUselessTps(
+        Ptr<UbController> controller = GetNode()->GetObject<UbController>();
+        controller->GetTpConnManager()->RemoveUselessTps(
             jettyNum, cleanup.sourceNode, cleanup.destNode, cleanup.priority);
+        controller->GetUbFunction()->DestroyJetty(jettyNum);
     }
     UbTrafficGen::Get()->OnTaskCompleted(taskId);
 }

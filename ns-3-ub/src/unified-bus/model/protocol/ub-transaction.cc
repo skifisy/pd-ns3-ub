@@ -134,11 +134,11 @@ void UbTransaction::DestroyJettyTpMap(uint32_t jettyNum)
     if (itJettyTp != m_jettyTpGroup.end()) {
         // 解除关系
         m_jettyTpGroup.erase(itJettyTp);
-        m_jettyTpNextIndex.erase(jettyNum);
         NS_LOG_DEBUG("Destroyed jetty in m_jettyTpGroup");
-    } else {
-        NS_LOG_WARN("Jetty Tp map not found for destruction");
     }
+    m_jettyTpNextIndex.erase(jettyNum);
+    m_serviceMode.erase(jettyNum);
+    m_jettyOrderedWqe.erase(jettyNum);
 
     for (auto it = m_tpRelatedJetties.begin(); it != m_tpRelatedJetties.end(); it++) {
         for (auto jettyIt = it->second.begin(); jettyIt != it->second.end();) {
