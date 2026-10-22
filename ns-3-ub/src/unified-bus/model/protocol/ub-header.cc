@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-only
 #include "ub-header.h"
+#include "ns3/abort.h"
 #include "ns3/ub-datatype.h"
 #include "ns3/log.h"
 
@@ -1566,6 +1567,8 @@ void UbTransactionHeader::Serialize(Buffer::Iterator start) const
 
 uint32_t UbTransactionHeader::Deserialize(Buffer::Iterator start)
 {
+    m_hasSimulationOriginJetty = false;
+    m_simulationOriginJetty = 0;
     // 字节0: [TaOpcode:8]
     m_taOpcode = start.ReadU8();
 
@@ -1649,7 +1652,22 @@ void UbTransactionHeader::SetIniRcType(uint8_t type)
 
 void UbTransactionHeader::SetIniRcId(uint32_t jettyNum)
 {
+    m_hasSimulationOriginJetty = false;
+    m_simulationOriginJetty = 0;
     m_iniRcIdId = jettyNum & 0xFFFFF; // 确保只使用低20位
+}
+
+void UbTransactionHeader::SetSimulationOriginJetty(uint32_t originJetty)
+{
+    NS_ABORT_MSG_IF((originJetty & 0xFFFFF) != m_iniRcIdId,
+                    "Simulation origin Jetty tag does not match wire initiator RCID");
+    m_simulationOriginJetty = originJetty;
+    m_hasSimulationOriginJetty = true;
+}
+
+uint32_t UbTransactionHeader::GetSimulationOriginJetty() const
+{
+    return m_hasSimulationOriginJetty ? m_simulationOriginJetty : m_iniRcIdId;
 }
 
 // Getters

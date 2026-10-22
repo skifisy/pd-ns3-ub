@@ -941,6 +941,12 @@ Ptr<Packet> UbTransportChannel::GenDataPacket(Ptr<UbWqeSegment> wqeSegment,
     Ptr<Packet> p = Create<Packet>(payloadSize);
     UbFlowTag flowTag(wqeSegment->GetTaskId(), wqeSegment->GetWqeSize());
     p->AddPacketTag(flowTag);
+    // Requests, TA responses, and regenerated GBN packets use this same path.
+    // Selective retransmission keeps the tag through Packet::Copy().
+    const uint32_t originJetty = wqeSegment->GetOriginJettyNum();
+    if (originJetty > 0xFFFFF) {
+        p->AddPacketTag(UbSimOriginJettyTag(originJetty));
+    }
     // add UbMAExtTah
     UbMAExtTah MAExtTaHeader;
     MAExtTaHeader.SetLength(wireLengthBytes);
@@ -998,7 +1004,7 @@ Ptr<UbWqeSegment> UbTransportChannel::TrackInboundTaPacket(const UbTransportHead
     const uint32_t srcTpn = tpHeader.GetSrcTpn();
     uint64_t& tpMsnReference = m_inboundTpMsnReferences[srcTpn];
     const uint64_t logicalTpMsn = UbTpMsnSequence::Unwrap(tpHeader.GetTpMsn(), tpMsnReference);
-    const auto taSsnKey = std::make_pair(srcTpn, taHeader.GetIniRcId());
+    const auto taSsnKey = std::make_pair(srcTpn, taHeader.GetSimulationOriginJetty());
     uint32_t& taSsnReference = m_inboundTaSsnReferences[taSsnKey];
     const uint32_t logicalTaSsn =
         UbTaSsnSequence::Unwrap(taHeader.GetIniTaSsn(), taSsnReference);
@@ -1016,10 +1022,10 @@ Ptr<UbWqeSegment> UbTransportChannel::TrackInboundTaPacket(const UbTransportHead
         state.segment->SetPriority(m_priority);
         state.segment->SetTaskId(taskId);
         state.segment->SetWqeSize(0);
-        state.segment->SetJettyNum(taHeader.GetIniRcId());
+        state.segment->SetJettyNum(taHeader.GetSimulationOriginJetty());
         state.segment->SetTaMsn(logicalTpMsn);
         state.segment->SetTaSsn(logicalTaSsn);
-        state.segment->SetOriginJettyNum(taHeader.GetIniRcId());
+        state.segment->SetOriginJettyNum(taHeader.GetSimulationOriginJetty());
         state.segment->SetRequestTassn(logicalTaSsn);
         state.segment->SetTpMsn(logicalTpMsn);
         state.segment->SetTpn(m_tpn);
@@ -1606,6 +1612,10 @@ UbTransportChannel::ParseReceivedDataPacket(Ptr<Packet> packet,
     packet->RemoveHeader(ctx.udpHeader);
     packet->RemoveHeader(ctx.transportHeader);
     packet->RemoveHeader(ctx.transactionHeader);
+    UbSimOriginJettyTag originJettyTag;
+    if (packet->PeekPacketTag(originJettyTag)) {
+        ctx.transactionHeader.SetSimulationOriginJetty(originJettyTag.GetOriginJetty());
+    }
     packet->RemoveHeader(ctx.maExtHeader);
     ctx.payloadBytes = packet->GetSize();
     ctx.resLenBytes = ctx.maExtHeader.GetLength();

@@ -6290,6 +6290,331 @@ class UbUrmaWriteOutOfOrderRequestSliceCompletionTest : public TestCase
     uint32_t m_targetRequestSliceCompleteCount{0};
 };
 
+class UbSimOriginJettyHeaderTest : public TestCase
+{
+public:
+    UbSimOriginJettyHeaderTest()
+        : TestCase("UnifiedBus - simulation Jetty identity preserves wire bytes and resets on reuse")
+    {
+    }
+
+    void DoRun() override
+    {
+        for (uint32_t origin : {0u, 1u, 0xFFFFFu, 0x100000u, 0x100001u, 0x200000u,
+                                0xFFFFFFFFu})
+        {
+            UbTransactionHeader header;
+            header.SetIniRcId(origin);
+            Ptr<Packet> plain = Create<Packet>(32);
+            plain->AddHeader(header);
+            Ptr<Packet> tagged = plain->Copy();
+            if (origin > 0xFFFFF)
+            {
+                tagged->AddPacketTag(UbSimOriginJettyTag(origin));
+            }
+            std::vector<uint8_t> plainBytes(plain->GetSize());
+            std::vector<uint8_t> taggedBytes(tagged->GetSize());
+            plain->CopyData(plainBytes.data(), plainBytes.size());
+            tagged->CopyData(taggedBytes.data(), taggedBytes.size());
+            NS_TEST_ASSERT_MSG_EQ((plainBytes == taggedBytes), true, "Tag must not change wire bytes");
+            NS_TEST_ASSERT_MSG_EQ(tagged->GetSize(), 40u, "TA header remains eight bytes");
+
+            UbTransactionHeader decoded;
+            tagged->RemoveHeader(decoded);
+            NS_TEST_ASSERT_MSG_EQ(decoded.GetIniRcId(), (origin & 0xFFFFF), "Wire RCID stays 20 bits");
+            UbSimOriginJettyTag tag;
+            const bool hasTag = tagged->PeekPacketTag(tag);
+            NS_TEST_ASSERT_MSG_EQ(hasTag, (origin > 0xFFFFF), "Low Jetty IDs need no extra tag");
+            if (hasTag)
+            {
+                NS_TEST_ASSERT_MSG_EQ(tag.GetOriginJetty(), origin, "Tag retains all 32 bits");
+                decoded.SetSimulationOriginJetty(tag.GetOriginJetty());
+            }
+            NS_TEST_ASSERT_MSG_EQ(decoded.GetSimulationOriginJetty(), origin, "Restore identity");
+            UbTransactionHeader copied = decoded;
+            NS_TEST_ASSERT_MSG_EQ(copied.GetSimulationOriginJetty(), origin, "OOO copies keep identity");
+            copied.SetIniRcId(7);
+            NS_TEST_ASSERT_MSG_EQ(copied.GetSimulationOriginJetty(), 7u, "Setter clears old identity");
+            plain->RemoveHeader(decoded);
+            NS_TEST_ASSERT_MSG_EQ(decoded.GetSimulationOriginJetty(), (origin & 0xFFFFF),
+                                  "Deserialize clears restored identity on reused object");
+        }
+#ifndef _WIN32
+        const int status = RunInChildProcess([]() {
+            UbTransactionHeader header;
+            header.SetIniRcId(1);
+            header.SetSimulationOriginJetty(0x100000);
+        });
+        NS_TEST_ASSERT_MSG_EQ(WIFSIGNALED(status), 1, "Mismatched metadata must be rejected");
+        NS_TEST_ASSERT_MSG_EQ(WTERMSIG(status), SIGABRT, "Mismatch must abort in release builds too");
+#endif
+    }
+};
+
+class UbSimOriginJettyCompletionTest : public TestCase
+{
+public:
+    UbSimOriginJettyCompletionTest()
+        : TestCase("UnifiedBus - colliding low-20-bit Jetty IDs complete READ and WRITE independently")
+    {
+    }
+
+    void DoRun() override
+    {
+        Config::Reset();
+        GlobalValue::Bind("UB_CC_ENABLED", BooleanValue(false));
+        LocalTpTopology topo = BuildLocalTpTopology();
+        InstallStaticTpPair(topo);
+        Ptr<UbController> ctrl = topo.sender->GetObject<UbController>();
+        Ptr<UbFunction> function = ctrl->GetUbFunction();
+        for (uint32_t jettyNum : {0u, 1u, 0xFFFFFu, 0x100000u, 0x100001u, 0x200000u,
+                                  0xFFFFFFFEu})
+        {
+            function->CreateJetty(topo.sender->GetId(), topo.receiver->GetId(), jettyNum);
+            const bool bound = ctrl->GetUbTransaction()->JettyBindTp(
+                topo.sender->GetId(), topo.receiver->GetId(), jettyNum, false,
+                {kUrmaWriteRegressionSenderTpn});
+            NS_TEST_ASSERT_MSG_EQ(bound, true, "All Jetties share the same static TP");
+            function->GetJetty(jettyNum)->SetClientCallback(
+                MakeCallback(&UbSimOriginJettyCompletionTest::OnCompleted, this));
+            for (TaOpcode opcode : {TaOpcode::TA_OPCODE_WRITE, TaOpcode::TA_OPCODE_READ})
+            {
+                const uint32_t taskId = 20000 + m_expected.size();
+                m_expected[taskId] = jettyNum;
+                Ptr<UbWqe> wqe = function->CreateWqe(topo.sender->GetId(), topo.receiver->GetId(),
+                                                    UB_MTU_BYTE * 2 + 512, taskId, opcode);
+                Simulator::ScheduleNow(&UbFunction::PushWqeToJetty, function, wqe, jettyNum);
+            }
+        }
+        Simulator::Stop(MilliSeconds(1));
+        Simulator::Run();
+        NS_TEST_ASSERT_MSG_EQ(m_completed.size(), m_expected.size(), "Every task must complete");
+        for (const auto& [taskId, jettyNum] : m_expected)
+        {
+            NS_TEST_ASSERT_MSG_EQ(m_completed[taskId], 1u, "Each task completes exactly once");
+        }
+        Simulator::Destroy();
+        Config::Reset();
+    }
+
+private:
+    void OnCompleted(uint32_t taskId, uint32_t jettyNum)
+    {
+        const auto it = m_expected.find(taskId);
+        NS_TEST_ASSERT_MSG_NE((it == m_expected.end()), true, "Completion must refer to an original task");
+        if (it != m_expected.end())
+        {
+            NS_TEST_ASSERT_MSG_EQ(jettyNum, it->second, "Callback must identify the full Jetty");
+        }
+        ++m_completed[taskId];
+    }
+    std::map<uint32_t, uint32_t> m_expected;
+    std::map<uint32_t, uint32_t> m_completed;
+};
+
+class UbSimOriginJettyOutOfOrderTest : public TestCase
+{
+public:
+    UbSimOriginJettyOutOfOrderTest()
+        : TestCase("UnifiedBus - OOO cache preserves full Jetty and isolates TA SSN unwrap state")
+    {
+    }
+
+    void DoRun() override
+    {
+        Config::Reset();
+        GlobalValue::Bind("UB_CC_ENABLED", BooleanValue(false));
+        UseSelectiveRetransmissionForTest();
+        LocalTpTopology topo = BuildLocalTpTopology();
+        InstallStaticTpPair(topo);
+        Ptr<UbTransportChannel> rx =
+            topo.receiver->GetObject<UbController>()->GetTpByTpn(kUrmaWriteRegressionReceiverTpn);
+        rx->SetInboundTaSsnReferenceForTest(kUrmaWriteRegressionSenderTpn, 0, 0);
+        rx->SetInboundTaSsnReferenceForTest(kUrmaWriteRegressionSenderTpn, 0x100000, 0x10000);
+        rx->TraceConnectWithoutContext("WqeSegmentCompletesNotify",
+            MakeCallback(&UbSimOriginJettyOutOfOrderTest::OnReceived, this));
+        Ptr<Packet> low0 = BuildReceiverDataPacketWithSequences(topo, 0, true, 0, 0, 16, 16, 21000);
+        Ptr<Packet> high = BuildReceiverDataPacketWithSequences(topo, 1, true, 1, 0, 16, 16, 21001);
+        high->AddPacketTag(UbSimOriginJettyTag(0x100000));
+        Ptr<Packet> low1 = BuildReceiverDataPacketWithSequences(topo, 2, true, 2, 1, 16, 16, 21002);
+        rx->RecvDataPacket(low1);
+        rx->RecvDataPacket(high);
+        NS_TEST_ASSERT_MSG_EQ(m_received.size(), 0u, "Future PSNs stay buffered");
+        rx->RecvDataPacket(low0);
+        NS_TEST_ASSERT_MSG_EQ(m_received.size(), 3u, "Closing the gap releases every TA unit");
+        NS_TEST_ASSERT_MSG_EQ(m_received[21000], 0u, "Low Jetty sequence starts at zero");
+        NS_TEST_ASSERT_MSG_EQ(m_received[21001], 0x10000u, "High Jetty has an independent unwrap epoch");
+        NS_TEST_ASSERT_MSG_EQ(m_received[21002], 1u, "High Jetty must not pollute low Jetty sequence");
+        Simulator::Destroy();
+        Config::Reset();
+    }
+
+private:
+    void OnReceived(uint32_t, uint32_t taskId, uint32_t taSsn) { m_received[taskId] = taSsn; }
+    std::map<uint32_t, uint32_t> m_received;
+};
+
+class UbSimOriginJettyRetransTest : public TestCase
+{
+public:
+    UbSimOriginJettyRetransTest()
+        : TestCase("UnifiedBus - GBN regeneration and selective copies preserve full Jetty identity")
+    {
+    }
+
+    void DoRun() override
+    {
+        for (UbRetransmissionMode mode : {UbRetransmissionMode::GBN, UbRetransmissionMode::SELECTIVE})
+        {
+            Config::Reset();
+            GlobalValue::Bind("UB_CC_ENABLED", BooleanValue(false));
+            Config::SetDefault("ns3::UbTransportChannel::EnableRetrans", BooleanValue(true));
+            Config::SetDefault("ns3::UbTransportChannel::EnableFastRetrans", BooleanValue(true));
+            Config::SetDefault("ns3::UbTransportChannel::RetransmissionMode", EnumValue(mode));
+            LocalTpTopology topo = BuildLocalTpTopology();
+            InstallStaticTpPair(topo);
+            Ptr<UbTransportChannel> tx =
+                topo.sender->GetObject<UbController>()->GetTpByTpn(kUrmaWriteRegressionSenderTpn);
+            Ptr<UbWqeSegment> request = CreateObject<UbWqeSegment>();
+            request->SetSrc(topo.sender->GetId());
+            request->SetDest(topo.receiver->GetId());
+            request->SetSport(topo.senderPort->GetIfIndex());
+            request->SetDport(topo.receiverPort->GetIfIndex());
+            request->SetPriority(kUrmaWriteRegressionPriority);
+            request->SetType(TaOpcode::TA_OPCODE_WRITE);
+            request->SetSize(UB_MTU_BYTE * 2);
+            request->SetWqeSize(UB_MTU_BYTE * 2);
+            request->SetPayloadBytes(UB_MTU_BYTE * 2);
+            request->SetResLenBytes(UB_MTU_BYTE * 2);
+            request->SetCarrierBytes(UB_MTU_BYTE * 2);
+            request->SetJettyNum(0x100000);
+            request->SetOriginJettyNum(0x100000);
+            request->SetSegmentKind(UbTransactionSegmentKind::REQUEST);
+            request->SetRequestOpcode(TaOpcode::TA_OPCODE_WRITE);
+            request->SetNeedsTransactionResponse(true);
+            request->SetTaskId(22000);
+            request->SetTaSsn(0);
+            request->SetRequestTassn(0);
+            request->SetTpMsn(tx->GetMsnCnt());
+            request->SetPsnStart(tx->GetPsnCnt());
+            request->SetTpn(kUrmaWriteRegressionSenderTpn);
+            tx->UpdatePsnCnt(request->GetPsnSize());
+            tx->UpDateMsnCnt(1);
+            tx->PushWqeSegment(request);
+            Ptr<Packet> original = tx->GetNextPacketForTest();
+            NS_TEST_ASSERT_MSG_NE(original, nullptr, "First send exists");
+            NS_TEST_ASSERT_MSG_NE(tx->GetNextPacketForTest(), nullptr, "Second send exists");
+            if (mode == UbRetransmissionMode::SELECTIVE)
+            {
+                tx->RecvTpAck(BuildTpsackBitmapForSender(0, 1, {1}));
+            }
+            else
+            {
+                tx->RecvTpAck(BuildTpnakForSender(0));
+            }
+            Ptr<Packet> replay = tx->GetNextPacketForTest();
+            NS_TEST_ASSERT_MSG_NE(replay, nullptr, "Missing first PSN is retransmitted");
+            if (original != nullptr && replay != nullptr)
+            {
+                UbSimOriginJettyTag tag;
+                NS_TEST_ASSERT_MSG_EQ(replay->PeekPacketTag(tag), true, "Replay carries identity tag");
+                NS_TEST_ASSERT_MSG_EQ(tag.GetOriginJetty(), 0x100000u, "Replay retains full Jetty");
+                std::vector<uint8_t> before(original->GetSize());
+                std::vector<uint8_t> after(replay->GetSize());
+                original->CopyData(before.data(), before.size());
+                replay->CopyData(after.data(), after.size());
+                NS_TEST_ASSERT_MSG_EQ((before == after), true, "Retransmitted PSN has identical wire bytes");
+            }
+            Simulator::Destroy();
+            Config::Reset();
+        }
+    }
+};
+
+#ifndef _WIN32
+class UbRtpCompletedJettyReclamationTest : public TestCase
+{
+public:
+    UbRtpCompletedJettyReclamationTest()
+        : TestCase("UnifiedBus - completed RTP tasks release one-task Jetties")
+    {
+    }
+
+    void DoRun() override
+    {
+        const int status = RunInChildProcess([]() {
+            LocalTpTopology topo = BuildLocalTpTopology();
+            InstallStaticTpPair(topo);
+            Ptr<UbController> controller = topo.sender->GetObject<UbController>();
+            Ptr<UbFunction> function = controller->GetUbFunction();
+            Ptr<UbTransaction> transaction = controller->GetUbTransaction();
+            Ptr<UbApp> app = CreateObject<UbApp>();
+            topo.sender->AddApplication(app);
+            app->SetTransportMode(TransportMode::RTP);
+
+            constexpr uint32_t jettyNum = 23000;
+            constexpr uint32_t taskId = 23000;
+            function->CreateJetty(topo.sender->GetId(), topo.receiver->GetId(), jettyNum);
+            NS_ABORT_MSG_IF(!transaction->JettyBindTp(
+                                topo.sender->GetId(),
+                                topo.receiver->GetId(),
+                                jettyNum,
+                                false,
+                                {kUrmaWriteRegressionSenderTpn}),
+                            "Test Jetty must bind to its TP");
+
+            utils::TrafficRecord task{};
+            task.taskId = taskId;
+            task.sourceNode = topo.sender->GetId();
+            task.destNode = topo.receiver->GetId();
+            task.dataSize = 64;
+            task.opType = "URMA_WRITE";
+            task.priority = kUrmaWriteRegressionPriority;
+            task.delay = "0ns";
+            UbTrafficGen::GetInstance().AddTaskDuringInitialLoad(task);
+
+            app->OnTaskCompleted(taskId, jettyNum);
+            NS_ABORT_MSG_IF(function->GetJetty(jettyNum) != nullptr,
+                            "Completed RTP Jetty must be removed from UbFunction");
+            NS_ABORT_MSG_IF(!transaction->GetJettyRelatedTpVec(jettyNum).empty(),
+                            "Completed RTP Jetty must be detached from its TP group");
+            NS_ABORT_MSG_IF(!controller->IsTPExists(kUrmaWriteRegressionSenderTpn),
+                            "TP should remain when RemoveUselessTp is disabled");
+
+            constexpr uint32_t sharedCtpJettyNum = 23001;
+            function->CreateJetty(topo.sender->GetId(), topo.receiver->GetId(), sharedCtpJettyNum);
+            app->SetTransportMode(TransportMode::CTP);
+            app->OnTaskCompleted(taskId + 1, sharedCtpJettyNum);
+            NS_ABORT_MSG_IF(function->GetJetty(sharedCtpJettyNum) == nullptr,
+                            "Shared CTP Jetty must remain available after a task callback");
+            Simulator::Destroy();
+            Config::Reset();
+        });
+        NS_TEST_ASSERT_MSG_EQ(WIFEXITED(status), 1,
+                              "Jetty reclamation lifecycle should exit normally");
+        NS_TEST_ASSERT_MSG_EQ(WEXITSTATUS(status), 0,
+                              "RTP Jetty should be released while shared CTP Jetty is retained");
+    }
+};
+#endif
+
+class UbSimOriginJettyTestSuite : public TestSuite
+{
+public:
+    UbSimOriginJettyTestSuite() : TestSuite("unified-bus-sim-origin-jetty", Type::UNIT)
+    {
+        AddTestCase(new UbSimOriginJettyHeaderTest(), TestCase::Duration::QUICK);
+        AddTestCase(new UbSimOriginJettyCompletionTest(), TestCase::Duration::QUICK);
+        AddTestCase(new UbSimOriginJettyOutOfOrderTest(), TestCase::Duration::QUICK);
+        AddTestCase(new UbSimOriginJettyRetransTest(), TestCase::Duration::QUICK);
+#ifndef _WIN32
+        AddTestCase(new UbRtpCompletedJettyReclamationTest(), TestCase::Duration::QUICK);
+#endif
+    }
+};
+
+static UbSimOriginJettyTestSuite g_ubSimOriginJettyTestSuite;
+
 class UbCreateNodeSystemIdTest : public TestCase
 {
   public:

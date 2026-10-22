@@ -868,6 +868,11 @@ public:
     uint8_t GetIniRcType() const;
     uint32_t GetIniRcId() const;
 
+    // Restored from PacketTag after parsing, before TA tracking or OOO buffering.
+    // These fields are copied with the header object but never serialized on wire.
+    void SetSimulationOriginJetty(uint32_t originJetty);
+    uint32_t GetSimulationOriginJetty() const;
+
 private:
     // 报文头字段 - 总共8字节 (64位)
     
@@ -900,6 +905,8 @@ private:
 
     // 字节6-7: [Src Jetty低16位:16] + 字节5的高4位组成完整的20位Jetty
     uint32_t m_iniRcIdId = 0xFFFFF;  // 20 bits: 对应发起端的 JettyNum
+    uint32_t m_simulationOriginJetty{0};
+    bool m_hasSimulationOriginJetty{false};
 
     // 尺寸和边界常量定义
     uint32_t totalHeaderSize = 8;  // 总头部大小 (8字节)
