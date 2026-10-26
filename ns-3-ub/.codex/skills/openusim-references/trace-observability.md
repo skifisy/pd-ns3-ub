@@ -36,8 +36,12 @@ Do not hardcode switch names in experiment specs or agent logic.
 
 - Add `--replay` to existing ub-quick-example commands. Mode and case_id are
   inferred from validated Jupiter TE / ToE inputs. Default output is
-  `<case>/replay/`: 500ms, all links aggregated by directed node pair, full-run
+  `<case>/replay/`: 10ms by default, all links aggregated by directed node pair, full-run
   reliable URMA WRITE / READ_RESPONSE endpoint/path aggregates, queues off.
+  Optional `--replay-interval=<Time>` overrides sampling (for example `20ms`
+  or `500ms`); it requires a strictly positive ns-3 time and only takes effect
+  with `--replay`. Dashboard `window_ms` must match the selected interval.
+  `--progress-interval` changes progress reporting, not replay sampling.
 - Local MTP (including `--mtp-threads=8`) is supported for ECMP and TE replay.
   Path counters and task buffers belong to logical-process IDs, not OS threads.
   The public LP samples/writes after the worker barrier; worker hooks cannot
@@ -56,7 +60,7 @@ Do not hardcode switch names in experiment specs or agent logic.
   logic, not a destination delivery confirmation. Current te_epoch need not be
   the original route epoch of queued packets.
 - Full-run path aggregation has per-packet update and output costs. Boundaries
-  split 500ms base windows; physical capacity remains separate from business
+  split configured base windows (default 10ms); physical capacity remains separate from business
   pause. See `../../../../tools/REPLAY_TELEMETRY_V4.md`.
 
 ## Non-Implications

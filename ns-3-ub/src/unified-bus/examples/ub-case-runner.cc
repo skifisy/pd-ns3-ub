@@ -5,6 +5,7 @@
 #include "ns3/command-line.h"
 #include "ns3/global-value.h"
 #include "ns3/node-list.h"
+#include "ns3/nstime.h"
 #include "ns3/ub-app.h"
 #include "ns3/ub-link.h"
 #include "ns3/ub-port.h"
@@ -72,6 +73,7 @@ struct QuickExampleOptions
     double toeSwitchDelaySeconds = 0.0;
     std::string toeOutput;
     bool replay = false;
+    std::string replayInterval = "10ms";
     std::string replayCommandLine;
 };
 
@@ -539,6 +541,9 @@ BuildScenarioFromConfig(const QuickExampleOptions& options, const RuntimeSelecti
 
     if (options.replay)
     {
+        const Time replayInterval(options.replayInterval);
+        NS_ABORT_MSG_IF(!replayInterval.IsStrictlyPositive(),
+                        "--replay-interval must be strictly positive");
         // Resolve from the same validated inputs that configured the controllers.
         // Keep dashboard's existing mode vocabulary; WCMP is represented as TE.
         const std::string mode = options.toeMode == "te" ? "toe+te"
@@ -550,16 +555,18 @@ BuildScenarioFromConfig(const QuickExampleOptions& options, const RuntimeSelecti
             GlobalValue::GetValueByNameFailSafe("UB_TASK_TRACE_ENABLE", taskTraceEnabled) &&
             taskTraceEnabled.Get();
         auto& replay = UbReplayLogger::Get();
-        // One flag enables a complete replay dataset. No extra mode, ID,
-        // sampling, task-log or path-log command-line arguments are required.
-        replay.Configure(configPath, "", caseId, mode, MilliSeconds(500),
+        // One flag enables a complete replay dataset at the default 10ms interval.
+        // --replay-interval optionally overrides sampling; mode and ID stay automatic.
+        replay.Configure(configPath, "", caseId, mode, replayInterval,
                          false, false, true, !nativeTaskTrace, "all", ModeUsesMtp(runtime.mode));
         replay.Metadata("command_line", options.replayCommandLine);
         replay.Metadata("source_revision", "unknown");
         replay.Metadata("routing_method", useJupiterTe ? "wcmp" : "ecmp");
         replay.Metadata("topology_control", options.toeMode == "off" ? "static" : "toe");
         replay.Metadata("task_data_source", nativeTaskTrace ? "native-task-trace" : "replay-task-events");
-        replay.Metadata("replay_profile", "500ms-all-links-node-pair-full-path-aggregation");
+        replay.Metadata("replay_interval_argument", options.replayInterval);
+        replay.Metadata("replay_profile",
+                        options.replayInterval + "-all-links-node-pair-full-path-aggregation");
         replay.Metadata("runtime", ModeUsesMtp(runtime.mode) ? "local-mtp" : "single-process-single-thread");
         replay.Metadata("requested_mtp_threads", std::to_string(options.mtpThreads));
         replay.Metadata("rng_seed", std::to_string(options.rngRun));
@@ -593,7 +600,8 @@ BuildScenarioFromConfig(const QuickExampleOptions& options, const RuntimeSelecti
         std::cout << "[INFO] Replay telemetry: mode=" << mode
                   << ", case_id=" << caseId
                   << ", directory=" << configPath + "/replay"
-                  << ", interval=500ms, scope=all, aggregation=node_pair, paths=all"
+                  << ", interval=" << options.replayInterval
+                  << ", scope=all, aggregation=node_pair, paths=all"
                   << ", task_source=" << (nativeTaskTrace ? "native-task-trace" : "replay-task-events")
                   << std::endl;
     }
@@ -900,8 +908,14 @@ QuickExampleOptions ParseOptions(int argc, char* argv[])
     cmd.AddValue("toe-switch-delay-seconds", "OCS reconnection delay (default 0s)",
                  options.toeSwitchDelaySeconds);
     cmd.AddValue("toe-output", "ToE audit output directory", options.toeOutput);
-    cmd.AddValue("replay", "Write complete 500ms replay logs; infer ECMP/TE(WCMP)/ToE mode automatically",
+    cmd.AddValue("replay",
+                 "Write complete replay logs (default 10ms); "
+                 "infer ECMP/TE(WCMP)/ToE mode automatically",
                  options.replay);
+    cmd.AddValue("replay-interval",
+                 "Replay sampling interval with time unit, e.g. 10ms or 500ms; "
+                 "must be strictly positive (default 10ms; requires --replay)",
+                 options.replayInterval);
     cmd.AddNonOption("casePath",
                      "Required unified-bus case directory when --case-path is omitted",
                      positionalCasePath);
