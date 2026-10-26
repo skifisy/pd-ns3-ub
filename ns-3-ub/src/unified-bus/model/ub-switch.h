@@ -108,6 +108,9 @@ public:
     bool IsQuiescentForTopologyChange() const;
     bool IsPortQuiescentForTopologyChange(uint32_t portId) const;
     void InitPortFlowControl(uint32_t portId);
+    void DropVoqsForCutover(uint32_t portId);
+    void ReleaseRejectedPacketForCutover(Ptr<UbPort> port, Ptr<Packet> packet,
+                                          uint32_t priority, const char* reason);
     bool HasVoqForTest(uint32_t outPort, uint32_t priority, uint32_t inPort) const;
     void RemoveTpFromAllocator(Ptr<UbIngressQueue> tp);
     Ptr<UbSwitchAllocator> GetAllocator();

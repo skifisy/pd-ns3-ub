@@ -76,6 +76,7 @@ void UbSwitchAllocator::DoDispose()
 
 void UbSwitchAllocator::TriggerAllocator(Ptr<UbPort> outPort)
 {
+    if (outPort->IsCutoverBlocked()) return;
     std::string typeName = GetInstanceTypeId().GetName();
     NS_LOG_DEBUG("[" << typeName << " TriggerAllocator] portId: " << outPort->GetIfIndex());
 
@@ -283,6 +284,12 @@ void UbRoundRobinAllocator::Init()
 
 void UbRoundRobinAllocator::AllocateNextPacket(Ptr<UbPort> outPort)
 {
+    if (outPort->IsCutoverBlocked())
+    {
+        m_isRunning[outPort->GetIfIndex()] = false;
+        m_oneMoreRound[outPort->GetIfIndex()] = false;
+        return;
+    }
     // 轮询调度
     NS_LOG_DEBUG("[UbRoundRobinAllocator AllocateNextPacket] portId: " << outPort->GetIfIndex());
     auto outPortId = outPort->GetIfIndex();
@@ -331,7 +338,7 @@ void UbRoundRobinAllocator::AllocateNextPacket(Ptr<UbPort> outPort)
                 auto node = NodeList::GetNode(m_nodeId);
                 auto inPort = DynamicCast<UbPort>(node->GetDevice(inPortId));
                 node->GetObject<UbSwitch>()->NotifySwitchDequeue(inPortId, outPortId, priority, packet);
-                inPort->GetFlowControl()->OnIngressReleased(context);
+                inPort->ReleaseIngress(context);
             }
         }
     }
@@ -501,6 +508,12 @@ Ptr<UbIngressQueue> UbDwrrAllocator::SelectNextIngressQueue(Ptr<UbPort> outPort)
 
 void UbDwrrAllocator::AllocateNextPacket(Ptr<UbPort> outPort)
 {
+    if (outPort->IsCutoverBlocked())
+    {
+        m_isRunning[outPort->GetIfIndex()] = false;
+        m_oneMoreRound[outPort->GetIfIndex()] = false;
+        return;
+    }
     NS_LOG_DEBUG("[UbDwrrAllocator AllocateNextPacket] portId: " << outPort->GetIfIndex());
     auto outPortId = outPort->GetIfIndex();
 
@@ -576,7 +589,7 @@ void UbDwrrAllocator::AllocateNextPacket(Ptr<UbPort> outPort)
                     auto node = NodeList::GetNode(m_nodeId);
                     auto inPort = DynamicCast<UbPort>(node->GetDevice(inPortId));
                     node->GetObject<UbSwitch>()->NotifySwitchDequeue(inPortId, outPortId, priority, packet);
-                    inPort->GetFlowControl()->OnIngressReleased(context);
+                    inPort->ReleaseIngress(context);
                 }
 
                 sentAny = true;

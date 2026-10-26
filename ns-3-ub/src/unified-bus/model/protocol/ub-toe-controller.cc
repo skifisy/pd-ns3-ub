@@ -14,6 +14,7 @@
 #include "ns3/ub-switch.h"
 #include "ns3/ub-te-controller.h"
 #include "ns3/ub-transport.h"
+#include "ns3/ub-utils.h"
 
 #include <algorithm>
 #include <cmath>
@@ -39,6 +40,7 @@ void UbToeController::Disable()
     if (m_timeoutEvent.IsPending()) Simulator::Cancel(m_timeoutEvent);
     if (m_applyEvent.IsPending()) Simulator::Cancel(m_applyEvent);
     m_enabled = false;
+    m_cutoverDrops.clear();
     m_paused = false;
     m_hostPortToLeaf.clear();
     m_groups.clear();
@@ -64,13 +66,15 @@ void UbToeController::Configure(const std::string& casePath,
                                 double mluSlack,
                                 double switchDelaySeconds,
                                 const std::string& outputDir,
-                                ReconfigurationMode reconfigurationMode)
+                                ReconfigurationMode reconfigurationMode,
+                                CutoverMode cutoverMode)
 {
     NS_ABORT_MSG_IF(!UbToeSolver::IsAvailable(), "ToE requires the in-process HiGHS backend");
     NS_ABORT_MSG_IF(intervalSeconds <= 0 || historyWindows == 0 || mluSlack < 0 ||
                         mluSlack > 1 || switchDelaySeconds < 0,
                     "invalid ToE configuration");
     Disable();
+    m_cutoverMode = cutoverMode;
     m_casePath = casePath;
     m_mode = mode;
     NS_ABORT_MSG_IF(mode == Mode::WITH_TE &&
@@ -159,6 +163,11 @@ void UbToeController::Configure(const std::string& casePath,
         << "epoch,decision_seconds,src_leaf,dst_leaf,demand_bps,demand_gbps,"
            "peak_window_bytes,latest_window_bytes,latest_gbps,sample_window_seconds,"
            "history_windows,completed_window,matrix_complete,matrix_kind\n";
+    if (LossyCutoverEnabled())
+    {
+        Simulator::ScheduleDestroy(&UbToeController::WriteCutoverDrops, this);
+        WriteCutoverDrops();
+    }
     WriteCircuits(m_currentCircuits, "initial");
     m_windowEvent = Simulator::Schedule(Seconds(30), &UbToeController::SampleWindow, this);
     m_recomputeEvent = Simulator::Schedule(Seconds(intervalSeconds) + NanoSeconds(1),
@@ -213,12 +222,18 @@ std::map<UbToeController::Od, uint32_t> UbToeController::CurrentTopology() const
 std::vector<uint16_t> UbToeController::PortsBetween(uint32_t src, uint32_t dst) const
 {
     auto it = m_linkPorts.find({src, dst});
-    return it == m_linkPorts.end() ? std::vector<uint16_t>{} : it->second;
+    if (it == m_linkPorts.end()) return {};
+    std::vector<uint16_t> ports;
+    for (auto id : it->second)
+        if (!DynamicCast<UbPort>(NodeList::GetNode(src)->GetDevice(id))->IsCutoverBlocked())
+            ports.push_back(id);
+    return ports;
 }
 
 void UbToeController::Recompute()
 {
     if (!m_enabled || m_paused) return;
+    if (LossyCutoverEnabled()) WriteCutoverDrops();
     const uint64_t completedWindow = static_cast<uint64_t>(
         std::floor(Simulator::Now().GetSeconds() / 30.0));
     std::map<Od, uint64_t> peak;
@@ -316,7 +331,7 @@ bool UbToeController::PauseNewBusinessData(uint32_t sourceHost, uint16_t sourceP
                                            uint32_t destinationHost,
                                            uint16_t destinationPort) const
 {
-    if (!m_paused) return false;
+    if (!m_paused || LossyCutoverEnabled()) return false;
     if (!m_selective) return true;
     const auto src = m_hostPortToLeaf.find({sourceHost, sourcePort});
     const auto dst = m_hostPortToLeaf.find({destinationHost, destinationPort});
@@ -355,7 +370,7 @@ void UbToeController::WriteReconfiguration(const char* status) const
     }
     std::ofstream output(m_outputDir + "/toe_reconfiguration.csv", std::ios::app);
     output << std::setprecision(12) << m_epoch << ',' << Simulator::Now().GetSeconds()
-           << ',' << status << ',' << (m_selective ? "selective" : "global") << ','
+           << ',' << status << ',' << (LossyCutoverEnabled() ? "lossy" : (m_selective ? "selective" : "global")) << ','
            << m_plan.changedPairs.size() << ',' << paused << ',' << total << ','
            << m_plan.retained.size() << ',' << m_plan.added.size() << ','
            << m_unpausedPayloadBytes << ','
@@ -390,6 +405,58 @@ void UbToeController::BeginReconfiguration(const UbToeSolver::Topology& target,
     m_paused = true;
     m_pauseStart = Simulator::Now();
     m_drainPolls = 0;
+    if (LossyCutoverEnabled())
+    {
+        // Check live channels too: a case can override the transport defaults.
+        for (uint32_t i = 0; i < NodeList::GetNNodes(); ++i)
+        {
+            auto controller = NodeList::GetNode(i)->GetObject<UbController>();
+            if (!controller) continue;
+            for (const auto& [tpn, tp] : controller->GetTpnMap())
+            {
+                (void)tpn;
+                NS_ABORT_MSG_IF(tp && !tp->GetRetransEnable(),
+                                "lossy ToE requires EnableRetrans on every RTP channel");
+            }
+        }
+        if (m_recomputeEvent.IsPending()) Simulator::Cancel(m_recomputeEvent);
+        if (m_mode == Mode::WITH_TE) UbTeController::Get().PauseForTopologyChange();
+        UbReplayLogger::Get().ToePhase(m_epoch, "withdrawn");
+        WriteSummary(result, "withdrawn");
+        WriteReconfiguration("withdrawn");
+        WriteCircuits(m_plan.retained, "retained");
+        WriteCircuits(m_plan.removed, "remove");
+        WriteCircuits(m_plan.added, "add");
+        UbReplayLogger::Get().BeforeTopologyChange();
+        // Gate ALL changed endpoints before any cleanup can return old credits.
+        for (const auto& [leaf, ports] : m_plan.changedPorts)
+            for (auto port : ports)
+                DynamicCast<UbPort>(NodeList::GetNode(leaf)->GetDevice(port))->BeginLossyCutover();
+        for (const auto& circuit : m_plan.removed)
+        {
+            auto port = DynamicCast<UbPort>(NodeList::GetNode(circuit.a)->GetDevice(circuit.ap));
+            DynamicCast<UbLink>(port->GetChannel())->InvalidateForCutover();
+        }
+        for (const auto& [leaf, ports] : m_plan.changedPorts)
+        {
+            auto sw = NodeList::GetNode(leaf)->GetObject<UbSwitch>();
+            for (auto port : ports) sw->DropVoqsForCutover(port);
+        }
+        // Publish the surviving topology for temporary ECMP forwarding.
+        m_linkPorts.clear();
+        for (const auto& circuit : m_plan.retained)
+        {
+            m_linkPorts[{circuit.a, circuit.b}].push_back(circuit.ap);
+            m_linkPorts[{circuit.b, circuit.a}].push_back(circuit.bp);
+        }
+        for (auto& [edge, ports] : m_linkPorts) std::sort(ports.begin(), ports.end());
+        m_drainFinish = m_pauseStart; // zero drain duration
+        WriteReconfiguration("disconnected");
+        UbReplayLogger::Get().ToePhase(m_epoch, "disconnected");
+        m_applyEvent = Simulator::Schedule(m_switchDelay,
+                                            &UbToeController::ApplyReconfiguration, this);
+        return;
+    }
     UbReplayLogger::Get().ToePhase(m_epoch, "draining");
     WriteSummary(result, "draining");
     WriteReconfiguration("draining");
@@ -523,7 +590,7 @@ void UbToeController::ApplyReconfiguration()
     for (const auto& [endpoint, packets] : m_guardTxPackets)
         if (DynamicCast<UbPort>(NodeList::GetNode(endpoint.first)->GetDevice(endpoint.second))
                 ->GetTxPackets() != packets) quietGuard = false;
-    if (!quietGuard || !IsDrained())
+    if (!LossyCutoverEnabled() && (!quietGuard || !IsDrained()))
     {
         UbReplayLogger::Get().ToePhase(m_epoch, "draining");
         m_drainPolls = 0;
@@ -539,6 +606,11 @@ void UbToeController::ApplyReconfiguration()
         link->SetAttribute("Delay", TimeValue(m_linkDelay));
         pa->Attach(link);
         pb->Attach(link);
+    }
+    if (LossyCutoverEnabled())
+    {
+        WriteReconfiguration("connected");
+        UbReplayLogger::Get().ToePhase(m_epoch, "connected");
     }
     // Retained ports keep their UbLink objects and peer flow-control state.
     for (const auto& [leaf, ports] : m_plan.changedPorts)
@@ -572,6 +644,11 @@ void UbToeController::ApplyReconfiguration()
         UbTeController::Get().RefreshTopology();
         UbTeController::Get().RecomputeForTopologyChange();
     }
+    if (LossyCutoverEnabled())
+    {
+        WriteReconfiguration("routes-installed");
+        UbReplayLogger::Get().ToePhase(m_epoch, "routes-installed");
+    }
     WriteTopology(CurrentTopology(), "applied");
     WriteCircuits(m_currentCircuits, "applied");
     WriteReconfiguration("applied");
@@ -583,7 +660,33 @@ void UbToeController::ApplyReconfiguration()
         << (m_drainFinish - m_pauseStart).GetSeconds() << ','
         << (Simulator::Now() - m_pauseStart).GetSeconds() << '\n';
     if (m_timeoutEvent.IsPending()) Simulator::Cancel(m_timeoutEvent);
+    if (LossyCutoverEnabled())
+    {
+        for (const auto& [leaf, ports] : m_plan.changedPorts)
+            for (auto port : ports)
+                DynamicCast<UbPort>(NodeList::GetNode(leaf)->GetDevice(port))->EndLossyCutover();
+        WriteCutoverDrops();
+    }
     ResumeTraffic();
+}
+
+void UbToeController::RecordCutoverDrop(const char* reason, uint32_t bytes)
+{
+    if (!LossyCutoverEnabled()) return;
+    if (std::string(reason) != "no-route" && std::string(reason) != "admission")
+        utils::UbUtils::RecordRuntimePacketDrop("reconfiguration cutover");
+    auto& count = m_cutoverDrops[{m_epoch, reason}];
+    ++count.first;
+    count.second += bytes;
+}
+
+void UbToeController::WriteCutoverDrops() const
+{
+    // Overwrite aggregate snapshots; ScheduleDestroy captures delayed old-link losses too.
+    std::ofstream output(m_outputDir + "/toe_cutover_drops.csv");
+    output << "epoch,reason,packets,bytes\n";
+    for (const auto& [key, count] : m_cutoverDrops)
+        output << key.first << ',' << key.second << ',' << count.first << ',' << count.second << '\n';
 }
 
 int UbToeController::SelectEcmpOutPort(uint32_t leaf,

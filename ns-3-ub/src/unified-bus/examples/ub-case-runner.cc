@@ -65,6 +65,7 @@ struct QuickExampleOptions
     std::string teOutput;
     std::string toeMode = "off";
     std::string toeReconfiguration = "auto";
+    std::string toeCutover = "drain";
     double toeRecomputeSeconds = 300.0;
     uint32_t toeHistoryWindows = 20;
     double toeMluSlack = 0.01;
@@ -514,7 +515,10 @@ BuildScenarioFromConfig(const QuickExampleOptions& options, const RuntimeSelecti
         const auto toeAppDefaults = CreateObject<UbApp>();
         NS_ABORT_MSG_IF(toeAppDefaults->GetTransportMode() != TransportMode::RTP,
                         "ToE drain/resume currently requires RTP transport");
-        NS_ABORT_MSG_IF(options.toeMode == "only" && options.toeReconfiguration != "global" &&
+        const auto tpDefaults = CreateObject<UbTransportChannel>();
+        NS_ABORT_MSG_IF(options.toeCutover == "lossy" && !tpDefaults->GetRetransEnable(),
+                        "--toe-cutover=lossy requires ns3::UbTransportChannel::EnableRetrans=true");
+        NS_ABORT_MSG_IF(options.toeCutover == "drain" && options.toeMode == "only" && options.toeReconfiguration != "global" &&
                             !toeAppDefaults->GetUseShortestPaths(),
                         "selective ToE requires UbApp::UseShortestPaths=true; use global otherwise");
         UbToeController::Get().Configure(
@@ -526,7 +530,9 @@ BuildScenarioFromConfig(const QuickExampleOptions& options, const RuntimeSelecti
             options.toeReconfiguration == "global" ? UbToeController::ReconfigurationMode::GLOBAL
                 : options.toeReconfiguration == "selective"
                     ? UbToeController::ReconfigurationMode::SELECTIVE
-                    : UbToeController::ReconfigurationMode::AUTO);
+                    : UbToeController::ReconfigurationMode::AUTO,
+            options.toeCutover == "lossy" ? UbToeController::CutoverMode::LOSSY
+                                         : UbToeController::CutoverMode::DRAIN);
     }
     UbUtils::Get()->CreateTp(configPath + "/transport_channel.csv");
     UbUtils::Get()->TopoTraceConnect();
@@ -880,6 +886,8 @@ QuickExampleOptions ParseOptions(int argc, char* argv[])
                  options.teOutput);
     cmd.AddValue("toe-mode", "Dynamic topology mode: off, only (ECMP), or te (ToE + Jupiter TE)",
                  options.toeMode);
+    cmd.AddValue("toe-cutover", "Cutover behavior: drain (default) or lossy (requires retransmission)",
+                 options.toeCutover);
     cmd.AddValue("toe-reconfiguration", "Drain scope: auto (selective for only, global for te), global, selective",
                  options.toeReconfiguration);
     cmd.AddValue("toe-recompute-seconds", "ToE topology recomputation interval (default 300s)",
@@ -914,6 +922,11 @@ QuickExampleOptions ParseOptions(int argc, char* argv[])
             std::cerr << "--debug-te requires Jupiter TE or --toe-mode=te" << std::endl;
             std::exit(1);
         }
+    }
+    if (options.toeCutover != "drain" && options.toeCutover != "lossy")
+    {
+        std::cerr << "--toe-cutover must be drain or lossy" << std::endl;
+        std::exit(EXIT_FAILURE);
     }
     if (options.toeReconfiguration != "auto" && options.toeReconfiguration != "global" &&
         options.toeReconfiguration != "selective")

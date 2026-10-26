@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-only
 #include "ns3/ub-port.h"
+#include "ns3/ub-toe-controller.h"
 #include "ns3/ub-link.h"
 #include "ns3/log.h"
 #include "ns3/ub-network-address.h"
@@ -14,6 +15,7 @@ using namespace utils;
 
 namespace ns3 {
 NS_OBJECT_ENSURE_REGISTERED(UbPort);
+NS_OBJECT_ENSURE_REGISTERED(UbCutoverTag);
 NS_LOG_COMPONENT_DEFINE("UbPort");
 
 constexpr long DEFAULT_PFC_UP_THLD = 819200;   // 800KB ≈ 78% of 1MB per-queue reserve
@@ -373,6 +375,46 @@ void UbPort::CreateAndInitFc(FcType type)
     }
 }
 
+void UbPort::ReleaseIngress(const UbFlowControlEventContext& context)
+{
+    UbCutoverTag tag;
+    const auto type = m_flowControl->GetFcType();
+    if ((type == FcType::CBFC || type == FcType::CBFC_SHARED) &&
+        context.packet->PeekPacketTag(tag) && tag.node == GetNode()->GetId() &&
+        tag.ingress != m_connectionGeneration) return;
+    // PFC decisions use current physical occupancy, even when the freed packet
+    // belonged to the old connection. This can resume a paused new peer.
+    m_flowControl->OnIngressReleased(context);
+}
+
+void UbPort::BeginLossyCutover()
+{
+    m_cutoverBlocked = true;
+    ++m_connectionGeneration;
+    if (m_transmitCompleteEvent.IsPending()) Simulator::Cancel(m_transmitCompleteEvent);
+    // The channel owns in-flight loss accounting (including the current packet).
+    m_currentPkt = nullptr;
+    m_sendState = SendState::READY;
+    m_currentInPortId = 0;
+    m_currentPriority = 0;
+    auto sw = GetNode()->GetObject<UbSwitch>();
+    while (!m_ubEQ->IsEmpty())
+    {
+        auto [inPort, priority, packet] = m_ubEQ->DoDequeue();
+        (void)inPort;
+        (void)priority;
+        if (sw) sw->GetQueueManager()->RemoveEgressBufferedBytes(packet->GetSize());
+        UbToeController::Get().RecordCutoverDrop("egress", packet->GetSize());
+    }
+    ResetCredits();
+}
+
+void UbPort::EndLossyCutover()
+{
+    m_cutoverBlocked = false;
+    TriggerTransmit();
+}
+
 void UbPort::TransmitComplete()
 {
     NS_LOG_FUNCTION(this);
@@ -424,6 +466,9 @@ void UbPort::DequeuePacket(void)
 
 void UbPort::TransmitPacket(Ptr<Packet> packet, Time delay)
 {
+    UbCutoverTag tag;
+    if (m_cutoverBlocked || (packet->PeekPacketTag(tag) &&
+        tag.node == GetNode()->GetId() && tag.egress != m_connectionGeneration)) return;
     PortTxNotify(GetNode()->GetId(), m_portId, packet->GetSize());
     NS_LOG_DEBUG("[UbPort send] nodetype: " << g_node_type_map[GetNode()->GetObject<UbSwitch>()->GetNodeType()]
         << " NodeId: " << GetNode()->GetId() << " PortId: " << m_portId << " send to:"
@@ -456,7 +501,7 @@ void UbPort::TransmitPacket(Ptr<Packet> packet, Time delay)
 
     // Transmission started successfully: notify and schedule completion
     TraComEventNotify(packet, txCompleteTime);
-    Simulator::Schedule(txCompleteTime, &UbPort::TransmitComplete, this);
+    m_transmitCompleteEvent = Simulator::Schedule(txCompleteTime, &UbPort::TransmitComplete, this);
     NS_LOG_DEBUG("[UbFc DequeueAndTransmit] will send pkt size: " << packet->GetSize());
     UpdateTxBytes(packet->GetSize());
     UbReplayLogger::Get().SuccessfulTransmit(packet, GetNode()->GetId(), GetIfIndex());
@@ -467,6 +512,9 @@ void UbPort::TransmitPacket(Ptr<Packet> packet, Time delay)
 void
 UbPort::TransmitPacketDetached(Ptr<Packet> packet)
 {
+    UbCutoverTag tag;
+    if (m_cutoverBlocked || (packet->PeekPacketTag(tag) &&
+        tag.node == GetNode()->GetId() && tag.egress != m_connectionGeneration)) return;
     PortTxNotify(GetNode()->GetId(), m_portId, packet->GetSize());
     NS_LOG_DEBUG("[UbPort detached send] nodetype: " << g_node_type_map[GetNode()->GetObject<UbSwitch>()->GetNodeType()]
         << " NodeId: " << GetNode()->GetId() << " PortId: " << m_portId << " send to:"
@@ -594,6 +642,7 @@ bool UbPort::IsUb(void) const
 
 void UbPort::TriggerTransmit()
 {
+    if (m_cutoverBlocked) return;
     NS_LOG_DEBUG("[UbPort TriggerTransmit] nodeId: " << GetNode()->GetId()
         << " portId: " << GetIfIndex() <<" TriggerTransmit...");
     if (!m_linkUp) {
@@ -626,6 +675,7 @@ void UbPort::TriggerTransmit()
 
 void UbPort::NotifyAllocationFinish()
 {
+    if (m_cutoverBlocked) return;
     if (IsBusy()) {
         return;
     }

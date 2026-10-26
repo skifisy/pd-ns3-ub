@@ -9,6 +9,7 @@
 #include "ns3/ub-caqm.h"
 #include "ns3/ub-port.h"
 #include "ns3/ub-switch.h"
+#include "ns3/ub-toe-controller.h"
 #include "ns3/ub-tag.h"
 #include "ns3/ub-replay-logger.h"
 #include "ns3/ub-controller.h"
@@ -417,6 +418,16 @@ UbSwitch::ForwardDataPacketAfterAdmission(Ptr<Packet> packet,
     NS_ASSERT_MSG(IsValidVoqIndices(outPort, priority, inPort, m_portsNum, m_vlNum),
                   "ForwardDataPacketAfterAdmission invalid VOQ indices");
 
+    auto node = GetObject<Node>();
+    if (UbToeController::Get().LossyCutoverEnabled())
+    {
+        UbCutoverTag tag;
+        packet->RemovePacketTag(tag);
+        tag.node = node->GetId();
+        tag.ingress = DynamicCast<UbPort>(node->GetDevice(inPort))->GetConnectionGeneration();
+        tag.egress = DynamicCast<UbPort>(node->GetDevice(outPort))->GetConnectionGeneration();
+        packet->AddPacketTag(tag);
+    }
     m_queueManager->PushToInPortProcessing(inPort, outPort, priority, packet->GetSize());
 
     if (m_inPortProcessingDelay <= NanoSeconds(0)) {
@@ -496,6 +507,20 @@ UbSwitch::CompleteInPortProcessing(Ptr<Packet> packet,
                        [](const EventId& event) { return !event.IsPending(); }),
         m_inPortProcessingEvents.end());
 
+    auto node = GetObject<Node>();
+    auto output = DynamicCast<UbPort>(node->GetDevice(outPort));
+    UbCutoverTag tag;
+    if (packet->PeekPacketTag(tag) && tag.egress != output->GetConnectionGeneration())
+    {
+        // Release processing occupancy using the existing accounting transitions,
+        // without inserting the invalid packet into a real queue.
+        m_queueManager->MoveInPortProcessingToVoq(inPort, outPort, priority, packet->GetSize());
+        NotifySwitchDequeue(inPort, outPort, priority, packet);
+        DynamicCast<UbPort>(node->GetDevice(inPort))->ReleaseIngress(
+            {packet, nullptr, inPort, outPort, priority});
+        UbToeController::Get().RecordCutoverDrop("processing", packet->GetSize());
+        return;
+    }
     MoveInPortProcessingToVoq(packet, inPort, outPort, priority);
     FinalizeForwardedPacketEnqueue(packet, inPort, outPort, priority);
 }
@@ -516,6 +541,40 @@ uint64_t UbSwitch::GetAllocatedVoqCountForTest() const
         }
     }
     return count;
+}
+
+void UbSwitch::ReleaseRejectedPacketForCutover(Ptr<UbPort> port, Ptr<Packet> packet,
+                                                uint32_t priority, const char* reason)
+{
+    if (!UbToeController::Get().LossyCutoverEnabled()) return;
+    UbToeController::Get().RecordCutoverDrop(reason, packet->GetSize());
+    if (IsCBFCEnable() || IsCBFCSharedEnable())
+    {
+        // A non-admitted packet immediately frees its receive capacity.
+        port->GetFlowControl()->OnIngressEnqueued(
+            {packet, nullptr, port->GetIfIndex(), port->GetIfIndex(), priority});
+    }
+}
+
+void UbSwitch::DropVoqsForCutover(uint32_t portId)
+{
+    auto node = GetObject<Node>();
+    for (uint32_t priority = 0; priority < m_vlNum; ++priority)
+    {
+        auto key = BuildVoqGroupKey(portId, priority);
+        for (auto& entry : m_voq.groups[key])
+        {
+            auto queue = entry.queue;
+            while (queue && !queue->IsEmpty())
+            {
+                auto packet = queue->GetNextPacket();
+                NotifySwitchDequeue(entry.inPort, portId, priority, packet);
+                DynamicCast<UbPort>(node->GetDevice(entry.inPort))->ReleaseIngress(
+                    {packet, queue, entry.inPort, portId, priority});
+                UbToeController::Get().RecordCutoverDrop("voq", packet->GetSize());
+            }
+        }
+    }
 }
 
 bool UbSwitch::IsQuiescentForTopologyChange() const
@@ -841,6 +900,8 @@ void UbSwitch::ForwardDataPacket(Ptr<UbPort> port, Ptr<Packet> packet, const Par
     bool selectedShortestPath = false;
     int outPort = m_routingProcess->GetOutPort(rtKey, selectedShortestPath, port->GetIfIndex());
     if (outPort < 0) {
+        ReleaseRejectedPacketForCutover(port, packet,
+            headers.datalinkPacketHeader.GetPacketVL(), "no-route");
         utils::UbUtils::RecordRuntimePacketDrop("route cannot be found");
         NS_LOG_WARN("The route cannot be found. Packet Dropped!");
         return;
@@ -872,6 +933,7 @@ void UbSwitch::ForwardDataPacket(Ptr<UbPort> port, Ptr<Packet> packet, const Par
                     "simulator model. Data packets must use priority 1..15.");
 
     if (!m_queueManager->CheckInPortSpace(inPort, priority, pSize)) {
+        ReleaseRejectedPacketForCutover(port, packet, priority, "admission");
         utils::UbUtils::RecordRuntimePacketDrop("ingress buffer full");
         NS_LOG_WARN("NodeId " << GetObject<Node>()->GetId() << " InPort " << inPort << " pri=" << (uint32_t)priority
                     << " buffer full. Packet Dropped!");
@@ -894,6 +956,8 @@ void UbSwitch::ForwardDataPacket(Ptr<UbPort> port, Ptr<Packet> packet, const Par
     bool selectedShortestPath = false;
     int outPort = m_routingProcess->GetOutPort(rtKey, selectedShortestPath, port->GetIfIndex());
     if (outPort < 0) {
+        ReleaseRejectedPacketForCutover(port, packet,
+            headers.datalinkPacketHeader.GetPacketVL(), "no-route");
         utils::UbUtils::RecordRuntimePacketDrop("route cannot be found");
         NS_LOG_WARN("The route cannot be found. Packet Dropped!");
         return;
@@ -913,6 +977,7 @@ void UbSwitch::ForwardDataPacket(Ptr<UbPort> port, Ptr<Packet> packet, const Par
                     "simulator model. Data packets must use priority 1..15.");
 
     if (!m_queueManager->CheckInPortSpace(inPort, priority, pSize)) {
+        ReleaseRejectedPacketForCutover(port, packet, priority, "admission");
         utils::UbUtils::RecordRuntimePacketDrop("ingress buffer full");
         NS_LOG_WARN("NodeId " << GetObject<Node>()->GetId() << " InPort " << inPort << " pri=" << (uint32_t)priority
                     << " buffer full. Packet Dropped!");
@@ -933,6 +998,8 @@ void UbSwitch::ForwardDataPacket(Ptr<UbPort> port, Ptr<Packet> packet, const Par
     bool selectedShortestPath = false;
     int outPort = m_routingProcess->GetOutPort(rtKey, selectedShortestPath, port->GetIfIndex());
     if (outPort < 0) {
+        ReleaseRejectedPacketForCutover(port, packet,
+            headers.datalinkPacketHeader.GetPacketVL(), "no-route");
         utils::UbUtils::RecordRuntimePacketDrop("route cannot be found");
         NS_LOG_WARN("The route cannot be found. Packet Dropped!");
         return;
@@ -950,6 +1017,7 @@ void UbSwitch::ForwardDataPacket(Ptr<UbPort> port, Ptr<Packet> packet, const Par
                     "simulator model. Data packets must use priority 1..15.");
 
     if (!m_queueManager->CheckInPortSpace(inPort, priority, pSize)) {
+        ReleaseRejectedPacketForCutover(port, packet, priority, "admission");
         utils::UbUtils::RecordRuntimePacketDrop("ingress buffer full");
         NS_LOG_WARN("NodeId " << GetObject<Node>()->GetId() << " InPort " << inPort << " pri=" << (uint32_t)priority
                     << " buffer full. Packet Dropped!");

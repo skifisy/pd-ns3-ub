@@ -62,6 +62,8 @@ public:
     virtual bool TransmitStart(Ptr<Packet> p, Ptr<UbPort> src, Time txTime);
 
     virtual bool IsRemote(void) const;
+    void InvalidateForCutover() { m_cutoverValid = false; }
+    void Deliver(Ptr<Packet> packet, uint32_t wire);
 
     /**
      * @brief Get number of devices on this link
@@ -118,6 +120,7 @@ private:
     // Each link has exactly two net devices
     static const int nDevices = 2;
 
+    bool m_cutoverValid{true};
     Time m_delay;
     int32_t m_nDevices;
 

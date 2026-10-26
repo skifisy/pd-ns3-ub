@@ -485,7 +485,8 @@ int UbRoutingProcess::SelectOutPort(RoutingKey &rtKey, const std::vector<uint16_
 // 3. 如果找不到出端口，报错
 int UbRoutingProcess::GetOutPort(RoutingKey &rtKey, bool &selectedShortestPath, uint16_t inPort)
 {
-    if (UbToeController::Get().UsesEcmp()) {
+    if (UbToeController::Get().UsesEcmp() ||
+        (UbToeController::Get().LossyCutoverEnabled() && !rtKey.teEligible)) {
         const uint32_t salt = utils::NodeIdToIp(m_nodeId).Get();
         uint64_t hash = 0;
         if (rtKey.usePacketSpray)
@@ -602,6 +603,13 @@ int UbRoutingProcess::GetOutPort(RoutingKey &rtKey, bool &selectedShortestPath, 
         GetNonShortestCandidates(tempDip, inPort, nonShortestPorts);
     }
     
+    auto removeBlocked = [&](std::vector<uint16_t>& ports) {
+        ports.erase(std::remove_if(ports.begin(), ports.end(), [&](uint16_t id) {
+            return DynamicCast<UbPort>(NodeList::GetNode(m_nodeId)->GetDevice(id))->IsCutoverBlocked();
+        }), ports.end());
+    };
+    removeBlocked(shortestPorts);
+    removeBlocked(nonShortestPorts);
     // 检查是否有可用端口
     if (shortestPorts.empty() && nonShortestPorts.empty()) {
         NS_LOG_ERROR("No candidate ports found for dip: " << Ipv4Address(dip));

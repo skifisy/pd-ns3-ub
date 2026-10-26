@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-only
 #include "ub-link.h"
+#include "ns3/ub-toe-controller.h"
 #include "ns3/log.h"
 
 NS_LOG_COMPONENT_DEFINE("UbLink");
@@ -52,15 +53,26 @@ bool UbLink::TransmitStart(Ptr<Packet> p, Ptr<UbPort> src, Time txTime)
     NS_LOG_FUNCTION(this << p << src);
     NS_LOG_LOGIC("UID is " << p->GetUid() << ")");
 
+    if (!m_cutoverValid) return false;
     NS_ASSERT(m_link[0].m_state != WireState::INITIALIZING);
     NS_ASSERT(m_link[1].m_state != WireState::INITIALIZING);
 
     uint32_t wire = src == m_link[0].m_src ? 0 : 1;
 
-    Simulator::ScheduleWithContext(m_link[wire].m_dst->GetNode()->GetId(), txTime + m_delay, &UbPort::Receive,
-                                   m_link[wire].m_dst, p);
+    Simulator::ScheduleWithContext(m_link[wire].m_dst->GetNode()->GetId(), txTime + m_delay, &UbLink::Deliver,
+                                   Ptr<UbLink>(this), p, wire);
 
     return true;
+}
+
+void UbLink::Deliver(Ptr<Packet> packet, uint32_t wire)
+{
+    if (!m_cutoverValid)
+    {
+        UbToeController::Get().RecordCutoverDrop("inflight", packet->GetSize());
+        return;
+    }
+    m_link[wire].m_dst->Receive(packet);
 }
 
 size_t UbLink::GetNDevices(void) const
@@ -110,6 +122,7 @@ bool UbLink::IsRemote(void) const
 
 bool UbLink::IsInitialized(void) const
 {
+    if (!m_cutoverValid) return false;
     NS_ASSERT(m_link[0].m_state != WireState::INITIALIZING);
     NS_ASSERT(m_link[1].m_state != WireState::INITIALIZING);
     return true;

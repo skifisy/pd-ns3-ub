@@ -3,6 +3,7 @@
 #define UB_PORT_H
 
 #include <atomic>
+#include "ns3/tag.h"
 #include <map>
 #include <vector>
 #include <string>
@@ -28,6 +29,29 @@
 
 
 namespace ns3 {
+class UbCutoverTag : public Tag {
+public:
+    static TypeId GetTypeId()
+    {
+        static TypeId tid = TypeId("ns3::UbCutoverTag").SetParent<Tag>()
+            .AddConstructor<UbCutoverTag>();
+        return tid;
+    }
+    TypeId GetInstanceTypeId() const override { return GetTypeId(); }
+    uint32_t GetSerializedSize() const override { return 20; }
+    void Serialize(TagBuffer b) const override
+    {
+        b.WriteU32(node); b.WriteU64(ingress); b.WriteU64(egress);
+    }
+    void Deserialize(TagBuffer b) override
+    {
+        node = b.ReadU32(); ingress = b.ReadU64(); egress = b.ReadU64();
+    }
+    void Print(std::ostream& os) const override { os << node << ':' << ingress << ':' << egress; }
+    uint32_t node{0};
+    uint64_t ingress{0}, egress{0};
+};
+
 class UbTransportChannel;
 class UbEgressQueue;
 class UbSwitch;
@@ -35,6 +59,7 @@ class UbDataLink;
 class UbIngressQueue;
 class UbLink;
 class UbFlowControl;
+struct UbFlowControlEventContext;
 class UbCbfc;
 class UbCbfcSharedCredit;
 class UbPfc;
@@ -104,6 +129,11 @@ public:
     bool Attach(Ptr<UbLink> ch);
 
     void NotifyLinkUp(void);
+    bool IsCutoverBlocked() const { return m_cutoverBlocked; }
+    uint64_t GetConnectionGeneration() const { return m_connectionGeneration; }
+    void BeginLossyCutover();
+    void EndLossyCutover();
+    void ReleaseIngress(const UbFlowControlEventContext& context);
 
     void TriggerTransmit();
     void NotifyAllocationFinish();
@@ -206,6 +236,9 @@ private:
 
     void DoDispose() override;
 
+    bool m_cutoverBlocked{false};
+    uint64_t m_connectionGeneration{0};
+    EventId m_transmitCompleteEvent;
     uint32_t m_portId;
 
     Ptr<UbEgressQueue> m_ubEQ;

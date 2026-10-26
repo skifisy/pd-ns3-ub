@@ -22,15 +22,23 @@ class UbToeController
 {
   public:
     enum class Mode { ONLY, WITH_TE };
+    enum class CutoverMode { DRAIN, LOSSY };
     enum class ReconfigurationMode { AUTO, GLOBAL, SELECTIVE };
     static UbToeController& Get();
     void Configure(const std::string& casePath, Mode mode, double intervalSeconds,
                    uint32_t historyWindows, double mluSlack, double switchDelaySeconds,
                    const std::string& outputDir,
-                   ReconfigurationMode reconfigurationMode = ReconfigurationMode::AUTO);
+                   ReconfigurationMode reconfigurationMode = ReconfigurationMode::AUTO,
+                   CutoverMode cutoverMode = CutoverMode::DRAIN);
     void Disable();
     bool Enabled() const { return m_enabled; }
-    bool UsesEcmp() const { return m_enabled && m_mode == Mode::ONLY; }
+    bool LossyCutoverEnabled() const { return m_enabled && m_cutoverMode == CutoverMode::LOSSY; }
+    bool UsesEcmp() const
+    {
+        return m_enabled && (m_mode == Mode::ONLY || (LossyCutoverEnabled() && m_paused));
+    }
+    void RecordCutoverDrop(const char* reason, uint32_t bytes);
+    void WriteCutoverDrops() const;
     bool PauseNewBusinessData(uint32_t sourceHost, uint16_t sourcePort,
                               uint32_t destinationHost, uint16_t destinationPort) const;
     void OnNewDataPacket(uint32_t sourceHost, uint16_t sourcePort,
@@ -61,6 +69,8 @@ class UbToeController
     void WriteCircuits(const std::vector<PortPair>& circuits, const char* status) const;
     bool VerifyPhysicalTopology() const;
 
+    CutoverMode m_cutoverMode{CutoverMode::DRAIN};
+    std::map<std::pair<uint64_t, std::string>, std::pair<uint64_t, uint64_t>> m_cutoverDrops;
     bool m_enabled{false};
     bool m_paused{false};
     bool m_selective{true};
