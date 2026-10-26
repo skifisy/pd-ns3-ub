@@ -26,22 +26,24 @@ python server.py --manifest /data/experiment.json --cache /data/replay-cache/rep
 
 ## 10 ms 采集与旧日志
 
-仿真侧使用此前独立交付的 v2 replay telemetry 采集器。该采集器通过参数选择间隔：
+仿真采集器已包含在仓库中。保留原有 ECMP / TE / TOE 参数，加 `--replay` 即按默认 10 ms 采集。
+可通过可选参数覆盖间隔：
 
 ```text
---replay-log=1 --replay-case-id=ecmp --replay-interval=10ms
---replay-scope=all --replay-link-aggregation=pair --replay-queues=0
---replay-detail-windows=220s:280s,400s:460s
+--replay                         # 默认 10ms
+--replay --replay-interval=10ms   # 显式指定 10ms
+--replay --replay-interval=500ms  # 使用旧粒度
 ```
 
-TE、TOE 分别使用自己的 case-id，三组保持相同采样间隔和详情范围。
-`--replay-detail-windows=none` 不采集路径详情；`all` 记录全程端点路径。
-详情范围外跳过端点路径计数，但全程链路采样仍开启。
-当前 main 的 `tools/replay_dashboard/` 不包含 C++ 采集器；本次 dashboard 补丁不替代此前的完整日志 patch。
-线程支持沿用你实际使用的采集器版本，本次没有修改线程数或仿真转发逻辑。
+间隔使用带单位的 ns-3 时间，必须严格大于零。单独设置 replay-interval 不会开启采集。
+`--progress-interval` 是独立的终端进度打印间隔，不改变 replay 窗口。
+模式和 case-id 根据原有 TE/TOE 参数自动识别；全程采集所有链路并按有向节点对聚合，队列采样关闭。
+当前入口固定采集全程路径，不接受旧版 `--replay-log`、`--replay-case-id`、`--replay-scope`、
+`--replay-link-aggregation`、`--replay-queues` 或 `--replay-detail-windows` 参数。
+本地 MTP（包括请求 8 线程）可用于 ECMP / TE 日志；TOE 仍受原有控制器单线程限制，MPI 日志不支持。
 
 在 manifest 中设置 `"window_ms": 10`。运行元数据 `sample_interval_ns` 和实际窗口长度会被校验。
-TE/TOE 发布、拓扑生效和详情边界仍按精确时间拆分，实际窗口可以小于 10 ms。
+TE/TOE 发布和拓扑生效仍按精确时间拆分，实际窗口可以小于所配置的基础间隔。
 旧 500 ms 数据不能还原成 10 ms；如需观看旧数据，显式保留 `"window_ms": 500`。
 三组采样间隔必须与同一个 manifest 一致，禁止把粗采样改标签后充当细采样。
 约 600 秒对应每组 60000 个基础窗口，采样记录数约为 500 ms 的 50 倍；未进行大规模开销实测。
@@ -60,7 +62,7 @@ TE/TOE 发布、拓扑生效和详情边界仍按精确时间拆分，实际窗�
 - `recording.start_seconds/end_seconds`：限定播放范围，不缩减全程 FCT 统计。
 
 任务来源优先级：显式 task_events → 显式 task_statistics → 非空 replay_task_events.csv → 原生 TaskTrace。
-默认不需要重复采集 replay 任务事件；如原采集器默认 `--replay-task-events=0`，复用原生 TaskTrace 即可。
+入口自动复用已开启的原生 TaskTrace；未开启时自动补写 replay_task_events.csv，不需要额外任务日志参数。
 原生解析跳过 Segment 事件，只识别任务级 MEM Task/WQE Starts/Completes；其余含 taskId 但格式不符的行报错。
 规范化 task_statistics CSV 字段为：
 

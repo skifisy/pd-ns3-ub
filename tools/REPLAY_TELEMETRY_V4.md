@@ -1,11 +1,8 @@
 # Replay telemetry v4：保留本地 MTP 8 线程
 
-提供两份补丁：
-
-- `te-toe-replay-telemetry-v3-to-v4-mtp8.patch`：已应用 v3 单开关补丁的工作树继续应用这份。
-- `te-toe-replay-telemetry-v4-mtp8-from-original.patch`：原始仓库 bcb10862fc5ea0ab1d64add84e725fc293e71fe8 使用这份完整补丁。
-
-两份选择一份，不要同时应用。原始基线之后若仅增加 dashboard.zip，不影响这些改动。
+当前 main 已内置 v4 采集器，无需再次应用历史 telemetry 补丁。
+默认基础窗口为 **10ms**，通过 `--replay-interval=<Time>` 覆盖；`--replay` 仍是唯一必需的启用开关。
+历史 v3/v4 补丁可能保留 500ms 默认值，当前行为以仓库源码为准。
 本次未运行编译、仿真、smoke 或测试；下面的检查命令供使用方自行执行。
 
 ## 你的 ECMP 命令
@@ -18,7 +15,20 @@ python3.12 ./ns3 run --no-build 'scratch/ub-quick-example --case-path=/mnt/yuhao
 ```
 
 TE 同样保留 --mtp-threads=8，使用原来的 --jupiter-te=1。
-不修改 --replay 单开关、不要求额外日志参数，自动识别和 v3 一样。
+只加 --replay 即以 **10ms** 为基础间隔采集；模式和 case_id 仍自动识别。
+可选参数 `--replay-interval=<Time>` 覆盖采样间隔，例如：
+
+```text
+--replay                         # 默认 10ms
+--replay --replay-interval=20ms   # 显式 20ms
+--replay --replay-interval=500ms  # 保留旧采样粒度
+```
+
+时间值使用 ns-3 的带单位格式，必须严格大于零；零、负值和精度舍入到零的值会被拒绝。
+该参数只有启用 `--replay` 时生效；单独设置它不会开启日志。
+`--progress-interval` 只控制任务进度打印，不改变 replay 采样。
+Dashboard manifest 的 `window_ms` 必须与采集间隔相同（10ms 对应 10，500ms 对应 500）。
+`sample_interval_ns` 写入实际解析后的间隔，启动提示与 replay_profile 反映所选参数。
 8 是 MTP 请求的最大线程数；底层实际分区数不足时，仍遵循原有 MTP 调度规则。
 
 ## 并发与窗口
@@ -35,7 +45,7 @@ TE 同样保留 --mtp-threads=8，使用原来的 --jupiter-te=1。
    约64KiB才对公共任务文件加锁写入。不是每个数据包争抢一把全局锁。
    任务CSV行允许交错，dashboard v6本来就是按task_id/时间恢复，不依赖全局行顺序。
 5. Finish 在 Simulator::Run 返回、工作线程join后执行。
-   最后一个不满500ms窗口用所有LP已执行时间的最大值收尾，避免公共LP时钟落后导致漏记。
+   最后一个不满所配置采样间隔的窗口用所有LP已执行时间的最大值收尾，避免公共LP时钟落后导致漏记。
 
 元信息保留 schema_version=2（兼容dashboard），新增 replay_logger_version=4、
 采样上下文、任务行顺序语义、请求线程数；首次周期采样补记实际 worker LP 数。
@@ -58,6 +68,7 @@ python3.12 ./ns3 build ub-replay-mtp-smoke
 python3.12 ./ns3 run --no-build 'scratch/ub-replay-mtp-smoke --output=/tmp/replay-mtp-smoke-v4'
 ```
 
+该回归夹具显式固定使用 500ms（不代表用户入口的默认值），保持原有边界断言。
 夹具建立8个LP，注入发送计数和路径观测，在490/500/510ms同时产生任务与路径计数，
 检查500ms边界、同一时刻策略更新归属、750ms最终部分窗口、总字节数和任务CSV完整性。
 每个LP产生足够任务行触发多次缓冲写盘。通过会输出 PASSED，否则返回失败。
