@@ -71,9 +71,13 @@ def import_tasks(db, root, config, reporter):
     def records():
         for path in files:
             if source == 'native':
-                pattern = re.compile(r'^\[([\d.eE+-]+)us\].*?(MEM Task|WQE) (Starts|Completes).*?taskId:\s*(\d+)')
+                pattern = re.compile(r'^\[([\d.eE+-]+)us\].*?\b(MEM Task|WQE) (?!Segment )(Starts|Completes)\b.*?taskId:\s*(\d+)')
                 node = int(re.search(r'node_(\d+)',path.name)[1])
                 for line in reporter.lines(path):
+                    # Per-segment Sends/Completes are not task start/end events.
+                    # Skip them before the strict task-id format check.
+                    if 'Segment' in line:
+                        continue
                     match = pattern.search(line)
                     if not match:
                         if 'taskId:' in line:

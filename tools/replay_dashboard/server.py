@@ -34,6 +34,12 @@ async def lifespan(application):
     application.state.bootstrap = None
     application.state.started = time.monotonic()
     application.state.progress = dict(status='queued',phase='queued',phaseLabel='等待处理',file='',rows=0)
+    # Optional throughput rescale for bandwidth/data-size scaled simulations.
+    # Only displayed Gbps/capacity values change; utilization stays unchanged.
+    try:
+        application.state.scale = float(json.loads(manifest.read_text(encoding='utf-8')).get('throughputScale', 1) or 1)
+    except (json.JSONDecodeError, OSError):
+        application.state.scale = 1
     context = multiprocessing.get_context('spawn')
     messages = context.Queue(maxsize=64)
     process = context.Process(target=import_worker,args=(str(manifest),str(cache),messages,os.environ.get('REPLAY_ALLOW_SYNTHETIC')=='1'),daemon=True)
@@ -112,7 +118,13 @@ def health():
 
 @app.get('/api/bootstrap')
 def bootstrap():
-    return ready()
+    info = ready()
+    scale = getattr(app.state, 'scale', 1)
+    if scale != 1:
+        info = dict(info)
+        info['rateScaleGbps'] = (info.get('rateScaleGbps') or 1) * scale
+        info['throughputScale'] = scale
+    return info
 
 
 @app.get('/api/frames')
@@ -120,8 +132,19 @@ def frames(start:float=Query(0,ge=0),end:float=Query(20,ge=0)):
     info = ready()
     if end<=start or end-start>30:
         raise HTTPException(400,'Request a positive interval of at most 30 simulation seconds')
+    scale = getattr(app.state, 'scale', 1)
     with connection() as db:
-        cases = {c['id']:[decode_frame(r[0]) for r in db.execute('SELECT data FROM frames WHERE case_id=? AND t1>? AND t0<? ORDER BY t0',(c['id'],start,end))] for c in info['cases']}
+        cases = {}
+        for c in info['cases']:
+            case_frames = [decode_frame(r[0]) for r in db.execute('SELECT data FROM frames WHERE case_id=? AND t1>? AND t0<? ORDER BY t0',(c['id'],start,end))]
+            if scale != 1:
+                for frame in case_frames:
+                    for edge in frame.get('edges', []):
+                        if edge.get('gbps') is not None:
+                            edge['gbps'] *= scale
+                        if edge.get('capacity') is not None:
+                            edge['capacity'] *= scale
+            cases[c['id']] = case_frames
     return dict(start=start,end=end,cases=cases)
 
 
@@ -137,13 +160,14 @@ def paths(src:int,dst:int,start:float=Query(0,ge=0),end:float=Query(5,ge=0)):
         raise HTTPException(400,'Choose two different input switches')
     if end<=start or end-start>10:
         raise HTTPException(400,'Path detail requests are limited to 10 simulation seconds')
+    scale = getattr(app.state, 'scale', 1)
     result={}
     with connection() as db:
         for case in info['cases']:
             windows={}
             for sample,t0,t1,sn,dn,mid,n in db.execute('SELECT sample,t0,t1,sn,dn,mid,bytes FROM node_paths WHERE case_id=? AND src=? AND dst=? AND t0>=? AND t0<? ORDER BY t0',(case['id'],src,dst,max(0,start-float(case['metadata'].get('sample_interval_ns',500000000))/1e9),end)):
                 if t1<=start: continue
-                windows.setdefault(str(sample),[]).append(dict(srcNode=sn,dstNode=dn,src=src,dst=dst,transit=mid,payloadBytes=n,gbps=n*8/(t1-t0)/1e9))
+                windows.setdefault(str(sample),[]).append(dict(srcNode=sn,dstNode=dn,src=src,dst=dst,transit=mid,payloadBytes=n,gbps=n*8/(t1-t0)/1e9*scale))
             result[case['id']]=windows
     return dict(src=src,dst=dst,start=start,end=end,cases=result)
 
@@ -153,11 +177,12 @@ def trend(src:int,dst:int):
     info = ready()
     if src not in info['topology']['leaves'] or dst not in info['topology']['leaves'] or src==dst:
         raise HTTPException(400,'Choose two different switches from the input topology')
+    scale = getattr(app.state, 'scale', 1)
     result = {}
     with connection() as db:
         for case in info['cases']:
             rows = db.execute('SELECT g.t0,l.capacity,l.gbps,l.util,l.queue FROM global_samples g LEFT JOIN link_trends l ON l.case_id=g.case_id AND l.t0=g.t0 AND l.src=? AND l.dst=? WHERE g.case_id=? ORDER BY g.t0',(src,dst,case['id']))
-            result[case['id']] = [dict(time=t,capacity=cap if cap is not None else 0,gbps=rate,utilization=u,queueMB=q) for t,cap,rate,u,q in rows]
+            result[case['id']] = [dict(time=t,capacity=(cap if cap is not None else 0)*scale,gbps=(rate or 0)*scale,utilization=u,queueMB=q) for t,cap,rate,u,q in rows]
     return dict(src=src,dst=dst,cases=result)
 
 

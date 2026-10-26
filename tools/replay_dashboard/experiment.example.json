@@ -1,6 +1,7 @@
 {
   "title": "ECMP / TE / TOE 实际实验结果",
   "window_ms": 500,
+  "throughputScale": 1,
   "topology": "/data/ECMP",
   "workload": "/data/ECMP/traffic.csv",
   "hotspot_threshold": 0.9,

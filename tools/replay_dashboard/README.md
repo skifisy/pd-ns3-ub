@@ -72,6 +72,17 @@ python server.py --manifest /data/experiment.json --host 0.0.0.0 --port 8000 --c
 `recording.start_seconds/end_seconds` 可限定视频观看范围；不缩减全程 FCT 的统计口径。
 输入不同的 traffic 指纹会被拒绝；搬移后的 TE/TOE 审计日志可以使用 `te_logs` / `toe_logs` 指定。
 
+### 吞吐显示倍率与原生任务日志
+
+manifest 顶层可设置 `"throughputScale": 100000`，例如将仿真中的 4 Mbps 显示为 400 Gbps；
+不设置时默认为 1。仅链路速率、容量、路径速率和绘图速率尺度按此倍率显示。
+利用率、时间、FCT、任务数、原始字节数及队列大小保持原日志值。
+这是显示换算，不代表验证了缩小规模仿真与原始网络的性能等价性。
+
+原生 TaskTrace 导入只识别任务级 `MEM Task/WQE Starts/Completes`；
+包含 `Segment` 的分段事件会在格式检查前跳过，避免误报或误计任务完成。
+其余含 `taskId:` 但不符合任务格式的记录仍会报错。任务解析代码改变后缓存会自动失效并重建。
+
 ## 页面口径
 
 - 顶部固定展示全程三组共同完成任务的精确 P50/P90/P99，及相对 ECMP 改善。
