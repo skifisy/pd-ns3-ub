@@ -1,0 +1,20 @@
+key,value
+schema_version,2
+case_id,te
+mode,te
+synthetic,true
+model,equal-share bottleneck fluid service; DT=0.1s; modeled header factor=1.03; queues are bounded illustrative proxies
+topology_sha256,912727dda83a540c0b0aa1eb283944f74777b34ebdf5d4786e63840ef6a68530
+sample_interval_ns,500000000.000
+start_ns,0.000
+end_ns,150000000000.000
+total_tasks,220
+completed_tasks,220
+stop_reason,demo-end
+data_origin,synthetic; not ns-3 output
+scope,all
+smoke_endpoint_profile,"v4 UI fixture: 95% forward / 5% reverse payload, deterministic connected endpoints; final task timings retained from v3 synthetic profile"
+link_aggregation,node_pair
+detail_windows,all
+node_path_enabled,true
+task_events,true

@@ -1,0 +1,8 @@
+event_id,case_id,mode,time_ns,event,topology_epoch,te_epoch,toe_decision_epoch,toe_phase
+1,toe,toe-only,0.000,run-start,0,0,0,steady
+2,toe,toe-only,70000000000.000,toe-draining,0,0,1,draining
+3,toe,toe-only,72000000000.000,toe-guard,0,0,1,guard
+4,toe,toe-only,74000000000.000,topology-before-apply,0,0,1,guard
+5,toe,toe-only,74000000000.000,topology-applied,1,0,1,applied
+6,toe,toe-only,74000000000.000,toe-steady,1,0,1,steady
+7,toe,toe-only,150000000000.000,run-stop,1,0,1,steady

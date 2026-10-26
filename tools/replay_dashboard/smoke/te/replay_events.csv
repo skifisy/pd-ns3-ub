@@ -1,0 +1,4 @@
+event_id,case_id,mode,time_ns,event,topology_epoch,te_epoch,toe_decision_epoch,toe_phase
+1,te,te,0.000,run-start,0,0,0,steady
+2,te,te,40000000000.000,te-policy-published,0,1,0,steady
+3,te,te,150000000000.000,run-stop,0,1,0,steady

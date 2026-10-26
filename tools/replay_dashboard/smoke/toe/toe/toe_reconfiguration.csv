@@ -1,0 +1,3 @@
+epoch,time_seconds,status,scope,affected_leaf_pairs,paused_tp_channels,total_tp_channels,retained_circuits,rewired_circuits,unpaused_new_payload_bytes,pause_seconds
+1,70,draining,selective,4,24,80,636,4,0,0
+1,74,applied,selective,4,24,80,636,4,0,4

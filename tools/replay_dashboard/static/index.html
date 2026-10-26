@@ -1,0 +1,30 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>TE / TOE · 网络热点与完成时间</title>
+<link rel="stylesheet" href="/static/style.css?v=6">
+<script defer src="/static/vendor/echarts.min.js"></script>
+<script defer src="/static/app.js?v=6"></script>
+</head>
+<body>
+<header class="heading">
+ <div><span class="eyebrow">OPTICAL NETWORK / EXPERIMENT REPLAY</span><h1>TE / TOE 网络优化效果</h1></div>
+ <div class="heading-right"><span id="topologyInfo"></span><span class="source-label" id="sourceLabel">读取数据</span><label class="focus-control">焦点 Leaf 方向<select id="focus" disabled aria-label="焦点 Leaf 对与方向"><option>等待数据就绪</option></select></label></div>
+</header>
+<section class="narrative"><div><strong id="chapter">全网热点 · 端到端路径</strong><span id="caption">准备日志。</span></div><div class="time"><b id="time">0.0</b><span>仿真秒</span></div></section>
+<main>
+ <section id="globalCards" class="global-cards" aria-label="最终分位数与当前完成进度"></section>
+ <div class="heat-legend"><span>颜色＝利用率；线宽＝发送速率（各组同尺度）</span><span><i class="cold"></i>＜35%</span><span><i class="warm"></i>35–70%</span><span><i class="busy"></i>70–90%</span><span><i class="hot"></i>≥90%</span><span><i class="unknown"></i>无采样</span><span>外描边＝焦点　<span class="added">＋新增</span> / <span class="removed">−减少</span>＝重配标记</span></div>
+ <section id="networks" class="networks" aria-label="三组固定两行拓扑"></section>
+ <section class="evidence">
+  <article><div class="chart-heading"><strong>累计任务完成数</strong><span id="completedLegend"></span></div><div id="completionChart" class="chart"></div></article>
+  <article><div class="chart-heading"><strong id="hotspotTitle">焦点方向</strong><span>实线：链路发送 Gbps　虚线：容量</span></div><div id="hotspotChart" class="chart"></div></article>
+  <article><div class="chart-heading"><strong>全网热点变化</strong><span>实线：最大利用率 %　虚线：高负载方向数</span></div><div id="globalChart" class="chart"></div></article>
+ </section>
+ <div class="footnote"><span id="cohort"></span><span>背景热力＝双向较大值；焦点外描边＝所选方向。接入颜色为链路总负载；光点为发送方向示意。</span></div>
+ <div class="playback-status" aria-label="回放控制"><button id="play" disabled>开始播放</button><button id="restart" class="secondary" disabled>从头播放</button><span id="playbackState">准备中</span><span id="currentClock">0.0 s</span><input id="timeline" type="range" min="0" max="1" value="0" step="0.1" disabled aria-label="拖动定位仿真时间"><span id="endClock">—</span><label>速度 <select id="speed" aria-label="播放速度"><option value="1">1 ×</option><option value="0.5">0.5 × 1 ×</option><option value="0.2">0.2 × 1 ×</option><option value="0.1">0.1 × 1 ×</option></select></label><span id="buffer"></span></div>
+</main>
+<div id="preparing" class="preparing" role="status" aria-live="polite"><div class="prepare-card"><span class="eyebrow">PREPARING EXPERIMENT DATA</span><h2 id="prepareTitle">准备日志</h2><p id="prepareCase"></p><p id="prepareFile" class="prepare-file"></p><div class="prepare-track"><i id="prepareFill"></i></div><p id="prepareNumbers"></p><p id="prepareDetail">后台处理日志，完成后自动进入回放。</p></div></div>
+<div id="error" class="error" hidden><h2>无法加载实验日志</h2><p id="errorText"></p></div>
+</body></html>

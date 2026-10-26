@@ -1,0 +1,12 @@
+{
+  "title": "ECMP / TE / TOE 实际实验结果",
+  "window_ms": 500,
+  "topology": "/data/ECMP",
+  "workload": "/data/ECMP/traffic.csv",
+  "hotspot_threshold": 0.9,
+  "cases": [
+    {"id": "ecmp", "mode": "ecmp", "label": "ECMP", "path": "/data/ECMP/replay", "task_trace_directory": "/data/ECMP/runlog"},
+    {"id": "te", "mode": "te", "label": "TE", "path": "/data/TE/replay", "task_trace_directory": "/data/TE/runlog"},
+    {"id": "toe", "mode": "toe-only", "label": "TOE", "path": "/data/TOE/replay", "task_trace_directory": "/data/TOE/runlog"}
+  ]
+}
