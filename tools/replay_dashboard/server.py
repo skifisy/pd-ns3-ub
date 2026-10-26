@@ -6,6 +6,7 @@ import json
 import math
 import multiprocessing
 import os
+import sys
 from pathlib import Path
 from queue import Empty
 import sqlite3
@@ -19,6 +20,7 @@ from fastapi.staticfiles import StaticFiles
 
 from jobs import import_worker
 from prepare import decode_frame
+from task_store import task_sources
 from queries import interval, progress_rows, completion_trend, global_trend as query_global, link_trend
 
 HERE = Path(__file__).resolve().parent
@@ -36,6 +38,7 @@ async def lifespan(application):
     application.state.cache = cache
     application.state.bootstrap = None
     application.state.started = time.monotonic()
+    application.state.fatal_error = None
     application.state.progress = dict(status='queued',phase='queued',phaseLabel='等待处理',file='',rows=0)
     # Optional throughput rescale for bandwidth/data-size scaled simulations.
     # Only displayed Gbps/capacity values change; utilization stays unchanged.
@@ -64,12 +67,24 @@ async def lifespan(application):
                 pass
             except Exception as error:
                 application.state.progress = dict(status='error',phaseLabel='缓存读取失败',error=str(error))
-            if application.state.progress['status'] in ('ready','error'):
+            status = application.state.progress['status']
+            if status == 'error':
+                application.state.fatal_error = application.state.progress.get('error', 'Replay preparation failed')
+                server = getattr(application.state, 'uvicorn_server', None)
+                if server is not None:
+                    server.should_exit = True
+                return
+            if status == 'ready':
                 return
             if not process.is_alive():
                 dead_polls += 1
-                if dead_polls>=10:
-                    application.state.progress = dict(status='error',phaseLabel='处理进程退出',error=f'Importer exited with code {process.exitcode}')
+                if dead_polls >= 10:
+                    error = f'Importer exited with code {process.exitcode}'
+                    application.state.progress = dict(status='error',phaseLabel='处理进程退出',error=error)
+                    application.state.fatal_error = error
+                    server = getattr(application.state, 'uvicorn_server', None)
+                    if server is not None:
+                        server.should_exit = True
                     return
             await asyncio.sleep(.2)
     watcher = asyncio.create_task(monitor())
@@ -234,5 +249,22 @@ if __name__=='__main__':
         os.environ['REPLAY_MANIFEST']=str(args.manifest.resolve())
     if args.cache:
         os.environ['REPLAY_CACHE']=str(args.cache.resolve())
+    manifest_path = Path(os.environ['REPLAY_MANIFEST']).resolve()
+    try:
+        manifest_config = json.loads(manifest_path.read_text(encoding='utf-8'))
+        cases = manifest_config.get('cases')
+        if not isinstance(cases, list) or not cases:
+            raise ValueError('Experiment manifest must define at least one case')
+        for case in cases:
+            task_sources(manifest_path.parent, case)
+    except Exception as error:
+        print(f'ERROR: Replay requires a usable output/task_statistics.csv for every case: {error}', file=sys.stderr, flush=True)
+        raise SystemExit(2)
     import uvicorn
-    uvicorn.run(app,host=args.host,port=args.port)
+    server = uvicorn.Server(uvicorn.Config(app, host=args.host, port=args.port))
+    app.state.uvicorn_server = server
+    server.run()
+    fatal_error = getattr(app.state, 'fatal_error', None)
+    if fatal_error:
+        print(f'ERROR: Replay preparation failed: {fatal_error}', file=sys.stderr, flush=True)
+        raise SystemExit(1)

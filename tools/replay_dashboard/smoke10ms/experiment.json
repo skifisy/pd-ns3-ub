@@ -18,19 +18,22 @@
       "id": "ecmp",
       "mode": "ecmp",
       "label": "ECMP",
-      "path": "ecmp"
+      "path": "ecmp",
+      "task_statistics": "ecmp/output/task_statistics.csv"
     },
     {
       "id": "te",
       "mode": "te",
       "label": "TE",
-      "path": "te"
+      "path": "te",
+      "task_statistics": "te/output/task_statistics.csv"
     },
     {
       "id": "toe",
       "mode": "toe-only",
       "label": "TOE",
-      "path": "toe"
+      "path": "toe",
+      "task_statistics": "toe/output/task_statistics.csv"
     }
   ]
 }

@@ -53,7 +53,7 @@ throughputScale 仅负责显示换算，与采样窗口独立；需要把 4 Mbps
 - replay_link_samples.csv：业务端接入和 Leaf 间有向链路采样。
 - replay_events.csv：精确控制事件时间。
 - replay_node_path_samples.csv：源 Leaf 实际业务载荷发送与首跳归属。
-- 原生 TaskTrace：已启用时自动复用；否则入口自动补写 replay_task_events.csv。
+- 每组 `output/task_statistics.csv`：提供 taskId 与 taskStartTime(us)/taskCompletesTime(us)，是 Dashboard 唯一的任务进度和 FCT 来源。缺失或不可用时程序报错并以非零退出码结束；不回退到 `.tr` 或 `replay_task_events.csv`。
 
 元信息 replay_interval_argument、replay_profile 和启动提示反映所选间隔。
 链路和路径使用相同 sample-id、时间边界及 epoch，控制事件可把基础窗口拆短。

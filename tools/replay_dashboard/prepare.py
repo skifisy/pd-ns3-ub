@@ -14,7 +14,7 @@ from progress import Progress
 from task_store import (create_tables, import_workload, import_tasks, completion_buckets,
                         common_quantiles, task_sources, picoseconds)
 
-CACHE_SCHEMA = 8
+CACHE_SCHEMA = 9
 
 
 def dumps(value):
@@ -101,7 +101,7 @@ def load_case(db, root, config, topology, reporter):
     te_directory = audit_directory(root, path, config, metadata, 'jupiter_te')
     toe_directory = audit_directory(root, path, config, metadata, 'toe')
     case_files = [path/name for name in ('replay_run.csv','replay_topology.csv','replay_queue_samples.csv',
-                  'replay_events.csv','replay_task_events.csv','replay_link_samples.csv')]
+                  'replay_events.csv','replay_link_samples.csv')]
     case_files += [te_directory/'epoch_summary.csv',te_directory/'weights.csv',toe_directory/'toe_circuits.csv']
     case_files += [node_path_file] if has_node_paths else [path/'replay_path_samples.csv']
     _, sources = task_sources(root, config)
@@ -428,4 +428,7 @@ if __name__ == '__main__':
     parser.add_argument('--cache', type=Path, default=Path(__file__).parent / 'cache/replay.sqlite')
     parser.add_argument('--force', action='store_true')
     args = parser.parse_args()
-    print(prepare(args.manifest, args.cache, args.force))
+    try:
+        print(prepare(args.manifest, args.cache, args.force))
+    except Exception as error:
+        parser.exit(2, f'ERROR: {error}\n')

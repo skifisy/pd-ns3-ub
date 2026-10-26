@@ -31,6 +31,7 @@ class ReplayV8Checks(unittest.TestCase):
             info=json.loads(db.execute("SELECT value FROM metadata WHERE key='bootstrap'").fetchone()[0])
             self.assertEqual(info['windowSeconds'],.01)
             self.assertEqual(info['commonTasks'],5)
+            self.assertTrue(all(c['taskSource']=='statistics' for c in info['cases']))
             self.assertTrue(info['synthetic'])
             self.assertTrue(all('completionBins' not in c for c in info['cases']))
             windows=list(db.execute("SELECT t0,t1 FROM frames WHERE case_id='te' AND t0>=.1 AND t0<.11"))

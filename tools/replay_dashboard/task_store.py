@@ -1,8 +1,7 @@
 """Bounded task import and exact disk-backed cohort statistics (no task arrays)."""
-import gzip
-import math
-import re
-from decimal import Decimal
+import sqlite3
+from decimal import Decimal, InvalidOperation
+from itertools import chain
 from pathlib import Path
 from topology import csv_rows
 
@@ -14,26 +13,33 @@ def picoseconds(value, scale=1000):
     return int(Decimal(str(value)) * scale)
 
 
-def existing(path):
-    path = Path(path)
-    return path if path.exists() else Path(str(path) + '.gz')
+def task_statistics_path(root, config):
+    """Resolve only the required per-case output/task_statistics.csv file."""
+    root = Path(root).resolve()
+    configured = config.get('task_statistics')
+    if configured:
+        candidate = Path(configured)
+        if not candidate.is_absolute():
+            candidate = root / candidate
+    else:
+        replay_path = (root / config['path']).resolve()
+        case_root = replay_path.parent if replay_path.name.lower() == 'replay' else replay_path
+        candidate = case_root / 'output' / 'task_statistics.csv'
+    candidate = candidate.resolve()
+    if candidate.name != 'task_statistics.csv' or candidate.parent.name != 'output':
+        raise ValueError(
+            f"{config['id']}: task_statistics must point to output/task_statistics.csv, got {candidate}"
+        )
+    if not candidate.is_file():
+        raise FileNotFoundError(
+            f"{config['id']}: required output/task_statistics.csv not found: {candidate}"
+        )
+    return candidate
 
 
 def task_sources(root, config):
-    path = (root / config['path']).resolve()
-    if config.get('task_events'):
-        return 'events', [existing(root / config['task_events'])]
-    if config.get('task_statistics'):
-        return 'statistics', [existing(root / config['task_statistics'])]
-    events = existing(path / 'replay_task_events.csv')
-    # An optional, header-only replay file must not hide the native task trace.
-    if events.exists() and next(csv_rows(events),None) is not None:
-        return 'events', [events]
-    directory = (root / config['task_trace_directory']).resolve() if config.get('task_trace_directory') else path.parent / 'runlog'
-    files = sorted(directory.glob('TaskTrace_node_*.tr*'))
-    if not files:
-        raise ValueError(f'{config["id"]}: no task data; specify task_events, task_statistics, or task_trace_directory')
-    return 'native', files
+    """Return the sole permitted FCT source; never fall back to events or .tr files."""
+    return 'statistics', [task_statistics_path(root, config)]
 
 
 def create_tables(db):
@@ -63,57 +69,103 @@ def import_workload(db, path, reporter):
     db.commit()
 
 
+def task_time_us(value, case, task_id, column):
+    raw = '' if value is None else str(value).strip()
+    if not raw or raw.lower() in ('nan', 'na', 'n/a', 'none', 'null'):
+        return None
+    try:
+        number = Decimal(raw)
+    except InvalidOperation as error:
+        raise ValueError(f'{case}: task {task_id} has invalid {column} value {raw!r}') from error
+    if number.is_nan():
+        return None
+    if not number.is_finite():
+        raise ValueError(f'{case}: task {task_id} has non-finite {column} value {raw!r}')
+    if number < 0:
+        raise ValueError(f'{case}: task {task_id} has negative {column} value {raw!r}')
+    # task_statistics.csv timestamps are in microseconds; store in picoseconds.
+    return int(number * 10**6)
+
+
 def import_tasks(db, root, config, reporter):
     case = config['id']
     source, files = task_sources(root, config)
-    statement = '''INSERT INTO tasks VALUES(?,?,?,?,?,?) ON CONFLICT(case_id,task_id) DO UPDATE SET
-        start_ps=CASE WHEN tasks.start_ps IS NULL THEN excluded.start_ps WHEN excluded.start_ps IS NULL THEN tasks.start_ps ELSE MIN(tasks.start_ps,excluded.start_ps) END,
-        end_ps=CASE WHEN tasks.end_ps IS NULL THEN excluded.end_ps WHEN excluded.end_ps IS NULL THEN tasks.end_ps ELSE MAX(tasks.end_ps,excluded.end_ps) END,
-        node=CASE WHEN tasks.node IS NULL OR (tasks.node>=0 AND excluded.node>=0 AND tasks.node!=excluded.node) THEN NULL ELSE tasks.node END'''
+    path = files[0]
+    required = (
+        'taskId', 'sourceNode', 'destNode', 'dataSize(Byte)', 'opType',
+        'taskStartTime(us)', 'taskCompletesTime(us)',
+    )
+    statement = 'INSERT INTO tasks VALUES(?,?,?,?,?,?)'
+
     def records():
-        for path in files:
-            if source == 'native':
-                pattern = re.compile(r'^\[([\d.eE+-]+)us\].*?\b(MEM Task|WQE) (?!Segment )(Starts|Completes)\b.*?taskId:\s*(\d+)')
-                node = int(re.search(r'node_(\d+)',path.name)[1])
-                for line in reporter.lines(path):
-                    # Per-segment Sends/Completes are not task start/end events.
-                    # Skip them before the strict task-id format check.
-                    if 'Segment' in line:
-                        continue
-                    match = pattern.search(line)
-                    if not match:
-                        if 'taskId:' in line:
-                            raise ValueError(f'Unrecognized task trace row: {line[:160]}')
-                        continue
-                    when, kind, event, tid = match.groups()
-                    when = picoseconds(when, 10**6)
-                    yield case,int(tid),when if event=='Starts' else None,when if event=='Completes' else None,kind,node
-            else:
-                for row in reporter.rows(path):
-                    if source == 'events':
-                        if row.get('case_id',case) != case or row['event'] not in ('start','complete'):
-                            raise ValueError(f'{case}: invalid task event')
-                        when = picoseconds(row['time_ns'])
-                        yield case,int(row['task_id']),when if row['event']=='start' else None,when if row['event']=='complete' else None,row.get('task_kind','unknown'),int(row.get('node_id',-1))
-                    else:
-                        # Explicit schema avoids guessing units from column names.
-                        yield case,int(row['task_id']),picoseconds(row['start_ns']) if row['start_ns'] else None,picoseconds(row['end_ns']) if row['end_ns'] else None,row.get('task_kind','unknown'),int(row.get('node_id',-1))
-    batch=[]
-    for record in records():
-        batch.append(record)
-        if len(batch)>=BATCH:
-            db.executemany(statement,batch);batch.clear();db.commit()
-    if batch: db.executemany(statement,batch)
-    db.commit()
-    if db.execute('SELECT 1 FROM tasks WHERE case_id=? AND node IS NULL LIMIT 1',(case,)).fetchone():
-        raise ValueError(f'{case}: task id reused by multiple source nodes')
-    if db.execute('SELECT 1 FROM tasks WHERE case_id=? AND (start_ps<0 OR end_ps<0 OR end_ps<start_ps) LIMIT 1',(case,)).fetchone():
-        raise ValueError(f'{case}: invalid task timestamps')
-    if db.execute('SELECT 1 FROM tasks t LEFT JOIN workload w USING(task_id) WHERE t.case_id=? AND w.task_id IS NULL LIMIT 1',(case,)).fetchone():
-        raise ValueError(f'{case}: task id is absent from workload')
-    completed, started, ended_started = db.execute('SELECT SUM(end_ps IS NOT NULL),SUM(start_ps IS NOT NULL),SUM(end_ps IS NOT NULL AND start_ps IS NOT NULL) FROM tasks WHERE case_id=?',(case,)).fetchone()
-    total=db.execute('SELECT COUNT(*) FROM workload').fetchone()[0]
-    return dict(totalTasks=total,completedTasks=completed or 0,pendingTasks=total-(started or 0),taskSource=source)
+        rows = iter(reporter.rows(path))
+        first = next(rows, None)
+        if first is None:
+            raise ValueError(f'{case}: {path} is empty or has no task rows')
+        missing = [column for column in required if column not in first]
+        if missing:
+            raise ValueError(f'{case}: {path} is missing required columns: {", ".join(missing)}')
+        for row in chain((first,), rows):
+            try:
+                task_id = int(row['taskId'])
+            except (TypeError, ValueError) as error:
+                raise ValueError(f'{case}: {path} contains an invalid taskId: {row.get("taskId")!r}') from error
+            start = task_time_us(row.get('taskStartTime(us)'), case, task_id, 'taskStartTime(us)')
+            end = task_time_us(row.get('taskCompletesTime(us)'), case, task_id, 'taskCompletesTime(us)')
+            if end is not None and start is None:
+                raise ValueError(f'{case}: task {task_id} has a completion time but no start time in {path}')
+            if start is not None and end is not None and end < start:
+                raise ValueError(f'{case}: task {task_id} completes before it starts in {path}')
+            node_raw = row.get('sourceNode')
+            try:
+                node = int(node_raw) if node_raw is not None and node_raw.strip() else -1
+            except (TypeError, ValueError) as error:
+                raise ValueError(f'{case}: task {task_id} has invalid sourceNode {node_raw!r} in {path}') from error
+            yield case, task_id, start, end, row.get('opType') or 'unknown', node
+
+    batch = []
+    try:
+        for record in records():
+            batch.append(record)
+            if len(batch) >= BATCH:
+                db.executemany(statement, batch)
+                batch.clear()
+                db.commit()
+        if batch:
+            db.executemany(statement, batch)
+        db.commit()
+    except sqlite3.IntegrityError as error:
+        raise ValueError(
+            f'{case}: duplicate taskId or conflicting task rows in {path}: {error}'
+        ) from error
+
+    if db.execute(
+        'SELECT 1 FROM tasks WHERE case_id=? AND (start_ps<0 OR end_ps<0 OR end_ps<start_ps) LIMIT 1',
+        (case,),
+    ).fetchone():
+        raise ValueError(f'{case}: invalid task timestamps in {path}')
+    if db.execute(
+        'SELECT 1 FROM tasks t LEFT JOIN workload w USING(task_id) WHERE t.case_id=? AND w.task_id IS NULL LIMIT 1',
+        (case,),
+    ).fetchone():
+        raise ValueError(f'{case}: task id is absent from workload: {path}')
+    completed, started = db.execute(
+        'SELECT SUM(start_ps IS NOT NULL AND end_ps IS NOT NULL), SUM(start_ps IS NOT NULL) '
+        'FROM tasks WHERE case_id=?',
+        (case,),
+    ).fetchone()
+    if not completed:
+        raise ValueError(
+            f'{case}: no usable completed tasks in {path}; finite taskStartTime(us) and '
+            'taskCompletesTime(us) values are required'
+        )
+    total = db.execute('SELECT COUNT(*) FROM workload').fetchone()[0]
+    return dict(
+        totalTasks=total,
+        completedTasks=completed or 0,
+        pendingTasks=total - (started or 0),
+        taskSource=source,
+    )
 
 
 def completion_buckets(db,case,step_ps,end,reporter,retain=True):
@@ -170,6 +222,8 @@ def common_quantiles(db,cases,config,reporter):
     if clauses:
         db.execute('DELETE FROM cohort WHERE task_id NOT IN (SELECT t.task_id FROM tasks t JOIN workload w USING(task_id) WHERE t.case_id=? AND '+ ' AND '.join(clauses)+')',args)
     n=db.execute('SELECT COUNT(*) FROM cohort').fetchone()[0]
+    if n == 0:
+        raise ValueError('No common completed task IDs across all cases; verify output/task_statistics.csv files and timestamps')
     values={}
     for case in cases:
         cid=case['id'];reporter.stage('fct-sort','磁盘排序并计算精确 FCT 分位数',cid)

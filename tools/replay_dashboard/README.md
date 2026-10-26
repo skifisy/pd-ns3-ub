@@ -56,25 +56,27 @@ TE/TOE 发布和拓扑生效仍按精确时间拆分，实际窗口可以小于�
 - `topology`：实际运行使用的 node.csv / topology.csv 目录。
 - `workload`：共同的 traffic.csv，用于任务总数和稳定任务标识。
 - 每组 `id`：必须与采集时 case-id 一致。
-- `task_events` / `task_statistics`：可选显式任务来源。
-- `task_trace_directory`：可指定原生 TaskTrace 所在目录。
+- 每组必须提供对应的 `output/task_statistics.csv`；可通过 `task_statistics` 显式指定文件路径。
 - `te_logs` / `toe_logs`：可指定搬移后的控制日志目录。
 - `recording.start_seconds/end_seconds`：限定播放范围，不缩减全程 FCT 统计。
 
-任务来源优先级：显式 task_events → 显式 task_statistics → 非空 replay_task_events.csv → 原生 TaskTrace。
-入口自动复用已开启的原生 TaskTrace；未开启时自动补写 replay_task_events.csv，不需要额外任务日志参数。
-原生解析跳过 Segment 事件，只识别任务级 MEM Task/WQE Starts/Completes；其余含 taskId 但格式不符的行报错。
-规范化 task_statistics CSV 字段为：
+**任务/FCT 数据唯一来源是每组的 `output/task_statistics.csv`。** 不读取 `.tr`，不读取 `replay_task_events.csv`，也不会在文件缺失时自动生成或回退到其他来源。
+
+CSV 必须包含以下列：
 
 ```text
-task_id,start_ns,end_ns,task_kind,node_id
+taskId,sourceNode,destNode,dataSize(Byte),opType,taskStartTime(us),taskCompletesTime(us)
 ```
 
-允许开始或完成时间留空，不猜测时间单位。沿用 traffic.csv 的全局 taskId，重复 workload ID 报错。
-顶部 P50/P90/P99 来自全程共同完成任务的原始 FCT；同时保留各组总数、完成数和未完成数。
+`taskStartTime(us)` 和 `taskCompletesTime(us)` 的单位是微秒，导入时直接换算；空值或 `NaN` 表示对应时间缺失。每组 CSV 至少要有一个开始、完成时间均有效且完成时间不早于开始时间的任务；各组还必须至少有一个共同完成的 taskId，否则准备过程报错。
+
+如果未设置 `task_statistics`，程序会按 case 的 `path` 推导固定文件位置：当 `path` 以 `replay/` 结尾时读取其上一级目录下的 `output/task_statistics.csv`，否则读取 `path/output/task_statistics.csv`。显式路径也必须指向 `output/task_statistics.csv`，不会接受其他文件名或 `.gz` 文件。
+
+缺少 CSV、CSV 列不完整、时间戳无效、没有有效完成任务或各组没有共同完成任务时，程序会在终端报错并以非零退出码结束，不启动可继续使用的空 Dashboard。
+
+沿用 `traffic.csv` 的全局 `taskId` 校验任务身份。顶部 P50/P90/P99 使用所有实验组共同完成任务的原始 FCT；同时保留各组总数、完成数和未完成数。
 任务以最多 20000 条一批写入 SQLite；精确分位数使用磁盘排序。数据库缓存约 64 MiB，临时排序落盘。
 该配置不是整个进程内存的硬上限，仍需为任务、索引、临时排序和旧/新缓存预留磁盘。
-
 ## 吞吐、容量和利用率
 
 每组拓扑左侧新增接入发送吞吐、Fabric 整体利用率，并保留最大利用率和热点方向数。
