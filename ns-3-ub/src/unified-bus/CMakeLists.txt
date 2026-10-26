@@ -52,6 +52,7 @@ build_lib(
 	model/protocol/ub-ctp.cc
 	model/ub-link.cc
 	model/ub-port.cc
+    model/ub-replay-logger.cc
 	model/ub-tag.cc
 	model/ub-switch.cc
 	model/protocol/ub-transaction.cc
@@ -88,6 +89,7 @@ build_lib(
 	model/ub-link.h
 	model/ub-modulo-sequence.h
 	model/ub-port.h
+    model/ub-replay-logger.h
 	model/ub-small-fifo-queue.h
 	model/ub-sliding-bitmap-window.h
 	model/ub-switch.h

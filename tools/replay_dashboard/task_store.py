@@ -43,6 +43,8 @@ def create_tables(db):
                            PRIMARY KEY(case_id,task_id)) WITHOUT ROWID;
         CREATE TABLE completion_bins(case_id TEXT,time_ps INTEGER,started INTEGER,completed INTEGER,ended_started INTEGER,
                                      PRIMARY KEY(case_id,time_ps)) WITHOUT ROWID;
+        CREATE TABLE playback_progress(case_id TEXT,time_ps INTEGER,started INTEGER,completed INTEGER,running INTEGER,
+                                       PRIMARY KEY(case_id,time_ps)) WITHOUT ROWID;
         CREATE TABLE cohort(task_id INTEGER PRIMARY KEY);
         CREATE TABLE fct_values(case_id TEXT,fct_ps INTEGER,task_id INTEGER,
                                 PRIMARY KEY(case_id,fct_ps,task_id)) WITHOUT ROWID;
@@ -114,9 +116,9 @@ def import_tasks(db, root, config, reporter):
     return dict(totalTasks=total,completedTasks=completed or 0,pendingTasks=total-(started or 0),taskSource=source)
 
 
-def completion_buckets(db,case,step_ps,end,reporter):
+def completion_buckets(db,case,step_ps,end,reporter,retain=True):
     # ceil(timestamp / step) ensures no future completion is shown at the left boundary.
-    reporter.stage('task-buckets','生成 500 ms 任务进度',case)
+    reporter.stage('task-buckets',f'生成 {step_ps / 10**9:g} ms 任务进度',case)
     for field,label in (('start_ps','started'),('end_ps','completed')):
         db.execute(f'''INSERT INTO completion_bins SELECT case_id,((CAST({field}/? AS INTEGER)+({field}%? > 0))*?),
             {"COUNT(*)" if label=="started" else "0"},{"COUNT(*)" if label=="completed" else "0"},
@@ -125,19 +127,25 @@ def completion_buckets(db,case,step_ps,end,reporter):
             ON CONFLICT(case_id,time_ps) DO UPDATE SET started=started+excluded.started,
             completed=completed+excluded.completed,ended_started=ended_started+excluded.ended_started''',(step_ps,step_ps,step_ps,case))
     rows=iter(db.execute('SELECT time_ps,started,completed,ended_started FROM completion_bins WHERE case_id=? ORDER BY time_ps',(case,)))
-    row=next(rows,None); started=completed=ended=0; result=[]
+    row=next(rows,None); started=completed=ended=0; result=[]; batch=[]
     end_ps=int(round(end*PS))
     ticks=range(0,end_ps+step_ps,step_ps)
     for when in ticks:
         boundary=min(when,end_ps)
         while row is not None and row[0]<=boundary:
             started+=row[1];completed+=row[2];ended+=row[3];row=next(rows,None)
-        result.append(dict(time=boundary/PS,started=started,completed=completed,running=started-ended))
+        # At the last partial boundary, the ceil bin extends past the run.
+        if when>=end_ps and end_ps%step_ps:
+            started,completed,ended=db.execute('SELECT SUM(start_ps<=?),SUM(end_ps<=?),SUM(start_ps IS NOT NULL AND end_ps<=?) FROM tasks WHERE case_id=?',(end_ps,end_ps,end_ps,case)).fetchone()
+            started,completed,ended=started or 0,completed or 0,ended or 0
+        batch.append((case,boundary,started,completed,started-ended))
+        if retain:
+            result.append(dict(time=boundary/PS,started=started,completed=completed,running=started-ended))
+        if len(batch)>=2000:
+            db.executemany('INSERT INTO playback_progress VALUES(?,?,?,?,?)',batch);batch.clear()
         if when>=end_ps: break
-    # Exact final partial boundary; its bin may extend beyond run end.
-    if end_ps%step_ps:
-        started,completed,ended=db.execute('SELECT SUM(start_ps<=?),SUM(end_ps<=?),SUM(start_ps IS NOT NULL AND end_ps<=?) FROM tasks WHERE case_id=?',(end_ps,end_ps,end_ps,case)).fetchone()
-        result[-1].update(started=started or 0,completed=completed or 0,running=(started or 0)-(ended or 0))
+    if batch:
+        db.executemany('INSERT INTO playback_progress VALUES(?,?,?,?,?)',batch)
     return result
 
 

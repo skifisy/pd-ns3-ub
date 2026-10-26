@@ -12,6 +12,7 @@
 #include "ub-traffic-gen.h"
 #include "ns3/ub-routing-process.h"
 #include "ns3/ub-port.h"
+#include "ns3/ub-replay-logger.h"
 #include "ns3/ub-utils.h"
 
 namespace ns3 {
@@ -422,21 +423,25 @@ void UbApp::OnMemTaskCompleted(uint32_t taskId)
 
 void UbApp::MemTaskStartsNotify(uint32_t nodeId, uint32_t taskId)
 {
+    UbReplayLogger::Get().TaskEvent("start", "mem", nodeId, taskId);
     m_traceMemTaskStartsNotify(nodeId, taskId);
 }
 
 void UbApp::MemTaskCompletesNotify(uint32_t nodeId, uint32_t taskId)
 {
+    UbReplayLogger::Get().TaskEvent("complete", "mem", nodeId, taskId);
     m_traceMemTaskCompletesNotify(nodeId, taskId);
 }
 
 void UbApp::WqeTaskStartsNotify(uint32_t nodeId, uint32_t jettyNum, uint32_t taskId)
 {
+    UbReplayLogger::Get().TaskEvent("start", "wqe", nodeId, taskId);
     m_traceWqeTaskStartsNotify(nodeId, jettyNum, taskId);
 }
 
 void UbApp::WqeTaskCompletesNotify(uint32_t nodeId, uint32_t jettyNum, uint32_t taskId)
 {
+    UbReplayLogger::Get().TaskEvent("complete", "wqe", nodeId, taskId);
     m_traceWqeTaskCompletesNotify(nodeId, jettyNum, taskId);
 }
 

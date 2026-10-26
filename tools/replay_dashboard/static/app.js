@@ -1,9 +1,10 @@
 'use strict';
 const $ = s => document.querySelector(s);
 const COLORS = ['#75889b','#267cae','#8264b3'];
+const TRANSIT_COLORS = ['#7852bb','#5369ba','#a3479a','#42699b','#77548e','#447f88'];
 const params = new URLSearchParams(location.search);
-const S = {time:0,playing:false,seeking:false,seekVersion:0,resumeAfterSeek:false,focus:null,blocks:new Map(),pending:new Map(),frames:{},scenes:new Map(),lastWall:0,lastDraw:0,key:'',dirty:true,trendKey:'',trendRequest:0,pathBlocks:new Map(),pathPending:new Map(),speed:1,controllers:new Map()};
-let meta, recording, completionChart, hotspotChart, globalChart, nodes, leaves, devices, access;
+const S = {time:0,playing:false,seeking:false,seekVersion:0,resumeAfterSeek:false,focus:null,blocks:new Map(),pending:new Map(),frames:{},scenes:new Map(),lastWall:0,lastDraw:0,key:'',dirty:true,trendKey:'',trendRequest:0,pathBlocks:new Map(),pathPending:new Map(),speed:1,controllers:new Map(),heat:true,loadVersion:0,trendStart:null,trendEnd:null,globalRequest:0,completionRequest:0};
+let meta, recording, completionChart, hotspotChart, globalChart, throughputChart, utilizationChart, nodes, leaves, devices, access;
 const esc = v => String(v ?? '').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 const finite = v => typeof v==='number' && Number.isFinite(v);
 const number = (v,d=1) => finite(v) ? v.toFixed(d) : '—';
@@ -11,8 +12,9 @@ const percent = v => finite(v) ? number(v*100,0)+'%' : '—';
 const pair = (a,b) => Math.min(a,b)+'-'+Math.max(a,b);
 const direction = (a,b) => a+'-'+b;
 const heat = u => !finite(u) ? ['#c6cdd4',.2,.7] : u>=.9 ? ['#df6257',.98,3.7] : u>=.7 ? ['#df9d37',.86,2.8] : u>=.35 ? ['#428ec0',.58,1.8] : ['#a8cfe6',u>0 ? .35 : .14,.9];
-function progressAt(c,t){const rows=c.completionBins;let a=0,b=rows.length;while(a<b){const m=(a+b)>>1;if(rows[m].time<=t)a=m+1;else b=m;}return a?rows[a-1]:{completed:0,running:0};}
-async function get(url,signal){const r=await fetch(url,{signal});if(!r.ok||r.status===202)throw Error(r.status+': '+await r.text());return r.json();}
+const transitColor = id => {const index=Math.max(0,leaves.indexOf(id));return TRANSIT_COLORS[index]||'hsl('+(205+100*(index-6)/Math.max(1,leaves.length-6))+',55%,44%)';};
+function progressAt(c,t){const rows=S.blocks.get(blockId(t))?.progress?.[c.id]||[];let a=0,b=rows.length;while(a<b){const m=(a+b)>>1;if(rows[m].time<=t+1e-12)a=m+1;else b=m;}return a?rows[a-1]:{completed:0,running:0};}
+async function get(url,signal){const r=await fetch(url,{signal});if(!r.ok||r.status===202)throw Error(r.status+': '+await r.text());const raw=await r.text(),data=JSON.parse(raw);Object.defineProperty(data,'_bytes',{value:new TextEncoder().encode(raw).byteLength});return data;}
 function fail(e){if(e.name==='AbortError')return;S.playing=false;$('#play').textContent='开始播放';$('#error').hidden=false;$('#errorText').textContent=e.message||String(e);}
 const delay = ms => new Promise(resolve=>setTimeout(resolve,ms));
 
@@ -35,18 +37,24 @@ async function waitReady(){
   await delay(500);
  }
 }
-function blockId(t){return Math.floor(Math.max(meta.start,Math.min(t,meta.end-1e-8))/5);}
+function blockId(t){return Math.floor(Math.max(meta.start,Math.min(t,meta.end-1e-8))/meta.blockSeconds);}
+function trimCache(cache,currentKey,newKey,budget){
+ const size=()=>[...cache.values()].reduce((n,v)=>n+(v._bytes||0),0);
+ while(cache.size>4||size()>budget){const key=[...cache.keys()].find(k=>k!==currentKey&&k!==newKey);if(key===undefined)break;cache.delete(key);}
+}
 function cancelLoads(pathsOnly=false){
+ if(!pathsOnly)++S.loadVersion;
  for(const [key,controller] of S.controllers){if(!pathsOnly||key.startsWith('path:')){controller.abort();S.controllers.delete(key);}}
  if(!pathsOnly)S.pending.clear();S.pathPending.clear();
 }
 async function ensureFrames(t){
  const id=blockId(t);if(S.blocks.has(id))return;if(S.pending.has(id))return S.pending.get(id);
  $('#buffer').textContent='缓存中';
- const controller=new AbortController(),requestKey='frame:'+id;S.controllers.set(requestKey,controller);
- const p=get('/api/frames?start='+Math.max(meta.start,id*5)+'&end='+Math.min(meta.end,(id+1)*5),controller.signal).then(data=>{
+ const controller=new AbortController(),requestKey='frame:'+id,version=S.loadVersion;S.controllers.set(requestKey,controller);
+ const p=get('/api/frames?start='+Math.max(meta.start,id*meta.blockSeconds)+'&end='+Math.min(meta.end,(id+1)*meta.blockSeconds),controller.signal).then(data=>{
+  if(controller.signal.aborted||version!==S.loadVersion)return;
   S.blocks.set(id,data);S.dirty=true;
-  while(S.blocks.size>4){const current=blockId(S.time),keys=[...S.blocks.keys()].filter(k=>k!==current&&k!==id);if(!keys.length)break;S.blocks.delete(keys[0]);}
+  trimCache(S.blocks,blockId(S.time),id,16*1024*1024);
  }).finally(()=>{if(S.pending.get(id)===p){S.pending.delete(id);S.controllers.delete(requestKey);}});
  S.pending.set(id,p);return p;
 }
@@ -54,10 +62,11 @@ function pathKey(t){return direction(S.focus.src,S.focus.dst)+'@'+blockId(t);}
 async function ensurePaths(t){
  const id=blockId(t),key=pathKey(t);if(S.pathBlocks.has(key))return;if(S.pathPending.has(key))return S.pathPending.get(key);
  const focus={...S.focus};
- const controller=new AbortController(),requestKey='path:'+key;S.controllers.set(requestKey,controller);
- const p=get('/api/paths?src='+focus.src+'&dst='+focus.dst+'&start='+Math.max(meta.start,id*5)+'&end='+Math.min(meta.end,(id+1)*5),controller.signal).then(data=>{
+ const controller=new AbortController(),requestKey='path:'+key,version=S.loadVersion;S.controllers.set(requestKey,controller);
+ const p=get('/api/paths?src='+focus.src+'&dst='+focus.dst+'&start='+Math.max(meta.start,id*meta.blockSeconds)+'&end='+Math.min(meta.end,(id+1)*meta.blockSeconds),controller.signal).then(data=>{
+  if(controller.signal.aborted||version!==S.loadVersion)return;
   S.pathBlocks.set(key,data);S.dirty=true;
-  while(S.pathBlocks.size>4){const keys=[...S.pathBlocks.keys()].filter(k=>k!==pathKey(S.time)&&k!==key);if(!keys.length)break;S.pathBlocks.delete(keys[0]);}
+  trimCache(S.pathBlocks,pathKey(S.time),key,8*1024*1024);
  }).finally(()=>{if(S.pathPending.get(key)===p){S.pathPending.delete(key);S.controllers.delete(requestKey);}});
  S.pathPending.set(key,p);return p;
 }
@@ -86,12 +95,14 @@ function setup(){
   const q=c.quantiles[k],gain=c.mode==='ecmp'?'基线':q.improvement==null?'无共同完成任务':(q.improvement>=0?'降低 ':'增加 ')+number(Math.abs(q.improvement))+'%';
   return '<div><div class="metric-label">'+k.toUpperCase()+'</div><div class="metric-value">'+number(q.seconds,3)+'<small>s</small></div><div class="gain '+(q.improvement<0?'regression':'')+'">'+gain+'</div></div>';
  }).join('')+'</div><div class="live-summary"><span>当前完成 <b id="complete-'+i+'">—</b> / '+c.totalTasks+'</span><span>进行中 <b id="running-'+i+'">—</b></span></div></article>').join('');
- $('#networks').innerHTML=meta.cases.map((c,i)=>'<article class="network-row" style="--case:'+COLORS[i%3]+'"><div class="case-side"><div><div class="case-name">'+esc(c.label)+'</div><div class="case-purpose">同一仿真时刻</div></div><div class="global-live"><div><label>最大利用率</label><b id="max-'+i+'">—</b></div><div><label>高负载方向</label><b id="hot-'+i+'">—</b><small>互连利用率 ≥ '+number(recording.hotspotThreshold*100,0)+'%</small></div></div></div><div class="network-space"><canvas class="network" id="network-'+i+'" aria-label="'+esc(c.label)+' 链路热力拓扑"></canvas><span class="network-watermark">上排 L＝交换机　下排 C＝计算 / S＝存储　接入间距已压缩</span></div><div class="action-side"><div class="action-label" id="action-label-'+i+'"></div><div class="action-title" id="action-title-'+i+'"></div><div class="action-lines" id="action-lines-'+i+'"></div><div class="action-footer" id="action-footer-'+i+'"></div></div></article>').join('');
+ $('#networks').innerHTML=meta.cases.map((c,i)=>'<article class="network-row" style="--case:'+COLORS[i%3]+'"><div class="case-side"><div><div class="case-name">'+esc(c.label)+'</div><div class="case-purpose">同一仿真时刻</div></div><div class="global-live"><div title="所有业务端到 Leaf 的发送量；含重传和控制流量"><label>接入发送吞吐</label><b id="throughput-'+i+'">—</b><small>Gbps · 发送口径</small></div><div title="Leaf 间发送比特数 / 有效容量时间积分"><label>Fabric 利用率</label><b id="util-'+i+'">—</b></div><div><label>最大利用率</label><b id="max-'+i+'">—</b></div><div><label>高负载方向</label><b id="hot-'+i+'">—</b><small>互连利用率 ≥ '+number(recording.hotspotThreshold*100,0)+'%</small></div></div></div><div class="network-space"><canvas class="network" id="network-'+i+'" aria-label="'+esc(c.label)+' 链路热力拓扑"></canvas><span class="network-watermark">上排 L＝交换机　下排 C＝计算 / S＝存储　接入间距已压缩</span></div><div class="action-side"><div class="action-label" id="action-label-'+i+'"></div><div class="action-title" id="action-title-'+i+'"></div><div class="action-lines" id="action-lines-'+i+'"></div><div class="action-footer" id="action-footer-'+i+'"></div></div></article>').join('');
  $('#focus').innerHTML=meta.focusOptions.map(p=>'<option value="'+direction(p.src,p.dst)+'">L'+p.src+' → L'+p.dst+'</option>').join('');
  $('#focus').value=direction(S.focus.src,S.focus.dst);$('#focus').disabled=false;
  $('#focus').onchange=e=>{const [src,dst]=e.target.value.split('-').map(Number);cancelLoads(true);S.focus={src,dst};S.dirty=true;ensurePaths(S.time).catch(fail);loadHotspot().catch(fail);};
  $('#focus').onpointerdown=updateOptions;
  $('#focus').onfocus=updateOptions;
+ $('#heatToggle').disabled=false;
+ $('#heatToggle').onclick=()=>{S.heat=!S.heat;$('#heatToggle').setAttribute('aria-pressed',String(S.heat));$('#heatToggle').textContent='热点展示：'+(S.heat?'开':'关');$('#heatLegend').classList.toggle('heat-off',!S.heat);$('#heatDescription').textContent=S.heat?'颜色＝利用率；线宽＝发送速率（各组同尺度）':'背景为灰色结构线；彩色路径与交换机＝当前焦点的中转';S.dirty=true;};
 }
 function updateOptions(){
  const maps=meta.cases.map(c=>new Map((S.frames[c.id]?.edges||[]).map(e=>[direction(e.src,e.dst),e])));
@@ -136,16 +147,18 @@ function makeScene(c,frame,i){
  const buffer=document.createElement('canvas');buffer.width=canvas.width;buffer.height=canvas.height;
  const ctx=buffer.getContext('2d');ctx.scale(dpr,dpr);ctx.lineCap='round';
  const {positions}=layout(w,h),observed=new Map(frame.edges.map(e=>[direction(e.src,e.dst),e]));
- const paths=focusedPaths(frame),mids=midpoints(c,frame),focusKeys=new Set([pair(S.focus.src,S.focus.dst)]),flow=new Map(),nodeRates=new Map();
+ const paths=focusedPaths(frame),mids=midpoints(c,frame),focusKeys=new Set([pair(S.focus.src,S.focus.dst)]),flow=new Map(),nodeRates=new Map(),pathColors=new Map();
  const addFlow=(a,b,rate)=>{const k=direction(a,b),old=flow.get(k);flow.set(k,{a,b,rate:(old?.rate||0)+rate});focusKeys.add(pair(a,b));};
  for(const p of paths){
   addFlow(p.srcNode,p.src,p.gbps);addFlow(p.dst,p.dstNode,p.gbps);
   if(p.transit<0)addFlow(p.src,p.dst,p.gbps);else{addFlow(p.src,p.transit,p.gbps);addFlow(p.transit,p.dst,p.gbps);}
+  if(p.transit>=0)for(const [a,b] of [[p.src,p.transit],[p.transit,p.dst]])pathColors.set(pair(a,b),transitColor(p.transit));
   for(const [id,key] of [[p.srcNode,'tx'],[p.dstNode,'rx']]){const n=nodeRates.get(id)||{tx:0,rx:0};n[key]+=p.gbps;nodeRates.set(id,n);}
  }
  if(!c.capabilities.nodePaths){
   const hops=[[S.focus.src,S.focus.dst],...mids.flatMap(m=>[[S.focus.src,m],[m,S.focus.dst]])];
   for(const [a,b] of hops){focusKeys.add(pair(a,b));const e=observed.get(direction(a,b));if(e?.gbps>0)addFlow(a,b,e.gbps);}
+  for(const m of mids)for(const [a,b] of [[S.focus.src,m],[m,S.focus.dst]])pathColors.set(pair(a,b),transitColor(m));
  }
  const bundles=new Map();
  for(const e of topologyAt(c,S.time).edges)if(e.src<e.dst&&leaves.includes(e.src)&&leaves.includes(e.dst))bundles.set(pair(e.src,e.dst),{...e,fabric:true});
@@ -162,18 +175,20 @@ function makeScene(c,frame,i){
  for(const {k,e,measured,u} of sorted){
   const focal=focusKeys.has(k),g=curve(e.src,e.dst,positions,e.fabric,focal);geometries.set(k,g);
   const [color,opacity,width]=heat(u),deleted=changes.has(k)&&!e.circuits;
-  if(focal)stroke(ctx,g,'#244c69',width+(e.fabric?3:2),.35);
-  if(!deleted)stroke(ctx,g,color,(.7+3.3*Math.log1p(measured?.gbps||0)/Math.log1p(Math.max(1,meta.rateScaleGbps)))*(e.fabric?1:.65),focal?Math.max(.65,opacity):opacity,!finite(u));
-  if(finite(u)&&u>=.7&&measured)arrow(ctx,g,color,measured.src===e.dst);
+  const pathColor=pathColors.get(k)||'#244c69';
+  if(focal)stroke(ctx,g,pathColor,S.heat?width+(e.fabric?3:2):3.8,S.heat ? .5 : .95);
+  if(!deleted)stroke(ctx,g,S.heat?color:focal?pathColor:'#c4cdd5',S.heat?(.7+3.3*Math.log1p(measured?.gbps||0)/Math.log1p(Math.max(1,meta.rateScaleGbps)))*(e.fabric?1:.65):focal?2:.7,S.heat?focal?Math.max(.65,opacity):opacity:focal?1:.28,S.heat&&!finite(u));
+  if(S.heat&&finite(u)&&u>=.7&&measured)arrow(ctx,g,color,measured.src===e.dst);
  }
  // Focus labels keep the selected direction explicit; background heat remains max(A→B,B→A).
- const hops=[[S.focus.src,S.focus.dst],...mids.slice(0,2).flatMap(m=>[[S.focus.src,m],[m,S.focus.dst]])];
+ const hops=[[S.focus.src,S.focus.dst],...mids.flatMap(m=>[[S.focus.src,m],[m,S.focus.dst]])];
  hops.forEach(([a,b],index)=>{
   const g=geometries.get(pair(a,b));if(!g)return;
   const e=observed.get(direction(a,b)),p=at(g,index===0 ? .5 : .42);
   const text='L'+a+'→L'+b+' '+percent(e?.utilization)+(index===0?' · '+number(e?.gbps,0)+'/'+number(e?.capacity,0)+'G':'');
-  if(e?.gbps>0)arrow(ctx,g,'#244c69',positions.get(a)!==g.a);
-  badge(ctx,text,p[0],p[1]+(index%2?9:-9),'#294f6d');
+  const color=pathColors.get(pair(a,b))||'#244c69';
+  if(e?.gbps>0)arrow(ctx,g,color,positions.get(a)!==g.a);
+  badge(ctx,text,p[0],p[1]+(index%2?9:-9),color);
  });
  for(const [k,d] of changes){
   const g=geometries.get(k);if(!g)continue;
@@ -185,9 +200,11 @@ function makeScene(c,frame,i){
  for(const n of nodes){
   const [x,y]=positions.get(n.id),upper=leaves.includes(n.id),active=upper?(n.id===S.focus.src||n.id===S.focus.dst||mids.includes(n.id)):nodeRates.has(n.id);
   ctx.save();ctx.fillStyle=active?'#244c69':upper?'#edf3f7':n.role==='storage-server'?'#e3daef':'#d7eaf4';ctx.strokeStyle=active?'#173a55':upper?'#8ca6b9':n.role==='storage-server'?'#9a83b6':'#75a6c0';ctx.lineWidth=active?1.8:1;
+  if(upper){ctx.fillStyle=n.role==='storage-leaf'?'#e3daef':'#d7eaf4';if(mids.includes(n.id)){ctx.fillStyle=transitColor(n.id);ctx.strokeStyle=transitColor(n.id);}else if(active){ctx.strokeStyle='#173a55';ctx.lineWidth=2.5;}}
   ctx.beginPath();if(upper)ctx.rect(x-10,y-6,20,12);else if(n.role==='storage-server')ctx.rect(x-5,y-5,10,10);else ctx.arc(x,y,5,0,Math.PI*2);ctx.fill();ctx.stroke();
   ctx.textAlign='center';ctx.fillStyle=active?'#24445b':'#7c91a0';ctx.font=(upper?'10':'9')+'px ui-monospace,monospace';
-  ctx.fillText((upper?'L':n.role==='storage-server'?'S':'C')+n.id,x,y+17);
+  if(upper&&mids.includes(n.id))ctx.fillStyle=transitColor(n.id);
+  ctx.fillText((upper?'L':n.role==='storage-server'?'S':'C')+n.id+(upper&&mids.includes(n.id)?' 中转':''),x,y+17);
   if(topRates.has(n.id)){const rate=nodeRates.get(n.id);ctx.font='8px ui-monospace,monospace';ctx.fillText((rate.tx?'↑'+number(rate.tx,0):'')+(rate.tx&&rate.rx?' / ':'')+(rate.rx?'↓'+number(rate.rx,0):'')+'G',x,y-10);}
   ctx.restore();
  }
@@ -195,7 +212,7 @@ function makeScene(c,frame,i){
  for(const f of flow.values()){
   const base=geometries.get(pair(f.a,f.b));if(!base||f.rate<=0)continue;
   const g=positions.get(f.a)===base.a?base:{a:base.b,b:base.a,c:base.c};
-  routes.push({g,rate:f.rate,color:heat(observed.get(direction(f.a,f.b))?.utilization)[0]});
+  routes.push({g,rate:f.rate,color:pathColors.get(pair(f.a,f.b))||(S.heat?heat(observed.get(direction(f.a,f.b))?.utilization)[0]:'#244c69')});
  }
  S.scenes.set(c.id,{canvas,buffer,dpr,routes});
 }
@@ -220,7 +237,7 @@ function action(c,frame,i){
    [...rotate(change.changes.filter(d=>d.delta>0)),...rotate(change.changes.filter(d=>d.delta<0))].map(d=>'<div class="'+(d.delta>0?'added':'removed')+'">L'+d.src+'↔L'+d.dst+' '+(d.delta>0?'+':'')+d.delta+'　'+d.before+'→'+d.after+'</div>').join('');
   if(change.failed)lines='<div>排空超时；实际连接和容量保持原值。</div>';
  }else{
-  lines=mids.slice(0,2).map(m=>'<div class="route-label">L'+f.src+' → L'+m+' → L'+f.dst+'</div>').join('');
+  lines=mids.map(m=>'<div class="route-label" style="color:'+transitColor(m)+'">L'+f.src+' → L'+m+' → L'+f.dst+'</div>').join('');
   if(!mids.length)lines='<div>观察 L'+f.src+' → L'+f.dst+'</div>';
   if(paths.length){
    const largest=[...paths].sort((a,b)=>b.gbps-a.gbps).slice(0,2);
@@ -228,57 +245,99 @@ function action(c,frame,i){
   }else lines+='<div>'+(detailAvailable(c,S.time)?'本窗口无该方向载荷记录':'此时间段未采集端到端路径详情')+'</div>';
  }
  const phase={steady:'正常转发',draining:'排空',guard:'保护等待',applied:'拓扑生效',finished:'实验结束',missing:'无采样'}[frame.phase]||frame.phase;
+ if(c.mode.startsWith('toe')&&change){
+  lines+=mids.map(m=>'<div class="route-label" style="color:'+transitColor(m)+'">L'+f.src+' → L'+m+' → L'+f.dst+'</div>').join('');
+  lines+='<div>'+(paths.length?'该方向节点载荷发送 '+number(payload,2)+' Gbps':detailAvailable(c,S.time)?'本窗口无该方向载荷记录':'此时间段未采集端到端路径详情')+'</div>';
+ }
+ if(mids.length)lines+='<div class="transit-legend">'+mids.map(m=>'<span style="color:'+transitColor(m)+'">● L'+m+' 中转</span>').join('　')+'</div>';
  $('#action-title-'+i).textContent=title;$('#action-lines-'+i).innerHTML=lines;
- $('#action-footer-'+i).innerHTML='窗口 '+number(frame.start,3)+'–'+number(frame.end,3)+' s<br>链路发送 <b>'+number(e?.gbps,0)+'</b> / 容量 <b>'+number(e?.capacity,0)+'</b> Gbps<br>反向 '+percent(reverse?.utilization)+'　·　'+esc(phase)+'　·　拓扑 v'+frame.topologyEpoch+'<br>'+(c.capabilities.accessSamples?'接入层有链路采样':'接入层无采样，保留灰色结构线');
+ $('#action-footer-'+i).innerHTML='窗口 '+number(frame.start,6)+'–'+number(frame.end,6)+' s<br>链路发送 <b>'+number(e?.gbps,0)+'</b> / 容量 <b>'+number(e?.capacity,0)+'</b> Gbps<br>反向 '+percent(reverse?.utilization)+'　·　'+esc(phase)+'　·　拓扑 v'+frame.topologyEpoch+'<br>'+(c.capabilities.accessSamples?'接入层有链路采样':'接入层无采样，保留灰色结构线');
 }
 function draw(){
  meta.cases.forEach((c,i)=>{
   const frame=frameAt(c,S.time);S.frames[c.id]=frame;makeScene(c,frame,i);action(c,frame,i);
+  $('#throughput-'+i).textContent=number(frame.global?.injectionGbps,2);
+  $('#util-'+i).textContent=percent(frame.global?.fabricUtilization);
   $('#max-'+i).textContent=percent(frame.global?.maxUtilization);
   $('#hot-'+i).textContent=frame.global?.hotLinks??'—';
  });
 }
-function cursor(){return {silent:true,symbol:'none',label:{show:false},lineStyle:{color:'#a2b4c2',type:'dashed',width:1},data:[{xAxis:S.time}]};}
+function cursor(){
+ const events=meta.cases.flatMap((c,i)=>c.events.filter(e=>['te-policy-published','topology-applied','toe-draining'].includes(e.event)).map(e=>({xAxis:e.time,name:c.label+' '+e.event,lineStyle:{color:COLORS[i%3],type:'dotted',width:1},label:{show:false}})));
+ return {silent:true,symbol:'none',label:{show:false},lineStyle:{color:'#91a3b1',type:'dashed',width:1},data:[{xAxis:S.time},...events]};
+}
 function chartBase(){
- return {animation:false,tooltip:{show:false},grid:{left:39,right:10,top:13,bottom:20},xAxis:{type:'value',min:recording.start,max:recording.end,axisLabel:{fontSize:8,color:'#8c9daa',formatter:v=>v.toFixed(0)+'s'},splitLine:{show:false},axisLine:{lineStyle:{color:'#dce6ec'}}},yAxis:{type:'value',min:0,splitNumber:2,axisLabel:{fontSize:8,color:'#8c9daa'},splitLine:{lineStyle:{color:'#edf2f5'}}}};
+ return {animation:false,tooltip:{trigger:'axis',confine:true,valueFormatter:v=>finite(v)?number(v,3):'无采样'},grid:{left:48,right:14,top:16,bottom:25},dataZoom:[{type:'inside',filterMode:'none',start:0,end:100}],xAxis:{type:'value',min:S.trendStart??recording.start,max:S.trendEnd??recording.end,axisLabel:{fontSize:8,color:'#8c9daa',formatter:v=>v.toFixed((S.trendEnd-S.trendStart)<10?2:0)+'s'},splitLine:{show:false},axisLine:{lineStyle:{color:'#dce6ec'}}},yAxis:{type:'value',min:0,splitNumber:2,axisLabel:{fontSize:8,color:'#8c9daa'},splitLine:{lineStyle:{color:'#edf2f5'}}}};
 }
-function line(id,data,color,dashed=false){return {id,type:'line',silent:true,showSymbol:false,step:'end',connectNulls:false,lineStyle:{color,width:dashed?1:1.6,type:dashed?'dashed':'solid'},data};}
-function drawCompletion(){
- completionChart.setOption({...chartBase(),series:meta.cases.map((c,i)=>({...line(c.id,c.completionBins.map(p=>[p.time,p.completed]),COLORS[i%3]),markLine:i===0?cursor():undefined}))});
+function line(id,data,color,dashed=false,name=id){return {id,name,type:'line',showSymbol:false,step:'end',connectNulls:false,lineStyle:{color,width:dashed?1:1.6,type:dashed?'dashed':'solid'},data};}
+function trendQuery(chart){return 'start='+S.trendStart+'&end='+S.trendEnd+'&points='+Math.max(100,Math.min(1600,Math.round(chart.getWidth()*2)));}
+async function loadCompletion(){
+ const request=++S.completionRequest,data=await get('/api/completion?'+trendQuery(completionChart));if(request!==S.completionRequest)return;
+ completionChart.setOption({...chartBase(),series:meta.cases.map((c,i)=>({...line(c.id,data.cases[c.id].map(p=>[p.time,p.completed]),COLORS[i%3],false,c.label+' 完成数'),markLine:i===0?cursor():undefined}))},{notMerge:true});
 }
-async function loadHotspot(){
- const f=S.focus,k=direction(f.src,f.dst);if(k===S.trendKey)return;
- S.trendKey=k;const request=++S.trendRequest;const data=await get('/api/trend?src='+f.src+'&dst='+f.dst);if(request!==S.trendRequest)return;
+async function loadHotspot(force=false){
+ const f={...S.focus},k=direction(f.src,f.dst)+'@'+S.trendStart+':'+S.trendEnd;if(!force&&k===S.trendKey)return;
+ S.trendKey=k;const request=++S.trendRequest,data=await get('/api/trend?src='+f.src+'&dst='+f.dst+'&'+trendQuery(hotspotChart));if(request!==S.trendRequest)return;
  $('#hotspotTitle').textContent='焦点 L'+f.src+' → L'+f.dst;
  hotspotChart.setOption({...chartBase(),series:meta.cases.flatMap((c,i)=>[
-  {...line(c.id+'-rate',data.cases[c.id].map(p=>[p.time,p.gbps]),COLORS[i%3]),markLine:i===0?cursor():undefined},
-  line(c.id+'-cap',data.cases[c.id].map(p=>[p.time,p.capacity]),COLORS[i%3],true)
+  {...line(c.id+'-rate',data.cases[c.id].map(p=>[p.time,p.gbps]),COLORS[i%3],false,c.label+' 发送 Gbps'),markLine:i===0?cursor():undefined},
+  line(c.id+'-cap',data.cases[c.id].map(p=>[p.time,p.capacity]),COLORS[i%3],true,c.label+' 容量 Gbps')
  ])},{notMerge:true});
 }
 async function loadGlobal(){
- const data=await get('/api/global-trend'),base=chartBase();
- globalChart.setOption({...base,grid:{left:34,right:28,top:13,bottom:20},yAxis:[{...base.yAxis,max:v=>Math.max(100,Math.ceil(v.max/20)*20)},{...base.yAxis,position:'right',splitLine:{show:false}}],series:meta.cases.flatMap((c,i)=>[
-  {...line(c.id+'-max',data.cases[c.id].map(p=>[p.time,finite(p.maxUtilization)?p.maxUtilization*100:null]),COLORS[i%3]),markLine:i===0?cursor():undefined},
-  {...line(c.id+'-hot',data.cases[c.id].map(p=>[p.time,p.hotLinks]),COLORS[i%3],true),yAxisIndex:1}
- ])});
+ const request=++S.globalRequest,data=await get('/api/global-trend?'+trendQuery(throughputChart));if(request!==S.globalRequest)return;
+ throughputChart.setOption({...chartBase(),series:meta.cases.map((c,i)=>({...line(c.id+'-throughput',data.cases[c.id].map(p=>[p.time,p.injectionGbps]),COLORS[i%3],false,c.label+' 接入发送 Gbps'),markLine:i===0?cursor():undefined}))},{notMerge:true});
+ const metric=$('#utilMetric').value;
+ utilizationChart.setOption({...chartBase(),series:meta.cases.map((c,i)=>({...line(c.id+'-util',data.cases[c.id].map(p=>[p.time,finite(p[metric])?p[metric]*100:null]),COLORS[i%3],false,c.label+' 利用率 %'),markLine:i===0?cursor():undefined}))},{notMerge:true});
+ globalChart.setOption({...chartBase(),grid:{left:39,right:28,top:16,bottom:25},yAxis:[{...chartBase().yAxis,max:v=>Math.max(100,Math.ceil(v.max/20)*20)},{...chartBase().yAxis,position:'right',splitLine:{show:false}}],series:meta.cases.flatMap((c,i)=>[
+  {...line(c.id+'-max',data.cases[c.id].map(p=>[p.time,finite(p.maxUtilization)?p.maxUtilization*100:null]),COLORS[i%3],false,c.label+' 峰值利用率 %'),markLine:i===0?cursor():undefined},
+  {...line(c.id+'-hot',data.cases[c.id].map(p=>[p.time,p.hotLinks]),COLORS[i%3],true,c.label+' 热点方向数'),yAxisIndex:1}
+ ])},{notMerge:true});
+}
+function charts(){return [completionChart,hotspotChart,globalChart,throughputChart,utilizationChart];}
+async function reloadTrends(){await Promise.all([loadCompletion(),loadHotspot(true),loadGlobal()]);$('#trendStatus').textContent=number(S.trendStart,3)+'–'+number(S.trendEnd,3)+' s · 聚合均值 / 热点峰值；滚轮可放大，点击可定位';}
+function trendControls(){
+ const setRange=(start,end)=>{S.trendStart=Math.max(recording.start,start);S.trendEnd=Math.min(recording.end,end);reloadTrends().catch(fail);};
+ $('#trendAll').onclick=()=>setRange(recording.start,recording.end);
+ $('#trendLocal').onclick=()=>{const width=Math.min(1,recording.end-recording.start),start=Math.max(recording.start,Math.min(S.time-width/2,recording.end-width));setRange(start,start+width);};
+ $('#utilMetric').onchange=()=>loadGlobal().catch(fail);
+ let zoomTimer;
+ for(const chart of charts()){
+  chart.getZr().on('click',e=>{if(!chart.containPixel('grid',[e.offsetX,e.offsetY]))return;const point=chart.convertFromPixel('grid',[e.offsetX,e.offsetY]);if(point&&finite(point[0]))seekTo(point[0]).catch(fail);});
+  chart.on('datazoom',e=>{const z=e.batch?.[0]||e,span=S.trendEnd-S.trendStart;
+   const start=finite(z.startValue)?z.startValue:S.trendStart+span*(z.start??0)/100,end=finite(z.endValue)?z.endValue:S.trendStart+span*(z.end??100)/100;
+   clearTimeout(zoomTimer);zoomTimer=setTimeout(()=>{if(end-start>=meta.windowSeconds)setRange(start,end);},180);
+  });
+ }
 }
 function updateText(){
- $('#time').textContent=number(S.time,1);
+ $('#time').textContent=number(S.time,3);
  meta.cases.forEach((c,i)=>{$('#complete-'+i).textContent=progressAt(c,S.time).completed;$('#running-'+i).textContent=progressAt(c,S.time).running;});
  const parts=meta.cases.map(c=>{const f=S.frames[c.id],e=f?.edges.find(e=>e.src===S.focus.src&&e.dst===S.focus.dst);return c.label+' '+percent(e?.utilization);});
  const selected=$('#focus').selectedOptions[0];
  if(selected)selected.textContent='L'+S.focus.src+' → L'+S.focus.dst+'　'+parts.join(' / ');
- $('#caption').textContent='L'+S.focus.src+' → L'+S.focus.dst+'：'+parts.join(' / ')+'。比较原热点、中转负载和其他热路径。';
+ $('#caption').textContent='L'+S.focus.src+' → L'+S.focus.dst+'：'+parts.join(' / ')+'。'+(S.heat?'热力表示链路负载；':'热点已关闭；')+'彩色中转 Leaf 对应当前窗口的实际路径。';
  if(!S.seeking)$('#timeline').value=S.time;
- $('#currentClock').textContent=number(S.time,1)+' s';
+ $('#currentClock').textContent=number(S.time,3)+' s';
  $('#play').textContent=S.playing?'暂停播放':S.time>=recording.end?'重新播放':'开始播放';
  $('#playbackState').textContent=S.seeking?'正在定位':S.time>=recording.end?'回放完成':S.playing?'播放中':'已暂停';
- completionChart.setOption({series:[{id:meta.cases[0].id,markLine:cursor()}]});
- hotspotChart.setOption({series:[{id:meta.cases[0].id+'-rate',markLine:cursor()}]});
- globalChart.setOption({series:[{id:meta.cases[0].id+'-max',markLine:cursor()}]});
+ if(performance.now()-(S.lastCursor||0)<100)return;S.lastCursor=performance.now();
+ for(const [chart,id] of [[completionChart,meta.cases[0].id],[hotspotChart,meta.cases[0].id+'-rate'],[globalChart,meta.cases[0].id+'-max'],[throughputChart,meta.cases[0].id+'-throughput'],[utilizationChart,meta.cases[0].id+'-util']])chart.setOption({series:[{id,markLine:cursor()}]});
 }
 function setPlaying(value){S.playing=value;S.lastWall=performance.now();updateText();}
+async function stepFrame(delta){
+ const version=S.stepRequest=(S.stepRequest||0)+1,at=S.time;
+ S.seeking=false;S.resumeAfterSeek=false;S.playing=false;
+ const probe=Math.max(recording.start,Math.min(recording.end,S.time+delta*meta.windowSeconds));
+ await ensure(probe);
+ if(version!==S.stepRequest||S.time!==at)return;
+ const boundaries=[recording.start,recording.end,...[...S.blocks.values()].flatMap(b=>Object.values(b.cases).flatMap(rows=>rows.flatMap(f=>[f.start,f.end])))];
+ const candidates=boundaries.filter(t=>delta>0?t>S.time+1e-10:t<S.time-1e-10);
+ const next=candidates.length?(delta>0?Math.min(...candidates):Math.max(...candidates)):probe;
+ await seekTo(next);
+}
 async function seekTo(time,resume=false){
+ S.stepRequest=(S.stepRequest||0)+1;
  const version=++S.seekVersion;cancelLoads();
  S.time=Math.max(recording.start,Math.min(recording.end,time));S.playing=false;S.lastWall=performance.now();S.dirty=true;
  $('#buffer').textContent='正在定位';updateText();
@@ -288,10 +347,12 @@ async function seekTo(time,resume=false){
  if(resume&&S.time<recording.end)setPlaying(true);
 }
 function controls(){
- const timeline=$('#timeline');timeline.min=recording.start;timeline.max=recording.end;timeline.value=S.time;
+ const timeline=$('#timeline');timeline.min=recording.start;timeline.max=recording.end;timeline.step=meta.windowSeconds;timeline.value=S.time;
  $('#speed').onchange=e=>{S.speed=Number(e.target.value);S.lastWall=performance.now();};
- $('#endClock').textContent=number(recording.end,1)+' s';
+ $('#endClock').textContent=number(recording.end,3)+' s';
  $('#play').disabled=false;$('#restart').disabled=false;timeline.disabled=false;
+ $('#prevFrame').disabled=false;$('#nextFrame').disabled=false;
+ $('#prevFrame').onclick=()=>stepFrame(-1).catch(fail);$('#nextFrame').onclick=()=>stepFrame(1).catch(fail);
  $('#play').onclick=()=>{
   S.seeking=false;S.resumeAfterSeek=false;++S.seekVersion;
   if(S.time>=recording.end)seekTo(recording.start,true).catch(fail);else setPlaying(!S.playing);
@@ -318,10 +379,10 @@ function tick(wall){
   }
   next=Math.min(next,recording.end);
   if(S.blocks.has(blockId(next))&&S.pathBlocks.has(pathKey(next))){S.time=next;if(next>=recording.end){if(params.get('loop')==='1'){S.time=recording.start;ensure(S.time).catch(fail);}else S.playing=false;}}else ensure(next).catch(fail);
-  const id=blockId(S.time);if(S.time>(id+1)*5-2)ensure(Math.min(recording.end-1e-8,(id+1)*5+.001)).catch(fail);
+  const id=blockId(S.time);if(S.time>(id+1)*meta.blockSeconds-meta.blockSeconds*.6)ensure(Math.min(recording.end-1e-8,(id+1)*meta.blockSeconds+1e-8)).catch(fail);
  }
- if(wall-S.lastDraw>140){
-  const frames=meta.cases.map(c=>frameAt(c,S.time)),key=frames.map(f=>f.id).join('|')+'|'+direction(S.focus.src,S.focus.dst)+'|'+Math.floor(S.time*2);
+ if(wall-S.lastDraw>33){
+  const frames=meta.cases.map(c=>frameAt(c,S.time)),key=frames.map(f=>f.id).join('|')+'|'+direction(S.focus.src,S.focus.dst)+'|'+Math.floor(S.time/meta.windowSeconds);
   if(S.dirty||key!==S.key){draw();S.key=key;S.dirty=meta.cases.some(c=>!S.scenes.has(c.id));}
   updateText();S.lastDraw=wall;
  }
@@ -330,20 +391,20 @@ function tick(wall){
 function frameLoop(wall){try{tick(wall);}catch(error){fail(error);}}
 async function init(){
  if(!window.echarts)throw Error('本地 ECharts 文件未加载');
- await waitReady();meta=await get('/api/bootstrap');recording=meta.recording;S.time=recording.start;S.focus={...meta.focus};
+ await waitReady();meta=await get('/api/bootstrap');recording=meta.recording;S.time=recording.start;S.focus={...meta.focus};S.trendStart=recording.start;S.trendEnd=recording.end;
  nodes=meta.topology.nodes;leaves=meta.topology.leaves;devices=nodes.filter(n=>!leaves.includes(n.id)).map(n=>n.id);
  const groups=new Map();
  for(const e of meta.topology.links)if(e.kind==='access'){const k=pair(e.src,e.dst),g=groups.get(k)||{src:Math.min(e.src,e.dst),dst:Math.max(e.src,e.dst),circuits:0};g.circuits++;groups.set(k,g);}access=[...groups.values()];
  $('#sourceLabel').textContent=meta.synthetic?'SMOKE 合成数据 · 非实验结果':'实际实验日志';
  $('#sourceLabel').classList.toggle('warning',meta.synthetic);
  $('#topologyInfo').textContent=nodes.length+' 节点 · '+leaves.length+' Leaf · '+meta.topology.fabricCircuits+' OCS';
- $('#cohort').textContent='500 ms 统计；最终 P50/P90/P99：共同完成 '+meta.commonTasks+' 个任务；未完成：'+meta.cases.map(c=>c.label+' '+(c.totalTasks-c.completedTasks)).join(' / ')+'。节点路径为源 Leaf 窗口发送量。';
+ $('#cohort').textContent=number(meta.windowSeconds*1000,0)+' ms 统计；最终 P50/P90/P99：共同完成 '+meta.commonTasks+' 个任务；未完成：'+meta.cases.map(c=>c.label+' '+(c.totalTasks-c.completedTasks)).join(' / ')+'。节点路径为源 Leaf 窗口发送量。';
  $('#completedLegend').innerHTML=meta.cases.map((c,i)=>'<span style="color:'+COLORS[i%3]+'">● '+esc(c.label)+'</span>').join('　');
- setup();completionChart=echarts.init($('#completionChart'));hotspotChart=echarts.init($('#hotspotChart'));globalChart=echarts.init($('#globalChart'));drawCompletion();
- await Promise.all([ensure(S.time),loadHotspot(),loadGlobal()]);
+ setup();completionChart=echarts.init($('#completionChart'));hotspotChart=echarts.init($('#hotspotChart'));globalChart=echarts.init($('#globalChart'));throughputChart=echarts.init($('#throughputChart'));utilizationChart=echarts.init($('#utilizationChart'));trendControls();
+ await Promise.all([ensure(S.time),reloadTrends()]);
  await new Promise(resolve=>requestAnimationFrame(resolve));
  draw();paint();controls();updateText();updateOptions();
- window.addEventListener('resize',()=>{completionChart.resize();hotspotChart.resize();globalChart.resize();S.dirty=true;});
+ window.addEventListener('resize',()=>{charts().forEach(c=>c.resize());S.dirty=true;});
  if(window.ResizeObserver){const observer=new ResizeObserver(()=>{S.dirty=true;});document.querySelectorAll('.network-space').forEach(el=>observer.observe(el));}
  $('#preparing').hidden=true;setPlaying(params.get('autoplay')==='1');requestAnimationFrame(frameLoop);
 }

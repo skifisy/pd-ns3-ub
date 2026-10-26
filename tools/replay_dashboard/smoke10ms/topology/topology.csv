@@ -1,0 +1,8 @@
+nodeId1,portId1,nodeId2,portId2,bandwidth
+0,0,10,0,8Mbps
+1,0,11,0,8Mbps
+10,1,11,1,4Mbps
+10,2,12,1,4Mbps
+11,2,13,1,4Mbps
+12,2,13,2,4Mbps
+12,3,11,3,4Mbps

@@ -32,6 +32,33 @@ Do not hardcode switch names in experiment specs or agent logic.
 - `UB_CONGESTION_CONTROL_TRACE_ENABLE` gates algorithm-emitted congestion-control trace files such as `DcqcnMarkTrace_*`, `DcqcnCnpTrace_*`, `DcqcnSenderTrace_*`, `CaqmAckTrace_*`, and `CaqmSenderTrace_*`.
 - These category gates default to `false`, so experiments must opt in explicitly when these files are needed.
 
+## Optional Replay Telemetry
+
+- Add `--replay` to existing ub-quick-example commands. Mode and case_id are
+  inferred from validated Jupiter TE / ToE inputs. Default output is
+  `<case>/replay/`: 500ms, all links aggregated by directed node pair, full-run
+  reliable URMA WRITE / READ_RESPONSE endpoint/path aggregates, queues off.
+- Local MTP (including `--mtp-threads=8`) is supported for ECMP and TE replay.
+  Path counters and task buffers belong to logical-process IDs, not OS threads.
+  The public LP samples/writes after the worker barrier; worker hooks cannot
+  advance the shared sampling window. Shared topology/epoch state is only
+  changed by public callbacks. No per-packet global logging lock is used.
+- Native TaskTrace is reused when enabled; otherwise replay task CSV is buffered
+  per LP and chunk writes are mutex-protected (about 64KiB). CSV order can be
+  interleaved; use exact time_ns/task_id, not row order. Final flush follows
+  worker join and covers the latest executed LP time.
+- MPI output is not implemented and still rejected. ToE controller itself still
+  requires single-thread execution; telemetry support does not remove that
+  independent base-repository guard. No thread count is silently reduced.
+- Reliable business payload is counted once at successful source-Leaf fabric
+  transmission, including retransmission. Intermediate Leaf identifies the
+  actual first hop; subsequent shortest routing is constrained by existing
+  logic, not a destination delivery confirmation. Current te_epoch need not be
+  the original route epoch of queued packets.
+- Full-run path aggregation has per-packet update and output costs. Boundaries
+  split 500ms base windows; physical capacity remains separate from business
+  pause. See `../../../../tools/REPLAY_TELEMETRY_V4.md`.
+
 ## Non-Implications
 
 - Do not claim that `detailed` trace itself lowers simulated throughput.

@@ -10,6 +10,7 @@
 #include "ns3/ub-port.h"
 #include "ns3/ub-switch.h"
 #include "ns3/ub-tag.h"
+#include "ns3/ub-replay-logger.h"
 #include "ns3/ub-controller.h"
 #include "ns3/ub-utils.h"
 
@@ -848,6 +849,18 @@ void UbSwitch::ForwardDataPacket(Ptr<UbPort> port, Ptr<Packet> packet, const Par
     // If packet routed via non-shortest path, force subsequent hops to use shortest path
     if (!selectedShortestPath) {
         ForceShortestPathRouting(packet, headers.datalinkPacketHeader);
+    }
+
+    // Reuse already parsed headers; only annotate data in requested detail ranges.
+    if (rtKey.teEligible && UbReplayLogger::Get().DetailsActive())
+    {
+        const uint32_t headerBytes = headers.datalinkPacketHeader.GetSerializedSize() +
+            headers.networkHeader.GetSerializedSize() + headers.ipv4Header.GetSerializedSize() +
+            headers.udpHeader.GetSerializedSize() + headers.transportHeader.GetSerializedSize() +
+            UbTransactionHeader().GetSerializedSize() + UbMAExtTah().GetSerializedSize();
+        if (packet->GetSize() > headerBytes)
+            UbReplayLogger::Get().PathMetadata(packet, GetObject<Node>()->GetId(),
+                rtKey.sip, rtKey.dip, packet->GetSize()-headerBytes);
     }
 
     // Buffer management: check input port buffer space

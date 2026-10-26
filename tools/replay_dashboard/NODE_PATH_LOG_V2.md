@@ -7,7 +7,7 @@ sample_id,case_id,start_ns,end_ns,topology_epoch,te_epoch,toe_decision_epoch,src
 ```
 
 窗口、sample_id、三个 epoch 与链路采样精确关联。时间单位 ns，保留 0.001 ns 精度。
-基础窗口 500 ms；策略发布、重配阶段、物理连接生效和详情范围边界会拆开窗口。
+默认基础窗口 10 ms；策略发布、重配阶段、物理连接生效和详情范围边界会拆开窗口。
 
 源/目的设备从实际数据包 IPv4 地址恢复；接入 Leaf 从真实设备端口的物理连接恢复。
 URMA WRITE 与 READ_RESPONSE 载荷均按实际包方向记录，不套用任务发起方向。
@@ -27,4 +27,4 @@ URMA WRITE 与 READ_RESPONSE 载荷均按实际包方向记录，不套用任务
 `te_epoch` 表示发送窗口内当前生效策略，不能解释成所有已排队包最初选择路由时的策略版本。
 
 后端批量写入临时磁盘表，与链路窗口/版本/拓扑连接校验后转到独立路径表。
-`/api/frames` 不嵌入所有端点路径；`/api/paths` 按当前 Leaf 对和最多 10 秒范围返回。
+`/api/frames` 不嵌入所有端点路径；`/api/paths` 按当前 Leaf 对和最多 2 秒范围返回。

@@ -1,6 +1,6 @@
 {
   "title": "ECMP / TE / TOE 实际实验结果",
-  "window_ms": 500,
+  "window_ms": 10,
   "throughputScale": 1,
   "topology": "/data/ECMP",
   "workload": "/data/ECMP/traffic.csv",

@@ -5,6 +5,7 @@
 #include "ns3/ub-network-address.h"
 #include "ns3/ub-caqm.h"
 #include "ns3/ub-tag.h"
+#include "ns3/ub-replay-logger.h"
 #include "ns3/ub-utils.h"
 #ifdef NS3_MPI
 #include "ns3/mpi-receiver.h"
@@ -458,6 +459,7 @@ void UbPort::TransmitPacket(Ptr<Packet> packet, Time delay)
     Simulator::Schedule(txCompleteTime, &UbPort::TransmitComplete, this);
     NS_LOG_DEBUG("[UbFc DequeueAndTransmit] will send pkt size: " << packet->GetSize());
     UpdateTxBytes(packet->GetSize());
+    UbReplayLogger::Get().SuccessfulTransmit(packet, GetNode()->GetId(), GetIfIndex());
 
     return;
 }
@@ -488,6 +490,7 @@ UbPort::TransmitPacketDetached(Ptr<Packet> packet)
 
     TraComEventNotify(packet, txTime);
     UpdateTxBytes(packet->GetSize());
+    UbReplayLogger::Get().SuccessfulTransmit(packet, GetNode()->GetId(), GetIfIndex());
 }
 
 void UbPort::Receive(Ptr<Packet> packet)

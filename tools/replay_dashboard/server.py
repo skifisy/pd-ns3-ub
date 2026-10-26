@@ -3,12 +3,14 @@ import argparse
 import asyncio
 from contextlib import asynccontextmanager, suppress
 import json
+import math
 import multiprocessing
 import os
 from pathlib import Path
 from queue import Empty
 import sqlite3
 import time
+from typing import Optional
 
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.gzip import GZipMiddleware
@@ -17,6 +19,7 @@ from fastapi.staticfiles import StaticFiles
 
 from jobs import import_worker
 from prepare import decode_frame
+from queries import interval, progress_rows, completion_trend, global_trend as query_global, link_trend
 
 HERE = Path(__file__).resolve().parent
 
@@ -37,9 +40,11 @@ async def lifespan(application):
     # Optional throughput rescale for bandwidth/data-size scaled simulations.
     # Only displayed Gbps/capacity values change; utilization stays unchanged.
     try:
-        application.state.scale = float(json.loads(manifest.read_text(encoding='utf-8')).get('throughputScale', 1) or 1)
+        application.state.scale = float(json.loads(manifest.read_text(encoding='utf-8')).get('throughputScale', 1))
     except (json.JSONDecodeError, OSError):
         application.state.scale = 1
+    if not math.isfinite(application.state.scale) or application.state.scale <= 0:
+        raise ValueError('throughputScale must be positive and finite')
     context = multiprocessing.get_context('spawn')
     messages = context.Queue(maxsize=64)
     process = context.Process(target=import_worker,args=(str(manifest),str(cache),messages,os.environ.get('REPLAY_ALLOW_SYNTHETIC')=='1'),daemon=True)
@@ -83,7 +88,7 @@ async def lifespan(application):
         messages.close()
 
 
-app = FastAPI(title='TE / TOE Replay v6', lifespan=lifespan)
+app = FastAPI(title='TE / TOE Replay v8', lifespan=lifespan)
 app.add_middleware(GZipMiddleware, minimum_size=1000)
 app.mount('/static', StaticFiles(directory=HERE/'static'),name='static')
 
@@ -124,48 +129,60 @@ def bootstrap():
         info = dict(info)
         info['rateScaleGbps'] = (info.get('rateScaleGbps') or 1) * scale
         info['throughputScale'] = scale
+        info['cases'] = [dict(c,topologyStates=[dict(s,edges=[dict(e,capacity=e['capacity']*scale)
+                          for e in s['edges']]) for s in c['topologyStates']],
+                          finalEdges=[dict(e,capacity=e['capacity']*scale) for e in c['finalEdges']])
+                         for c in info['cases']]
     return info
 
 
 @app.get('/api/frames')
-def frames(start:float=Query(0,ge=0),end:float=Query(20,ge=0)):
+def frames(start:float=Query(0,ge=0),end:float=Query(.5,ge=0)):
     info = ready()
-    if end<=start or end-start>30:
-        raise HTTPException(400,'Request a positive interval of at most 30 simulation seconds')
+    if not math.isfinite(start) or not math.isfinite(end) or end<=start or end-start>2:
+        raise HTTPException(400,'Request a positive interval of at most 2 simulation seconds')
     scale = getattr(app.state, 'scale', 1)
     with connection() as db:
-        cases = {}
+        cases = {}; progress = {}
         for c in info['cases']:
             case_frames = [decode_frame(r[0]) for r in db.execute('SELECT data FROM frames WHERE case_id=? AND t1>? AND t0<? ORDER BY t0',(c['id'],start,end))]
             if scale != 1:
                 for frame in case_frames:
+                    if frame['global'].get('injectionGbps') is not None:
+                        frame['global']['injectionGbps'] *= scale
                     for edge in frame.get('edges', []):
                         if edge.get('gbps') is not None:
                             edge['gbps'] *= scale
                         if edge.get('capacity') is not None:
                             edge['capacity'] *= scale
             cases[c['id']] = case_frames
-    return dict(start=start,end=end,cases=cases)
+            progress[c['id']] = progress_rows(db,c['id'],start,end)
+    return dict(start=start,end=end,cases=cases,progress=progress)
 
 
 @app.get('/api/completion')
-def completion():
-    return {'windowSeconds':.5,'cases':{c['id']:c['completionBins'] for c in ready()['cases']}}
+def completion(start:Optional[float]=Query(None,ge=0),end:Optional[float]=Query(None,ge=0),points:int=Query(800,ge=2,le=2000)):
+    info = ready()
+    try: start,end = interval(info,start,end)
+    except ValueError as error: raise HTTPException(400,str(error))
+    with connection() as db:
+        return dict(windowSeconds=info['windowSeconds'],start=start,end=end,
+                    cases={c['id']:completion_trend(db,c['id'],start,end,points) for c in info['cases']})
 
 
 @app.get('/api/paths')
-def paths(src:int,dst:int,start:float=Query(0,ge=0),end:float=Query(5,ge=0)):
+def paths(src:int,dst:int,start:float=Query(0,ge=0),end:float=Query(.5,ge=0)):
     info=ready()
     if src==dst or src not in info['topology']['leaves'] or dst not in info['topology']['leaves']:
         raise HTTPException(400,'Choose two different input switches')
-    if end<=start or end-start>10:
-        raise HTTPException(400,'Path detail requests are limited to 10 simulation seconds')
+    if not math.isfinite(start) or not math.isfinite(end) or end<=start or end-start>2:
+        raise HTTPException(400,'Path detail requests are limited to 2 simulation seconds')
     scale = getattr(app.state, 'scale', 1)
     result={}
     with connection() as db:
         for case in info['cases']:
             windows={}
-            for sample,t0,t1,sn,dn,mid,n in db.execute('SELECT sample,t0,t1,sn,dn,mid,bytes FROM node_paths WHERE case_id=? AND src=? AND dst=? AND t0>=? AND t0<? ORDER BY t0',(case['id'],src,dst,max(0,start-float(case['metadata'].get('sample_interval_ns',500000000))/1e9),end)):
+            for sample,t0,t1,sn,dn,mid,n in db.execute('SELECT sample,t0,t1,sn,dn,mid,bytes FROM node_paths WHERE case_id=? AND src=? AND dst=? AND t0>=? AND t0<? ORDER BY t0',(case['id'],src,dst,max(0,start-info['windowSeconds']-1e-9),end)):
                 if t1<=start: continue
                 windows.setdefault(str(sample),[]).append(dict(srcNode=sn,dstNode=dn,src=src,dst=dst,transit=mid,payloadBytes=n,gbps=n*8/(t1-t0)/1e9*scale))
             result[case['id']]=windows
@@ -173,24 +190,28 @@ def paths(src:int,dst:int,start:float=Query(0,ge=0),end:float=Query(5,ge=0)):
 
 
 @app.get('/api/trend')
-def trend(src:int,dst:int):
+def trend(src:int,dst:int,start:Optional[float]=Query(None,ge=0),end:Optional[float]=Query(None,ge=0),points:int=Query(800,ge=2,le=2000)):
     info = ready()
     if src not in info['topology']['leaves'] or dst not in info['topology']['leaves'] or src==dst:
         raise HTTPException(400,'Choose two different switches from the input topology')
     scale = getattr(app.state, 'scale', 1)
+    try: start,end = interval(info,start,end)
+    except ValueError as error: raise HTTPException(400,str(error))
     result = {}
     with connection() as db:
         for case in info['cases']:
-            rows = db.execute('SELECT g.t0,l.capacity,l.gbps,l.util,l.queue FROM global_samples g LEFT JOIN link_trends l ON l.case_id=g.case_id AND l.t0=g.t0 AND l.src=? AND l.dst=? WHERE g.case_id=? ORDER BY g.t0',(src,dst,case['id']))
-            result[case['id']] = [dict(time=t,capacity=(cap if cap is not None else 0)*scale,gbps=(rate or 0)*scale,utilization=u,queueMB=q) for t,cap,rate,u,q in rows]
+            result[case['id']] = link_trend(db,case['id'],src,dst,start,end,points,scale)
     return dict(src=src,dst=dst,cases=result)
 
 
 @app.get('/api/global-trend')
-def global_trend():
+def global_trend(start:Optional[float]=Query(None,ge=0),end:Optional[float]=Query(None,ge=0),points:int=Query(800,ge=2,le=2000)):
     info = ready()
+    try: start,end = interval(info,start,end)
+    except ValueError as error: raise HTTPException(400,str(error))
+    scale = getattr(app.state,'scale',1)
     with connection() as db:
-        return {'cases':{c['id']:[dict(time=t,end=end,maxUtilization=u,hotLinks=h,measuredLinks=n) for t,end,u,h,n in db.execute('SELECT t0,t1,max_util,hot,measured FROM global_samples WHERE case_id=? ORDER BY t0',(c['id'],))] for c in info['cases']}}
+        return dict(start=start,end=end,cases={c['id']:query_global(db,c['id'],start,end,points,scale) for c in info['cases']})
 
 
 if __name__=='__main__':
@@ -203,9 +224,9 @@ if __name__=='__main__':
     parser.add_argument('--cache',type=Path)
     args = parser.parse_args()
     if args.smoke:
-        args.manifest = HERE/'smoke/experiment.json'
+        args.manifest = HERE/'smoke10ms/experiment.json'
         os.environ['REPLAY_ALLOW_SYNTHETIC']='1'
-        os.environ['REPLAY_CACHE']=str(HERE/'cache/smoke.sqlite')
+        os.environ['REPLAY_CACHE']=str(HERE/'cache/smoke-v8.sqlite')
         print('SMOKE: synthetic fixture, not ns-3 experiment results.',flush=True)
     if args.manifest is None and 'REPLAY_MANIFEST' not in os.environ:
         parser.error('provide --manifest for actual logs, or explicitly use --smoke')

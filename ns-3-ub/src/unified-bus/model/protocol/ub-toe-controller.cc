@@ -9,6 +9,7 @@
 #include "ns3/ub-link.h"
 #include "ns3/ub-network-address.h"
 #include "ns3/ub-port.h"
+#include "ns3/ub-replay-logger.h"
 #include "ns3/ub-routing-process.h"
 #include "ns3/ub-switch.h"
 #include "ns3/ub-te-controller.h"
@@ -389,6 +390,7 @@ void UbToeController::BeginReconfiguration(const UbToeSolver::Topology& target,
     m_paused = true;
     m_pauseStart = Simulator::Now();
     m_drainPolls = 0;
+    UbReplayLogger::Get().ToePhase(m_epoch, "draining");
     WriteSummary(result, "draining");
     WriteReconfiguration("draining");
     WriteCircuits(m_plan.retained, "retained");
@@ -450,6 +452,7 @@ void UbToeController::PollDrain()
     else ++m_drainPolls;
     if (m_drainPolls >= 2)
     {
+        UbReplayLogger::Get().ToePhase(m_epoch, "guard");
         m_drainFinish = Simulator::Now();
         m_guardTxPackets.clear();
         for (const auto& [leaf, ports] : m_plan.changedPorts)
@@ -469,6 +472,7 @@ void UbToeController::AbortReconfiguration()
     if (!m_paused) return;
     if (m_drainEvent.IsPending()) Simulator::Cancel(m_drainEvent);
     if (m_applyEvent.IsPending()) Simulator::Cancel(m_applyEvent);
+    UbReplayLogger::Get().ToePhase(m_epoch, "drain-timeout");
     WriteSummary(m_pendingResult, "drain-timeout");
     WriteReconfiguration("drain-timeout");
     std::ofstream errors(m_outputDir + "/toe_errors.log", std::ios::app);
@@ -499,6 +503,7 @@ void UbToeController::ResumeTraffic()
     for (const auto& [leaf, ports] : m_plan.changedPorts)
         for (uint16_t portId : ports) wakePorts.insert({leaf, portId});
     m_paused = false;
+    UbReplayLogger::Get().ToePhase(m_epoch, "steady");
     m_pendingTopology.clear();
     m_plan = {};
     m_guardTxPackets.clear();
@@ -520,10 +525,12 @@ void UbToeController::ApplyReconfiguration()
                 ->GetTxPackets() != packets) quietGuard = false;
     if (!quietGuard || !IsDrained())
     {
+        UbReplayLogger::Get().ToePhase(m_epoch, "draining");
         m_drainPolls = 0;
         m_drainEvent = Simulator::Schedule(MicroSeconds(100), &UbToeController::PollDrain, this);
         return;
     }
+    UbReplayLogger::Get().BeforeTopologyChange();
     for (const auto& pair : m_plan.added)
     {
         auto pa = DynamicCast<UbPort>(NodeList::GetNode(pair.a)->GetDevice(pair.ap));
@@ -554,6 +561,7 @@ void UbToeController::ApplyReconfiguration()
     for (auto& [edge, ports] : m_linkPorts) std::sort(ports.begin(), ports.end());
     NS_ABORT_MSG_IF(CurrentTopology() != m_pendingTopology || !VerifyPhysicalTopology(),
                     "ToE physical port readback does not match target topology");
+    UbReplayLogger::Get().TopologyApplied(m_epoch);
     if (m_mode == Mode::WITH_TE)
     {
         for (uint32_t nodeId = 0; nodeId < NodeList::GetNNodes(); ++nodeId)

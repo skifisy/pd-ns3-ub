@@ -1,0 +1,4 @@
+event_id,time_ns,event,topology_epoch,te_epoch,toe_decision_epoch,toe_phase
+0,0,run-start,0,0,0,steady
+1,253500000,topology-applied,1,0,1,steady
+2,1000000000,run-finish,1,0,1,finished

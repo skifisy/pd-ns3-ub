@@ -3,10 +3,12 @@
 
 #include "ns3/boolean.h"
 #include "ns3/command-line.h"
+#include "ns3/global-value.h"
 #include "ns3/node-list.h"
 #include "ns3/ub-app.h"
 #include "ns3/ub-link.h"
 #include "ns3/ub-port.h"
+#include "ns3/ub-replay-logger.h"
 #include "ns3/ub-traffic-gen.h"
 #include "ns3/ub-te-controller.h"
 #include "ns3/ub-toe-controller.h"
@@ -68,6 +70,8 @@ struct QuickExampleOptions
     double toeMluSlack = 0.01;
     double toeSwitchDelaySeconds = 0.0;
     std::string toeOutput;
+    bool replay = false;
+    std::string replayCommandLine;
 };
 
 struct DropAbortState
@@ -482,6 +486,8 @@ void
 BuildScenarioFromConfig(const QuickExampleOptions& options, const RuntimeSelection& runtime)
 {
     const std::string& configPath = options.configPath;
+    NS_ABORT_MSG_IF(options.replay && runtime.enableMpi,
+                    "Replay telemetry supports local single/MTP runs; MPI output is not implemented");
     const Time linkOffsetWindow =
         ParseOffsetWindow(options.linkDelayOffsetWindow, "--link-delay-offset-window");
     UbUtils::Get()->SetComponentsAttribute(configPath + "/network_attribute.txt");
@@ -524,6 +530,67 @@ BuildScenarioFromConfig(const QuickExampleOptions& options, const RuntimeSelecti
     }
     UbUtils::Get()->CreateTp(configPath + "/transport_channel.csv");
     UbUtils::Get()->TopoTraceConnect();
+
+    if (options.replay)
+    {
+        // Resolve from the same validated inputs that configured the controllers.
+        // Keep dashboard's existing mode vocabulary; WCMP is represented as TE.
+        const std::string mode = options.toeMode == "te" ? "toe+te"
+                                 : options.toeMode == "only" ? "toe-only"
+                                 : useJupiterTe ? "te" : "ecmp";
+        const std::string caseId = options.toeMode == "only" ? "toe" : mode;
+        BooleanValue taskTraceEnabled(false);
+        const bool nativeTaskTrace = UbUtils::IsTraceEnabled() &&
+            GlobalValue::GetValueByNameFailSafe("UB_TASK_TRACE_ENABLE", taskTraceEnabled) &&
+            taskTraceEnabled.Get();
+        auto& replay = UbReplayLogger::Get();
+        // One flag enables a complete replay dataset. No extra mode, ID,
+        // sampling, task-log or path-log command-line arguments are required.
+        replay.Configure(configPath, "", caseId, mode, MilliSeconds(500),
+                         false, false, true, !nativeTaskTrace, "all", ModeUsesMtp(runtime.mode));
+        replay.Metadata("command_line", options.replayCommandLine);
+        replay.Metadata("source_revision", "unknown");
+        replay.Metadata("routing_method", useJupiterTe ? "wcmp" : "ecmp");
+        replay.Metadata("topology_control", options.toeMode == "off" ? "static" : "toe");
+        replay.Metadata("task_data_source", nativeTaskTrace ? "native-task-trace" : "replay-task-events");
+        replay.Metadata("replay_profile", "500ms-all-links-node-pair-full-path-aggregation");
+        replay.Metadata("runtime", ModeUsesMtp(runtime.mode) ? "local-mtp" : "single-process-single-thread");
+        replay.Metadata("requested_mtp_threads", std::to_string(options.mtpThreads));
+        replay.Metadata("rng_seed", std::to_string(options.rngRun));
+        replay.Metadata("stop_ms", std::to_string(options.stopMs));
+        const auto precise = [](double value) {
+            std::ostringstream text;
+            text << std::setprecision(17) << value;
+            return text.str();
+        };
+        replay.Metadata("te_recompute_seconds", precise(options.teRecomputeSeconds));
+        replay.Metadata("te_history_windows", std::to_string(options.teHistoryWindows));
+        replay.Metadata("te_s", precise(options.teS));
+        replay.Metadata("toe_recompute_seconds", precise(options.toeRecomputeSeconds));
+        replay.Metadata("toe_history_windows", std::to_string(options.toeHistoryWindows));
+        replay.Metadata("toe_mlu_slack", precise(options.toeMluSlack));
+        replay.Metadata("toe_switch_delay_seconds", precise(options.toeSwitchDelaySeconds));
+        replay.Metadata("toe_reconfiguration", options.toeReconfiguration);
+        replay.Metadata("dependency_visibility_delay_argument", options.dependencyVisibilityDelay);
+        replay.Metadata("initial_task_start_offset_window", options.initialTaskStartOffsetWindow);
+        replay.Metadata("link_delay_offset_window", options.linkDelayOffsetWindow);
+        replay.Metadata("timing_offset_seed", std::to_string(options.timingOffsetSeed));
+        replay.Metadata("te_log_directory", useJupiterTe
+            ? (options.teOutput.empty() ? configPath + "/jupiter_te" : options.teOutput) : "");
+        replay.Metadata("toe_log_directory", options.toeMode != "off"
+            ? (options.toeOutput.empty() ? configPath + "/toe" : options.toeOutput) : "");
+        replay.InputFingerprint("traffic", configPath + "/traffic.csv");
+        replay.InputFingerprint("nodes", configPath + "/node.csv");
+        replay.InputFingerprint("initial_topology", configPath + "/topology.csv");
+        replay.InputFingerprint("network_attributes", configPath + "/network_attribute.txt");
+        replay.InputFingerprint("routing_table", configPath + "/routing_table.csv");
+        std::cout << "[INFO] Replay telemetry: mode=" << mode
+                  << ", case_id=" << caseId
+                  << ", directory=" << configPath + "/replay"
+                  << ", interval=500ms, scope=all, aggregation=node_pair, paths=all"
+                  << ", task_source=" << (nativeTaskTrace ? "native-task-trace" : "replay-task-events")
+                  << std::endl;
+    }
 
     const bool shouldPrint = !runtime.enableMpi || runtime.mpiRank == 0;
     if (shouldPrint && linkOffsetWindow.IsStrictlyPositive())
@@ -825,10 +892,22 @@ QuickExampleOptions ParseOptions(int argc, char* argv[])
     cmd.AddValue("toe-switch-delay-seconds", "OCS reconnection delay (default 0s)",
                  options.toeSwitchDelaySeconds);
     cmd.AddValue("toe-output", "ToE audit output directory", options.toeOutput);
+    cmd.AddValue("replay", "Write complete 500ms replay logs; infer ECMP/TE(WCMP)/ToE mode automatically",
+                 options.replay);
     cmd.AddNonOption("casePath",
                      "Required unified-bus case directory when --case-path is omitted",
                      positionalCasePath);
     cmd.Parse(argc, argv);
+    // Shell-style quoting is for human reproducibility only; this string is
+    // recorded as CSV metadata and is never executed by the simulator.
+    for (int i = 0; i < argc; ++i)
+    {
+        if (i) options.replayCommandLine += ' ';
+        options.replayCommandLine += '\'';
+        for (char c : std::string(argv[i]))
+            options.replayCommandLine += c == '\'' ? "'\\''" : std::string(1, c);
+        options.replayCommandLine += '\'';
+    }
     if (options.debugTe && !options.jupiterTe)
     {
         if (options.toeMode != "te") {
@@ -976,6 +1055,8 @@ PhaseTiming RunScenario(const QuickExampleOptions& options,
     ApplyDependencyVisibilityLookaheadBound(runtime);
     ConfigureCanonicalOutput(options, runtime);
     ConfigureInitialTaskStartOffset(options, runtime);
+    UbReplayLogger::Get().Metadata("resolved_dependency_visibility_delay_ps",
+        std::to_string(UbTrafficGen::Get()->GetDependencyVisibilityDelay().GetPicoSeconds()));
     ResetDropAbortState();
     GetDropAbortState().retransEnabled = IsRetransEnabledForRun();
     ActivateTrafficFromConfig(options.configPath,
@@ -988,6 +1069,19 @@ PhaseTiming RunScenario(const QuickExampleOptions& options,
         Simulator::Stop(MilliSeconds(options.stopMs));
     }
     Simulator::Run();
+    if (UbReplayLogger::Get().Enabled())
+    {
+        const auto counts = UbTrafficGen::Get()->GetTaskStateCounts();
+        auto& replay = UbReplayLogger::Get();
+        replay.Metadata("total_tasks", std::to_string(counts.total));
+        replay.Metadata("pending_tasks", std::to_string(counts.pending));
+        replay.Metadata("ready_tasks", std::to_string(counts.ready));
+        replay.Metadata("running_tasks", std::to_string(counts.running));
+        replay.Metadata("completed_tasks", std::to_string(counts.completed));
+        replay.Finish(GetDropAbortState().triggered ? "drop-without-retransmission"
+                      : counts.completed == counts.total ? "all-tasks-completed"
+                      : options.stopMs > 0 ? "stop-time" : "simulator-stopped");
+    }
     UbTeController::Get().FlushFinalWindow();
     UbTeController::Get().Disable();
     timing.simulationEnd = std::chrono::high_resolution_clock::now();

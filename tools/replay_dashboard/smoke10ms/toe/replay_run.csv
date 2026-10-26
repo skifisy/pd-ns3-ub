@@ -1,0 +1,10 @@
+key,value
+schema_version,2
+case_id,toe
+mode,toe-only
+synthetic,true
+sample_interval_ns,10000000
+aggregation,node_pair
+node_path_enabled,true
+detail_windows,all
+traffic_fnv1a64,SYNTHETIC-V8-SAME-WORKLOAD

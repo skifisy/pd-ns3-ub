@@ -16,3 +16,21 @@ main{margin-bottom:65px}
 #playbackState{min-width:60px}
 
 .playback-status #speed{width:140px;max-width:140px;padding:5px;font-size:10px}
+/* v8: independent hotspot layer and live network metrics. */
+.heading-right{flex-wrap:wrap;justify-content:flex-end}
+#heatToggle,.trend-toolbar button{border:1px solid #b5cbd7;border-radius:5px;background:#fff;color:#244c69;font:11px system-ui;padding:7px 10px;cursor:pointer;white-space:nowrap}
+#heatToggle[aria-pressed=true]{background:#e7f2f6;border-color:#79a9c4}
+#heatToggle:focus-visible,.trend-toolbar button:focus-visible{outline:3px solid #8bbcd8;outline-offset:2px}
+#heatToggle:disabled{opacity:.5;cursor:wait}
+.heat-off .heat-key{display:none}
+.heat-legend .transit{border-color:#7852bb;border-width:3px}
+.network-row{height:clamp(220px,25vh,280px);grid-template-columns:150px minmax(0,1fr) 275px}
+.global-live{gap:7px}.global-live label{display:block;width:auto;margin-bottom:2px}.global-live b{font-size:15px}.global-live small{margin-top:2px}
+.performance-evidence{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:10px;margin-top:8px}
+.performance-evidence article{background:#fff;border:1px solid var(--line);border-radius:5px;min-width:0;padding:9px 11px 3px}
+#utilMetric{width:175px;max-width:175px;font:10px system-ui;padding:3px}
+.trend-toolbar{display:flex;align-items:center;gap:8px;margin-top:12px;color:var(--muted);font-size:9px}.trend-toolbar span{margin-right:auto}.trend-toolbar button{font-size:10px;padding:5px 9px}
+.chart{height:130px}.playback-status{gap:8px}.playback-status #speed{width:70px;max-width:70px}.playback-status #currentClock,.playback-status #endClock{min-width:74px}
+@media(max-width:1450px){.network-row{grid-template-columns:125px minmax(0,1fr) 240px}.global-live b{font-size:14px}}
+@media(max-width:1050px){.network-row{grid-template-columns:115px minmax(0,1fr) 210px}.heading-right{gap:7px}.heat-legend{flex-wrap:wrap}.playback-status button{padding:7px 8px}}
+.transit-legend{font-size:9px;line-height:1.5}.transit-legend span{white-space:nowrap}

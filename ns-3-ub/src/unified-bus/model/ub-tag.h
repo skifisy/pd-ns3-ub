@@ -25,6 +25,27 @@ private:
     uint32_t m_originJetty{0};
 };
 
+/** Bounded replay provenance. Simulation-only: adds no on-wire bytes. */
+class UbReplayPathTag : public Tag {
+public:
+    uint32_t sourceNode{0}, destinationNode{0}, sourceLeaf{0}, destinationLeaf{0}, payloadBytes{0};
+    static TypeId GetTypeId() {
+        static TypeId tid = TypeId("ns3::UbReplayPathTag").SetParent<Tag>().AddConstructor<UbReplayPathTag>();
+        return tid;
+    }
+    TypeId GetInstanceTypeId() const override { return GetTypeId(); }
+    uint32_t GetSerializedSize() const override { return 20; }
+    void Serialize(TagBuffer b) const override {
+        b.WriteU32(sourceNode); b.WriteU32(destinationNode); b.WriteU32(sourceLeaf);
+        b.WriteU32(destinationLeaf); b.WriteU32(payloadBytes);
+    }
+    void Deserialize(TagBuffer b) override {
+        sourceNode=b.ReadU32(); destinationNode=b.ReadU32(); sourceLeaf=b.ReadU32();
+        destinationLeaf=b.ReadU32(); payloadBytes=b.ReadU32();
+    }
+    void Print(std::ostream& out) const override { out << sourceLeaf << "->" << destinationLeaf; }
+};
+
 enum class PacketType {
     PACKET,
     ACK,

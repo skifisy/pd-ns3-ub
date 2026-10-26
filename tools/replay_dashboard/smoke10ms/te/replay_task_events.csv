@@ -1,0 +1,13 @@
+case_id,time_ns,event,task_kind,node_id,task_id
+te,0,start,WQE,0,1
+te,110000000,complete,WQE,0,1
+te,20000000,start,WQE,0,2
+te,250000000,complete,WQE,0,2
+te,40000000,start,WQE,0,3
+te,430000000,complete,WQE,0,3
+te,60000000,start,WQE,0,4
+te,630000000,complete,WQE,0,4
+te,80000000,start,WQE,0,5
+te,790000000,complete,WQE,0,5
+te,100000000,start,WQE,0,6
+te,910000000,complete,WQE,0,6

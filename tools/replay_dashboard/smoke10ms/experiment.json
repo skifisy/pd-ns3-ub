@@ -1,0 +1,36 @@
+{
+  "title": "SMOKE v8 · 10 ms 合成数据（非仿真结果）",
+  "synthetic": true,
+  "window_ms": 10,
+  "throughputScale": 100000,
+  "topology": "topology",
+  "workload": "topology/traffic.csv",
+  "focus": {
+    "src": 10,
+    "dst": 11
+  },
+  "recording": {
+    "start_seconds": 0,
+    "end_seconds": 1
+  },
+  "cases": [
+    {
+      "id": "ecmp",
+      "mode": "ecmp",
+      "label": "ECMP",
+      "path": "ecmp"
+    },
+    {
+      "id": "te",
+      "mode": "te",
+      "label": "TE",
+      "path": "te"
+    },
+    {
+      "id": "toe",
+      "mode": "toe-only",
+      "label": "TOE",
+      "path": "toe"
+    }
+  ]
+}

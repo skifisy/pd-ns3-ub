@@ -2,6 +2,7 @@
 #include "ns3/ub-te-controller.h"
 #include "ns3/ub-network-address.h"
 #include "ns3/ub-port.h"
+#include "ns3/ub-replay-logger.h"
 #include "ns3/ub-link.h"
 #include "ns3/ub-routing-process.h"
 #include "ns3/ub-te-solver.h"
@@ -1154,6 +1155,7 @@ void UbTeController::Recompute()
         std::lock_guard<std::mutex> lock(m_mutex);
         WriteDebugProgressLocked("epoch");
     }
+    UbReplayLogger::Get().TePolicyPublished(epoch, solverRan);
     if (m_enabled.load(std::memory_order_acquire) &&
         m_periodicEventsActive.load(std::memory_order_acquire))
     {

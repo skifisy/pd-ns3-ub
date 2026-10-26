@@ -1,4 +1,4 @@
-"""Stream replay v1/v2 into disk-backed task statistics and indexed 500 ms playback."""
+"""Stream replay logs into disk-backed statistics and indexed 10 ms playback."""
 import argparse
 import hashlib
 import json
@@ -14,7 +14,7 @@ from progress import Progress
 from task_store import (create_tables, import_workload, import_tasks, completion_buckets,
                         common_quantiles, task_sources, picoseconds)
 
-CACHE_SCHEMA = 6
+CACHE_SCHEMA = 8
 
 
 def dumps(value):
@@ -54,7 +54,7 @@ def quantile(values, q=.99, ordered=False):
 def fingerprint(manifest):
     manifest = Path(manifest).resolve()
     config = json.loads(manifest.read_text(encoding='utf-8'))
-    files = {manifest, Path(__file__), Path(__file__).with_name('topology.py'), Path(__file__).with_name('recording.py'), Path(__file__).with_name('progress.py'), Path(__file__).with_name('task_store.py')}
+    files = {manifest, Path(__file__), Path(__file__).with_name('topology.py'), Path(__file__).with_name('recording.py'), Path(__file__).with_name('progress.py'), Path(__file__).with_name('task_store.py'), Path(__file__).with_name('queries.py')}
     root = manifest.parent
     for case in config['cases']:
         case_path = (root / case['path']).resolve()
@@ -94,8 +94,10 @@ def load_case(db, root, config, topology, reporter):
         return float(match[1])*{'ps':1e-12,'ns':1e-9,'us':1e-6,'ms':1e-3,'s':1,'min':60,'h':3600}[match[2]]
     detail_windows=None if detail_spec=='all' else ([] if detail_spec in ('none','') else [[seconds(v) for v in w.split(':')] for w in detail_spec.split(',')])
     has_node_paths=has_node_paths and metadata.get('node_path_enabled','true')!='false'
-    if metadata.get('schema_version')=='2' and abs(float(metadata.get('sample_interval_ns',0))-500000000)>1e-3:
-        raise ValueError(f'{case_id}: collect v2 logs with --replay-interval=500ms')
+    step_ms = float(config['window_ms'])
+    if abs(float(metadata.get('sample_interval_ns',0))-step_ms*1e6)>1e-3:
+        raise ValueError(f'{case_id}: sample interval differs from window_ms={step_ms:g}; '
+                         f'recollect with --replay-interval={step_ms:g}ms (old samples cannot be subdivided)')
     te_directory = audit_directory(root, path, config, metadata, 'jupiter_te')
     toe_directory = audit_directory(root, path, config, metadata, 'toe')
     case_files = [path/name for name in ('replay_run.csv','replay_topology.csv','replay_queue_samples.csv',
@@ -132,6 +134,9 @@ def load_case(db, root, config, topology, reporter):
             totals[pair]=(n+1,rate+snapshot_rates[epoch][endpoint])
         pair_totals[epoch]=totals
     connections_by_epoch = {epoch:{(a,b) for (a,_),(b,_) in peers.items()} for epoch,peers in snapshots.items()}
+    expected_access = {(a,b) for a,b in access_pairs if a in devices and b in leaves}
+    expected_fabric_by_epoch = {epoch:{(a,b) for a,b in pairs if a in leaves and b in leaves}
+                                for epoch,pairs in connections_by_epoch.items()}
     # Deduplicate repeated boundary snapshots per physical port before summing.
     # Disk-backed staging keeps queue preprocessing bounded by batch size.
     db.execute('DROP TABLE IF EXISTS queue_stage')
@@ -190,15 +195,27 @@ def load_case(db, root, config, topology, reporter):
         if sample is None:
             return
         duration = sample['end'] - sample['start']
-        if duration <= 0:
-            raise ValueError(f'{case_id}: non-positive link sample duration')
+        if duration <= 0 or duration > step_ms/1000+1e-9:
+            raise ValueError(f'{case_id}: invalid link sample duration for window_ms={step_ms:g}')
         rows = db.execute('SELECT src,dst,SUM(q) FROM queue_stage WHERE t=? AND top=? AND te=? AND phase=? GROUP BY src,dst',
                           (sample['endNs'], sample['topologyEpoch'], sample['teEpoch'], sample['phase'])).fetchall()
         queues = {(a, b): q / 1e6 for a, b, q in rows}
+        fabric_bits = fabric_capacity = access_bits = 0
+        # Missing access samples are unknown, never a fabricated zero throughput.
+        access_complete = bool(expected_access) and expected_access <= edges.keys()
+        expected_fabric = expected_fabric_by_epoch.get(sample['topologyEpoch'],set())
+        fabric_complete = bool(expected_fabric) and expected_fabric <= edges.keys()
         for k, edge in edges.items():
-            edge['gbps'] = round(edge.pop('wireBytes') * 8 / duration / 1e9, 6)
+            wire_bits = edge.pop('wireBytes') * 8
             bits = edge.pop('capacityBits')
-            edge['capacity'] = round(bits / duration / 1e9, 6)
+            if edge['src'] in leaves and edge['dst'] in leaves:
+                fabric_bits += wire_bits
+                fabric_capacity += bits
+            elif edge['src'] in devices and edge['dst'] in leaves:
+                access_bits += wire_bits
+            # Preserve precision before display scaling (e.g. Mbps -> Gbps).
+            edge['gbps'] = wire_bits / duration / 1e9
+            edge['capacity'] = bits / duration / 1e9
             edge['queueMB'] = queues.get(k)
             edge['utilization'] = edge['gbps'] / edge['capacity'] if edge['capacity'] else None
         frame = {k: v for k, v in sample.items() if k != 'endNs'}
@@ -207,6 +224,9 @@ def load_case(db, root, config, topology, reporter):
         fabric = [e for e in frame['edges'] if e['src'] in leaves and e['dst'] in leaves]
         measured = [e for e in fabric if e['utilization'] is not None]
         frame['global'] = dict(maxUtilization=max((e['utilization'] for e in measured),default=None),
+                               fabricUtilization=fabric_bits/fabric_capacity if fabric_complete and fabric_capacity else None,
+                               injectionGbps=access_bits/duration/1e9 if access_complete else None,
+                               accessComplete=access_complete,fabricComplete=fabric_complete,
                                hotLinks=sum(e['utilization'] >= threshold for e in measured) if measured else None,
                                measuredLinks=len(measured),
                                queueMB=sum(e['queueMB'] for e in fabric if e['queueMB'] is not None) if any(e['queueMB'] is not None for e in fabric) else None)
@@ -222,7 +242,12 @@ def load_case(db, root, config, topology, reporter):
             sampled_routes.setdefault((a,b,m),[sample['start'],sample['end']])
         frame['nodePaths'] = []
         db.execute('UPDATE node_path_stage SET used=1 WHERE sample=? AND t0=? AND t1=? AND top=? AND te=? AND toe=?',window)
-        db.execute('INSERT INTO global_samples VALUES(?,?,?,?,?,?)',(case_id,sample['start'],sample['end'],frame['global']['maxUtilization'],frame['global']['hotLinks'],len(measured)))
+        db.execute('INSERT INTO global_samples VALUES(?,?,?,?,?,?,?,?,?,?,?)',
+                   (case_id,sample['start'],sample['end'],frame['global']['maxUtilization'],
+                    frame['global']['hotLinks'],len(measured),
+                    access_bits if access_complete else None,duration if access_complete else 0,
+                    fabric_bits if fabric_complete else None,fabric_capacity if fabric_complete else None,
+                    frame['global']['fabricUtilization']))
         db.executemany('INSERT INTO link_trends VALUES(?,?,?,?,?,?,?,?)',[(case_id,sample['start'],e['src'],e['dst'],e['capacity'],e['gbps'],e['utilization'],e['queueMB']) for e in fabric])
         blob = zlib.compress(dumps(frame).encode(), 3)
         db.execute('INSERT INTO frames VALUES(?,?,?,?)', (case_id, sample['start'], sample['end'], blob))
@@ -314,6 +339,9 @@ def prepare(manifest_path, cache_path, force=False, progress=None):
             except sqlite3.DatabaseError:
                 pass
     config = json.loads(manifest_path.read_text(encoding='utf-8'))
+    step_ms = float(config.get('window_ms',10))
+    if not math.isfinite(step_ms) or step_ms <= 0 or picoseconds(step_ms,10**9) <= 0:
+        raise ValueError('window_ms must be a positive finite sampling interval')
     if not config.get('cases') or len({c['id'] for c in config['cases']}) != len(config['cases']):
         raise ValueError('Experiment must contain cases with nonempty, unique ids')
     root = manifest_path.parent
@@ -337,7 +365,7 @@ def prepare(manifest_path, cache_path, force=False, progress=None):
     cases = []
     with sqlite3.connect(temporary) as db:
         db.executescript("PRAGMA journal_mode=DELETE; PRAGMA synchronous=NORMAL; PRAGMA temp_store=FILE; PRAGMA cache_size=-65536; PRAGMA mmap_size=0; CREATE TABLE metadata(key TEXT PRIMARY KEY,value TEXT); CREATE TABLE frames(case_id TEXT,t0 REAL,t1 REAL,data BLOB,PRIMARY KEY(case_id,t0)); CREATE INDEX frames_range ON frames(case_id,t1);")
-        db.executescript('CREATE TABLE global_samples(case_id TEXT,t0 REAL,t1 REAL,max_util REAL,hot INTEGER,measured INTEGER,PRIMARY KEY(case_id,t0)); CREATE TABLE link_trends(case_id TEXT,t0 REAL,src INTEGER,dst INTEGER,capacity REAL,gbps REAL,util REAL,queue REAL,PRIMARY KEY(case_id,src,dst,t0)); CREATE TABLE node_paths(case_id TEXT,sample INTEGER,t0 REAL,t1 REAL,sn INTEGER,dn INTEGER,src INTEGER,dst INTEGER,mid INTEGER,bytes INTEGER);')
+        db.executescript('CREATE TABLE global_samples(case_id TEXT,t0 REAL,t1 REAL,max_util REAL,hot INTEGER,measured INTEGER,access_bits INTEGER,access_duration REAL,fabric_bits INTEGER,fabric_capacity REAL,fabric_util REAL,PRIMARY KEY(case_id,t0)); CREATE TABLE link_trends(case_id TEXT,t0 REAL,src INTEGER,dst INTEGER,capacity REAL,gbps REAL,util REAL,queue REAL,PRIMARY KEY(case_id,src,dst,t0)); CREATE TABLE node_paths(case_id TEXT,sample INTEGER,t0 REAL,t1 REAL,sn INTEGER,dn INTEGER,src INTEGER,dst INTEGER,mid INTEGER,bytes INTEGER);')
         db.set_progress_handler(lambda: (reporter.update(),0)[1],200000)
         create_tables(db)
         reporter.stage('workload','分批导入 workload 到磁盘')
@@ -345,7 +373,7 @@ def prepare(manifest_path, cache_path, force=False, progress=None):
         for case in config['cases']:
             print(f"Preparing {case['id']} (streaming CSV → SQLite)", flush=True)
             reporter.stage('import','导入日志、聚合链路与节点路径',case['id'])
-            info = load_case(db, root, {**case,'hotspot_threshold':config.get('hotspot_threshold',.9)}, topology,reporter)
+            info = load_case(db, root, {**case,'window_ms':step_ms,'hotspot_threshold':threshold}, topology,reporter)
             cases.append(info)
             db.commit()
         reporter.stage('statistics','计算共同任务集与 FCT 分位数')
@@ -353,11 +381,8 @@ def prepare(manifest_path, cache_path, force=False, progress=None):
         if len(workload_fingerprints) > 1:
             raise ValueError('Input workload fingerprints differ across cases')
         common_count, baseline = common_quantiles(db,cases,config,reporter)
-        step_ms=float(config.get('window_ms',500))
-        if step_ms != 500:
-            raise ValueError('This release uses window_ms=500; native link collection must use --replay-interval=500ms')
         for case in cases:
-            case['completionBins']=completion_buckets(db,case['id'],picoseconds(step_ms,10**9),case['end'],reporter)
+            completion_buckets(db,case['id'],picoseconds(step_ms,10**9),case['end'],reporter,retain=False)
         recording = build_recording(config,cases,baseline,topology['leaves'])
         selected = None
         reporter.stage('indexing','建立路径查询索引')
@@ -379,7 +404,8 @@ def prepare(manifest_path, cache_path, force=False, progress=None):
         bootstrap = dict(title=config.get('title', 'TE / TOE 回放'), description=config.get('description', ''),
                          synthetic=bool(config.get('synthetic', False)) or any(c['synthetic'] for c in cases),
                          topologySource=config.get('topologySource', 'experiment node.csv / topology.csv'),
-                         topology=topology, cases=cases, commonTasks=common_count, windowSeconds=.5,
+                         topology=topology, cases=cases, commonTasks=common_count, windowSeconds=step_ms/1000,
+                         blockSeconds=max(step_ms/1000,min(.5,50*step_ms/1000)),
                          start=min(c['start'] for c in cases), end=max(c['end'] for c in cases),
                          focus=default_focus,
                          focusOptions=[dict(src=a,dst=b) for a in topology['leaves'] for b in topology['leaves'] if a!=b],
