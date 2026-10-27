@@ -37,54 +37,23 @@ class ReplayV8Checks(unittest.TestCase):
             windows=list(db.execute("SELECT t0,t1 FROM frames WHERE case_id='te' AND t0>=.1 AND t0<.11"))
             self.assertEqual(windows,[(.1,.1035),(.1035,.11)])
 
-    def test_old_log_storage_utilization_and_missing_decode_column(self):
+    def test_existing_tx_wire_bytes_drive_storage_throughput(self):
+        # Fixture logs intentionally contain no READ_RESPONSE-specific column.
         with sqlite3.connect(self.cache) as db:
             info=json.loads(db.execute("SELECT value FROM metadata WHERE key='bootstrap'").fetchone()[0])
             te=next(c for c in info['cases'] if c['id']=='te')
             self.assertTrue(te['storageSampleComplete'])
             self.assertIsNotNone(te['storageUtilization'])
-            self.assertGreaterEqual(te['storageUtilization'],0)
             frame=decode_frame(db.execute("SELECT data FROM frames WHERE case_id='te' AND t0=.11").fetchone()[0])
-            self.assertIsNone(frame['global']['storageDecodeGbps'])
-            self.assertAlmostEqual(frame['global']['fabricUtilization'],.185)
-            points=global_trend(db,'te',.11,.12,2,100000)
-            self.assertIsNone(points[0]['storageDecodeGbps'])
-            self.assertAlmostEqual(points[0]['fabricUtilization'],.185)
-
-    def test_new_decode_counters_use_only_storage_direction(self):
-        copied=self.root/'decode'
-        shutil.copytree(HERE/'smoke10ms',copied)
-        for cid in ('ecmp','te','toe'):
-            path=copied/cid/'replay_link_samples.csv'
-            with path.open(newline='') as stream:
-                reader=csv.DictReader(stream)
-                fields=[*reader.fieldnames,'read_response_tx_wire_bytes']
-                rows=list(reader)
-            for row in rows:
-                # Compute hosts and fabric may also have traffic but must not
-                # contribute to the storage-side READ_RESPONSE metric.
-                is_storage=row['src_node']=='1' and row['dst_node']=='11'
-                row['read_response_tx_wire_bytes'] = (
-                    str(int(row['tx_wire_bytes'])//2) if is_storage
-                    else str(int(row['tx_wire_bytes']))
-                )
-            with path.open('w',newline='') as stream:
-                writer=csv.DictWriter(stream,fieldnames=fields)
-                writer.writeheader();writer.writerows(rows)
-        cache=self.root/'decode.sqlite'
-        prepare(copied/'experiment.json',cache)
-        with sqlite3.connect(cache) as db:
-            info=json.loads(db.execute("SELECT value FROM metadata WHERE key='bootstrap'").fetchone()[0])
-            case=next(c for c in info['cases'] if c['id']=='te')
-            self.assertIsNotNone(case['storageUtilization'])
-            frame=decode_frame(db.execute("SELECT data FROM frames WHERE case_id='te' AND t0=.11").fetchone()[0])
-            self.assertTrue(frame['global']['decodeSampleComplete'])
-            with (copied/'te/replay_link_samples.csv').open(newline='') as stream:
+            self.assertTrue(frame['global']['storageSampleComplete'])
+            with (HERE/'smoke10ms/te/replay_link_samples.csv').open(newline='') as stream:
                 selected=[row for row in csv.DictReader(stream)
                           if row['src_node']=='1' and row['dst_node']=='11'
                           and row['start_ns']=='110000000']
-            expected=sum(int(row['read_response_tx_wire_bytes']) for row in selected)*8/.01/1e9
+            expected=sum(int(row['tx_wire_bytes']) for row in selected)*8/.01/1e9
+            self.assertGreater(expected,0)
             self.assertAlmostEqual(frame['global']['storageDecodeGbps'],expected)
+            self.assertAlmostEqual(frame['global']['fabricUtilization'],.185)
             points=global_trend(db,'te',.11,.12,2,100000)
             self.assertAlmostEqual(points[0]['storageDecodeGbps'],expected*100000)
 

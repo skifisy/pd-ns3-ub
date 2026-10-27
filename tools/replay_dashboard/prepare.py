@@ -14,7 +14,7 @@ from progress import Progress
 from task_store import (create_tables, import_workload, import_tasks, completion_buckets,
                         common_quantiles, task_sources, picoseconds)
 
-CACHE_SCHEMA = 10
+CACHE_SCHEMA = 11
 
 
 def dumps(value):
@@ -203,28 +203,23 @@ def load_case(db, root, config, topology, reporter):
         rows = db.execute('SELECT src,dst,SUM(q) FROM queue_stage WHERE t=? AND top=? AND te=? AND phase=? GROUP BY src,dst',
                           (sample['endNs'], sample['topologyEpoch'], sample['teEpoch'], sample['phase'])).fetchall()
         queues = {(a, b): q / 1e6 for a, b, q in rows}
-        fabric_bits = fabric_capacity = storage_bits = storage_capacity = decode_bits = 0
-        # Missing storage ports or READ_RESPONSE counters are unknown, not zero.
+        fabric_bits = fabric_capacity = storage_bits = storage_capacity = 0
+        # Missing storage access ports are unknown, not zero.
         expected_counts = pair_totals.get(sample['topologyEpoch'], {})
         storage_complete = bool(expected_storage) and all(
             k in edges and k in expected_counts and
             edges[k]['circuits'] == expected_counts[k][0] for k in expected_storage)
-        decode_complete = storage_complete and all(
-            edges[k]['decodeComplete'] for k in expected_storage)
         expected_fabric = expected_fabric_by_epoch.get(sample['topologyEpoch'],set())
         fabric_complete = bool(expected_fabric) and expected_fabric <= edges.keys()
         for k, edge in edges.items():
             wire_bits = edge.pop('wireBytes') * 8
             bits = edge.pop('capacityBits')
-            decode_wire_bits = edge.pop('decodeWireBytes') * 8
-            edge.pop('decodeComplete')
             if edge['src'] in leaves and edge['dst'] in leaves:
                 fabric_bits += wire_bits
                 fabric_capacity += bits
             elif k in expected_storage:
                 storage_bits += wire_bits
                 storage_capacity += bits
-                decode_bits += decode_wire_bits
             # Preserve precision before display scaling (e.g. Mbps -> Gbps).
             edge['gbps'] = wire_bits / duration / 1e9
             edge['capacity'] = bits / duration / 1e9
@@ -237,9 +232,8 @@ def load_case(db, root, config, topology, reporter):
         measured = [e for e in fabric if e['utilization'] is not None]
         frame['global'] = dict(maxUtilization=max((e['utilization'] for e in measured),default=None),
                                fabricUtilization=fabric_bits/fabric_capacity if fabric_complete and fabric_capacity else None,
-                               storageDecodeGbps=decode_bits/duration/1e9 if decode_complete else None,
+                               storageDecodeGbps=storage_bits/duration/1e9 if storage_complete else None,
                                storageSampleComplete=storage_complete,
-                               decodeSampleComplete=decode_complete,
                                fabricComplete=fabric_complete,
                                hotLinks=sum(e['utilization'] >= threshold for e in measured) if measured else None,
                                measuredLinks=len(measured),
@@ -256,11 +250,11 @@ def load_case(db, root, config, topology, reporter):
             sampled_routes.setdefault((a,b,m),[sample['start'],sample['end']])
         frame['nodePaths'] = []
         db.execute('UPDATE node_path_stage SET used=1 WHERE sample=? AND t0=? AND t1=? AND top=? AND te=? AND toe=?',window)
-        db.execute('INSERT INTO global_samples VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)',
+        db.execute('INSERT INTO global_samples VALUES(?,?,?,?,?,?,?,?,?,?,?,?)',
                    (case_id,sample['start'],sample['end'],frame['global']['maxUtilization'],
                     frame['global']['hotLinks'],len(measured),
-                    decode_bits if decode_complete else None,duration if decode_complete else 0,
                     storage_bits if storage_complete else None,
+                    duration if storage_complete else 0,
                     storage_capacity if storage_complete else None,
                     fabric_bits if fabric_complete else None,fabric_capacity if fabric_complete else None,
                     frame['global']['fabricUtilization']))
@@ -299,25 +293,14 @@ def load_case(db, root, config, topology, reporter):
             raise ValueError(f'{case_id}: sample endpoint disagrees with applied topology: {src}:{port}->{dst}:{dp}')
         key = (src, dst)
         edge = edges.setdefault(key, dict(src=src, dst=dst, circuits=0, wireBytes=0,
-                                          capacityBits=0, decodeWireBytes=0, decodeComplete=True))
+                                          capacityBits=0))
         wire_bytes = int(r['tx_wire_bytes'])
         if wire_bytes < 0:
             raise ValueError(f'{case_id}: negative tx_wire_bytes in sample {sample_id}')
         edge['circuits'] += circuit_count
         edge['wireBytes'] += wire_bytes
         edge['capacityBits'] += float(r['capacity_bits'])
-        if src in storage_nodes and dst in leaves:
-            raw_decode = r.get('read_response_tx_wire_bytes')
-            if raw_decode is None or raw_decode == '':
-                edge['decodeComplete'] = False
-            else:
-                try:
-                    decode_bytes = int(raw_decode)
-                except ValueError as error:
-                    raise ValueError(f'{case_id}: invalid READ_RESPONSE bytes in sample {sample_id}') from error
-                if decode_bytes < 0 or decode_bytes > wire_bytes:
-                    raise ValueError(f'{case_id}: READ_RESPONSE bytes exceed total Tx bytes in sample {sample_id}')
-                edge['decodeWireBytes'] += decode_bytes
+
     save_frame()
     if db.execute('SELECT 1 FROM node_path_stage WHERE used=0 LIMIT 1').fetchone():
         raise ValueError(f'{case_id}: node path windows/epochs do not match link samples')
@@ -407,7 +390,7 @@ def prepare(manifest_path, cache_path, force=False, progress=None):
     cases = []
     with sqlite3.connect(temporary) as db:
         db.executescript("PRAGMA journal_mode=DELETE; PRAGMA synchronous=NORMAL; PRAGMA temp_store=FILE; PRAGMA cache_size=-65536; PRAGMA mmap_size=0; CREATE TABLE metadata(key TEXT PRIMARY KEY,value TEXT); CREATE TABLE frames(case_id TEXT,t0 REAL,t1 REAL,data BLOB,PRIMARY KEY(case_id,t0)); CREATE INDEX frames_range ON frames(case_id,t1);")
-        db.executescript('CREATE TABLE global_samples(case_id TEXT,t0 REAL,t1 REAL,max_util REAL,hot INTEGER,measured INTEGER,decode_bits INTEGER,decode_duration REAL,storage_bits INTEGER,storage_capacity REAL,fabric_bits INTEGER,fabric_capacity REAL,fabric_util REAL,PRIMARY KEY(case_id,t0)); CREATE TABLE link_trends(case_id TEXT,t0 REAL,src INTEGER,dst INTEGER,capacity REAL,gbps REAL,util REAL,queue REAL,PRIMARY KEY(case_id,src,dst,t0)); CREATE TABLE node_paths(case_id TEXT,sample INTEGER,t0 REAL,t1 REAL,sn INTEGER,dn INTEGER,src INTEGER,dst INTEGER,mid INTEGER,bytes INTEGER);')
+        db.executescript('CREATE TABLE global_samples(case_id TEXT,t0 REAL,t1 REAL,max_util REAL,hot INTEGER,measured INTEGER,storage_bits INTEGER,storage_duration REAL,storage_capacity REAL,fabric_bits INTEGER,fabric_capacity REAL,fabric_util REAL,PRIMARY KEY(case_id,t0)); CREATE TABLE link_trends(case_id TEXT,t0 REAL,src INTEGER,dst INTEGER,capacity REAL,gbps REAL,util REAL,queue REAL,PRIMARY KEY(case_id,src,dst,t0)); CREATE TABLE node_paths(case_id TEXT,sample INTEGER,t0 REAL,t1 REAL,sn INTEGER,dn INTEGER,src INTEGER,dst INTEGER,mid INTEGER,bytes INTEGER);')
         db.set_progress_handler(lambda: (reporter.update(),0)[1],200000)
         create_tables(db)
         reporter.stage('workload','分批导入 workload 到磁盘')

@@ -86,24 +86,18 @@ taskId,sourceNode,destNode,dataSize(Byte),opType,taskStartTime(us),taskCompletes
 
 | 指标 | 口径 |
 |---|---|
-| Decode / URMA READ 返回吞吐 | 存储节点 → Leaf 端口实际发送的 `READ_RESPONSE` wire bytes（含该报文头部、重传）× 8 / 采样窗口秒数 |
+| Decode / URMA READ 返回吞吐 | 使用已有的存储节点 → Leaf 接入端口 `tx_wire_bytes`，乘 8 再除以采样窗口秒数；包含协议头与重传 |
 | 全程存储侧利用率 | 完整实验期间所有存储节点 → Leaf 端口总发送比特 / 同口径全部链路的容量时间积分 |
 | Fabric 整体利用率 | Leaf 间所有有向链路发送比特数 / 容量时间积分总和 |
 | 最大利用率 | 当前窗口已采样 Leaf 间有向链路的最高利用率 |
 | 焦点链路发送 | 焦点 A→B 直连物理链路（含并行链路）的窗口平均发送速率 |
 | 节点载荷发送 | 源 Leaf 按实际首跳归属的端点业务载荷发送量，含重传 |
 
-Decode 专用计数来源于新版本 C++ Replay Logger 的 `read_response_tx_wire_bytes` 列，按原采样窗口输出；
-只在存储节点向 Leaf 的物理发送口进行协议识别，并使用 LP-local 累加器。
-旧日志缺少这一列时，实时 Decode 吞吐和趋势图显示「—」，不能冒充 0 Gbps；
-顶部存储侧全程利用率仍可使用旧日志的 `tx_wire_bytes` 和 `capacity_bits` 计算。
-真实零发送需要有完整采样及有效的新字段 `read_response_tx_wire_bytes=0`。
+中间 Decode 吞吐和顶部全程利用率都复用已有的 `tx_wire_bytes` 与 `capacity_bits`，不要求 `read_response_tx_wire_bytes` 字段；
+因此可以直接使用旧版 Replay 日志，无需重新编译或重新运行仿真。这里把存储 → Leaf 的全部端口发送量作为 Decode 返回流量的代理，前提是该实验中存储节点不发送其他业务类别。该指标是物理端口发送口径，包含协议开销与重传，并非去重后的业务 Payload Goodput。
 
 不能累加所有 Fabric 链路当作端到端吞吐；中转可能重复计数同一份数据。
-新 Decode 指标统计物理端口发送尝试，不是去重之后的目的端 Goodput；也不包括 READ 请求和非 READ_RESPONSE 业务流量。
-链路的实际序列化开销口径由采集器定义。存储节点识别与 `topology.py` 一致：
-非 SWITCH 节点中，64 个 UbPort 为计算端，其余为存储端；请检查实际实验的 node.csv 角色符合这一约定。
-使用旧 Replay 数据可计算顶部利用率；精确的 Decode 吞吐需重新运行带新采样器的仿真。
+存储节点识别与 `topology.py` 一致：非 SWITCH 节点中，64 个 UbPort 为计算端，其余为存储端；请检查实际实验的 node.csv 角色符合这一约定。
 
 `"throughputScale": 100000` 可将 4 Mbps 显示为 400 Gbps。显示速率、容量、路径速率和绘图速率尺度同步缩放。
 利用率、时间、FCT、任务数、原始载荷字节和队列大小保持原值。倍率必须为正有限数。

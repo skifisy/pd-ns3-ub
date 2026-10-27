@@ -42,15 +42,15 @@ def completion_trend(db, case_id, start, end, points):
 def global_trend(db, case_id, start, end, points, scale):
     width = (end-start)/points
     rows = db.execute('''SELECT MIN(t0),MAX(t1),MAX(max_util),MAX(hot),MIN(measured),
-        SUM(decode_bits),SUM(decode_duration),COUNT(decode_bits)=COUNT(*),
+        SUM(storage_bits),SUM(storage_duration),COUNT(storage_bits)=COUNT(*),
         SUM(fabric_bits),SUM(fabric_capacity),COUNT(fabric_bits)=COUNT(*)
         FROM global_samples WHERE case_id=? AND t0>=? AND t0<?
         GROUP BY CAST((t0-?)/? AS INTEGER) ORDER BY 1''',
         (case_id,start,end,start,width))
     return [dict(time=t,end=b,maxUtilization=u,hotLinks=h,measuredLinks=n,
-                 storageDecodeGbps=bits/duration/1e9*scale if decode_ok and duration else None,
+                 storageDecodeGbps=bits/duration/1e9*scale if storage_ok and duration else None,
                  fabricUtilization=wire/cap if fabric_ok and cap else None)
-            for t,b,u,h,n,bits,duration,decode_ok,wire,cap,fabric_ok in rows]
+            for t,b,u,h,n,bits,duration,storage_ok,wire,cap,fabric_ok in rows]
 
 
 def link_trend(db, case_id, src, dst, start, end, points, scale):
