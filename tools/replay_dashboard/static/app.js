@@ -94,8 +94,8 @@ function setup(){
  $('#globalCards').innerHTML=meta.cases.map((c,i)=>'<article class="global-card" style="--case:'+COLORS[i%3]+'"><div class="card-heading"><h2>'+esc(c.label)+'</h2><span>最终 FCT · 固定共同完成任务集</span></div><div class="quantiles">'+['p50','p90','p99'].map(k=>{
   const q=c.quantiles[k],gain=c.mode==='ecmp'?'基线':q.improvement==null?'无共同完成任务':(q.improvement>=0?'降低 ':'增加 ')+number(Math.abs(q.improvement))+'%';
   return '<div><div class="metric-label">'+k.toUpperCase()+'</div><div class="metric-value">'+number(q.seconds,3)+'<small>s</small></div><div class="gain '+(q.improvement<0?'regression':'')+'">'+gain+'</div></div>';
- }).join('')+'</div><div class="live-summary"><span>当前完成 <b id="complete-'+i+'">—</b> / '+c.totalTasks+'</span><span>进行中 <b id="running-'+i+'">—</b></span></div></article>').join('');
- $('#networks').innerHTML=meta.cases.map((c,i)=>'<article class="network-row" style="--case:'+COLORS[i%3]+'"><div class="case-side"><div><div class="case-name">'+esc(c.label)+'</div><div class="case-purpose">同一仿真时刻</div></div><div class="global-live"><div title="所有业务端到 Leaf 的发送量；含重传和控制流量"><label>接入发送吞吐</label><b id="throughput-'+i+'">—</b><small>Gbps · 发送口径</small></div><div title="Leaf 间发送比特数 / 有效容量时间积分"><label>Fabric 利用率</label><b id="util-'+i+'">—</b></div><div><label>最大利用率</label><b id="max-'+i+'">—</b></div><div><label>高负载方向</label><b id="hot-'+i+'">—</b><small>互连利用率 ≥ '+number(recording.hotspotThreshold*100,0)+'%</small></div></div></div><div class="network-space"><canvas class="network" id="network-'+i+'" aria-label="'+esc(c.label)+' 链路热力拓扑"></canvas><span class="network-watermark">上排 L＝交换机　下排 C＝计算 / S＝存储　接入间距已压缩</span></div><div class="action-side"><div class="action-label" id="action-label-'+i+'"></div><div class="action-title" id="action-title-'+i+'"></div><div class="action-lines" id="action-lines-'+i+'"></div><div class="action-footer" id="action-footer-'+i+'"></div></div></article>').join('');
+ }).join('')+'<div><div class="metric-label" title="全程存储节点 → Leaf 实际发送比特 / 全程存储接入容量时间积分">存储侧利用率</div><div class="metric-value">'+percent(c.storageUtilization)+'</div><div class="gain">完整仿真时间段</div></div></div><div class="live-summary"><span>当前完成 <b id="complete-'+i+'">—</b> / '+c.totalTasks+'</span><span>进行中 <b id="running-'+i+'">—</b></span></div></article>').join('');
+ $('#networks').innerHTML=meta.cases.map((c,i)=>'<article class="network-row" style="--case:'+COLORS[i%3]+'"><div class="case-side"><div><div class="case-name">'+esc(c.label)+'</div><div class="case-purpose">同一仿真时刻</div></div><div class="global-live"><div title="仅存储节点 → Leaf 的 URMA READ_RESPONSE 实际发送量，含该报文的头部和重传"><label>Decode 返回吞吐</label><b id="throughput-'+i+'">—</b><small>Gbps · 存储侧发送</small></div><div title="Leaf 间发送比特数 / 有效容量时间积分"><label>Fabric 利用率</label><b id="util-'+i+'">—</b></div><div><label>最大利用率</label><b id="max-'+i+'">—</b></div></div></div><div class="network-space"><canvas class="network" id="network-'+i+'" aria-label="'+esc(c.label)+' 链路热力拓扑"></canvas><span class="network-watermark">上排 L＝交换机　下排 C＝计算 / S＝存储　接入间距已压缩</span></div><div class="action-side"><div class="action-label" id="action-label-'+i+'"></div><div class="action-title" id="action-title-'+i+'"></div><div class="action-lines" id="action-lines-'+i+'"></div><div class="action-footer" id="action-footer-'+i+'"></div></div></article>').join('');
  $('#focus').innerHTML=meta.focusOptions.map(p=>'<option value="'+direction(p.src,p.dst)+'">L'+p.src+' → L'+p.dst+'</option>').join('');
  $('#focus').value=direction(S.focus.src,S.focus.dst);$('#focus').disabled=false;
  $('#focus').onchange=e=>{const [src,dst]=e.target.value.split('-').map(Number);cancelLoads(true);S.focus={src,dst};S.dirty=true;ensurePaths(S.time).catch(fail);loadHotspot().catch(fail);};
@@ -256,10 +256,9 @@ function action(c,frame,i){
 function draw(){
  meta.cases.forEach((c,i)=>{
   const frame=frameAt(c,S.time);S.frames[c.id]=frame;makeScene(c,frame,i);action(c,frame,i);
-  $('#throughput-'+i).textContent=number(frame.global?.injectionGbps,2);
+  $('#throughput-'+i).textContent=number(frame.global?.storageDecodeGbps,2);
   $('#util-'+i).textContent=percent(frame.global?.fabricUtilization);
   $('#max-'+i).textContent=percent(frame.global?.maxUtilization);
-  $('#hot-'+i).textContent=frame.global?.hotLinks??'—';
  });
 }
 function cursor(){
@@ -286,7 +285,7 @@ async function loadHotspot(force=false){
 }
 async function loadGlobal(){
  const request=++S.globalRequest,data=await get('/api/global-trend?'+trendQuery(throughputChart));if(request!==S.globalRequest)return;
- throughputChart.setOption({...chartBase(),series:meta.cases.map((c,i)=>({...line(c.id+'-throughput',data.cases[c.id].map(p=>[p.time,p.injectionGbps]),COLORS[i%3],false,c.label+' 接入发送 Gbps'),markLine:i===0?cursor():undefined}))},{notMerge:true});
+ throughputChart.setOption({...chartBase(),series:meta.cases.map((c,i)=>({...line(c.id+'-throughput',data.cases[c.id].map(p=>[p.time,p.storageDecodeGbps]),COLORS[i%3],false,c.label+' 存储 READ_RESPONSE Gbps'),markLine:i===0?cursor():undefined}))},{notMerge:true});
  const metric=$('#utilMetric').value;
  utilizationChart.setOption({...chartBase(),series:meta.cases.map((c,i)=>({...line(c.id+'-util',data.cases[c.id].map(p=>[p.time,finite(p[metric])?p[metric]*100:null]),COLORS[i%3],false,c.label+' 利用率 %'),markLine:i===0?cursor():undefined}))},{notMerge:true});
  globalChart.setOption({...chartBase(),grid:{left:39,right:28,top:16,bottom:25},yAxis:[{...chartBase().yAxis,max:v=>Math.max(100,Math.ceil(v.max/20)*20)},{...chartBase().yAxis,position:'right',splitLine:{show:false}}],series:meta.cases.flatMap((c,i)=>[

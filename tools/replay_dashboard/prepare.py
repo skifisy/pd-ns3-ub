@@ -14,7 +14,7 @@ from progress import Progress
 from task_store import (create_tables, import_workload, import_tasks, completion_buckets,
                         common_quantiles, task_sources, picoseconds)
 
-CACHE_SCHEMA = 9
+CACHE_SCHEMA = 10
 
 
 def dumps(value):
@@ -134,7 +134,10 @@ def load_case(db, root, config, topology, reporter):
             totals[pair]=(n+1,rate+snapshot_rates[epoch][endpoint])
         pair_totals[epoch]=totals
     connections_by_epoch = {epoch:{(a,b) for (a,_),(b,_) in peers.items()} for epoch,peers in snapshots.items()}
-    expected_access = {(a,b) for a,b in access_pairs if a in devices and b in leaves}
+    storage_nodes = {n['id'] for n in topology['nodes'] if n['role']=='storage-server'}
+    expected_storage = {(a,b) for a,b in access_pairs if a in storage_nodes and b in leaves}
+    if not expected_storage:
+        raise ValueError(f'{case_id}: no storage-server -> Leaf links in topology')
     expected_fabric_by_epoch = {epoch:{(a,b) for a,b in pairs if a in leaves and b in leaves}
                                 for epoch,pairs in connections_by_epoch.items()}
     # Deduplicate repeated boundary snapshots per physical port before summing.
@@ -200,19 +203,28 @@ def load_case(db, root, config, topology, reporter):
         rows = db.execute('SELECT src,dst,SUM(q) FROM queue_stage WHERE t=? AND top=? AND te=? AND phase=? GROUP BY src,dst',
                           (sample['endNs'], sample['topologyEpoch'], sample['teEpoch'], sample['phase'])).fetchall()
         queues = {(a, b): q / 1e6 for a, b, q in rows}
-        fabric_bits = fabric_capacity = access_bits = 0
-        # Missing access samples are unknown, never a fabricated zero throughput.
-        access_complete = bool(expected_access) and expected_access <= edges.keys()
+        fabric_bits = fabric_capacity = storage_bits = storage_capacity = decode_bits = 0
+        # Missing storage ports or READ_RESPONSE counters are unknown, not zero.
+        expected_counts = pair_totals.get(sample['topologyEpoch'], {})
+        storage_complete = bool(expected_storage) and all(
+            k in edges and k in expected_counts and
+            edges[k]['circuits'] == expected_counts[k][0] for k in expected_storage)
+        decode_complete = storage_complete and all(
+            edges[k]['decodeComplete'] for k in expected_storage)
         expected_fabric = expected_fabric_by_epoch.get(sample['topologyEpoch'],set())
         fabric_complete = bool(expected_fabric) and expected_fabric <= edges.keys()
         for k, edge in edges.items():
             wire_bits = edge.pop('wireBytes') * 8
             bits = edge.pop('capacityBits')
+            decode_wire_bits = edge.pop('decodeWireBytes') * 8
+            edge.pop('decodeComplete')
             if edge['src'] in leaves and edge['dst'] in leaves:
                 fabric_bits += wire_bits
                 fabric_capacity += bits
-            elif edge['src'] in devices and edge['dst'] in leaves:
-                access_bits += wire_bits
+            elif k in expected_storage:
+                storage_bits += wire_bits
+                storage_capacity += bits
+                decode_bits += decode_wire_bits
             # Preserve precision before display scaling (e.g. Mbps -> Gbps).
             edge['gbps'] = wire_bits / duration / 1e9
             edge['capacity'] = bits / duration / 1e9
@@ -225,8 +237,10 @@ def load_case(db, root, config, topology, reporter):
         measured = [e for e in fabric if e['utilization'] is not None]
         frame['global'] = dict(maxUtilization=max((e['utilization'] for e in measured),default=None),
                                fabricUtilization=fabric_bits/fabric_capacity if fabric_complete and fabric_capacity else None,
-                               injectionGbps=access_bits/duration/1e9 if access_complete else None,
-                               accessComplete=access_complete,fabricComplete=fabric_complete,
+                               storageDecodeGbps=decode_bits/duration/1e9 if decode_complete else None,
+                               storageSampleComplete=storage_complete,
+                               decodeSampleComplete=decode_complete,
+                               fabricComplete=fabric_complete,
                                hotLinks=sum(e['utilization'] >= threshold for e in measured) if measured else None,
                                measuredLinks=len(measured),
                                queueMB=sum(e['queueMB'] for e in fabric if e['queueMB'] is not None) if any(e['queueMB'] is not None for e in fabric) else None)
@@ -242,10 +256,12 @@ def load_case(db, root, config, topology, reporter):
             sampled_routes.setdefault((a,b,m),[sample['start'],sample['end']])
         frame['nodePaths'] = []
         db.execute('UPDATE node_path_stage SET used=1 WHERE sample=? AND t0=? AND t1=? AND top=? AND te=? AND toe=?',window)
-        db.execute('INSERT INTO global_samples VALUES(?,?,?,?,?,?,?,?,?,?,?)',
+        db.execute('INSERT INTO global_samples VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)',
                    (case_id,sample['start'],sample['end'],frame['global']['maxUtilization'],
                     frame['global']['hotLinks'],len(measured),
-                    access_bits if access_complete else None,duration if access_complete else 0,
+                    decode_bits if decode_complete else None,duration if decode_complete else 0,
+                    storage_bits if storage_complete else None,
+                    storage_capacity if storage_complete else None,
                     fabric_bits if fabric_complete else None,fabric_capacity if fabric_complete else None,
                     frame['global']['fabricUtilization']))
         db.executemany('INSERT INTO link_trends VALUES(?,?,?,?,?,?,?,?)',[(case_id,sample['start'],e['src'],e['dst'],e['capacity'],e['gbps'],e['utilization'],e['queueMB']) for e in fabric])
@@ -282,10 +298,26 @@ def load_case(db, root, config, topology, reporter):
         elif snapshots.get(int(r['topology_epoch']), {}).get((src, port)) != (dst, dp):
             raise ValueError(f'{case_id}: sample endpoint disagrees with applied topology: {src}:{port}->{dst}:{dp}')
         key = (src, dst)
-        edge = edges.setdefault(key, dict(src=src, dst=dst, circuits=0, wireBytes=0, capacityBits=0))
+        edge = edges.setdefault(key, dict(src=src, dst=dst, circuits=0, wireBytes=0,
+                                          capacityBits=0, decodeWireBytes=0, decodeComplete=True))
+        wire_bytes = int(r['tx_wire_bytes'])
+        if wire_bytes < 0:
+            raise ValueError(f'{case_id}: negative tx_wire_bytes in sample {sample_id}')
         edge['circuits'] += circuit_count
-        edge['wireBytes'] += int(r['tx_wire_bytes'])
+        edge['wireBytes'] += wire_bytes
         edge['capacityBits'] += float(r['capacity_bits'])
+        if src in storage_nodes and dst in leaves:
+            raw_decode = r.get('read_response_tx_wire_bytes')
+            if raw_decode is None or raw_decode == '':
+                edge['decodeComplete'] = False
+            else:
+                try:
+                    decode_bytes = int(raw_decode)
+                except ValueError as error:
+                    raise ValueError(f'{case_id}: invalid READ_RESPONSE bytes in sample {sample_id}') from error
+                if decode_bytes < 0 or decode_bytes > wire_bytes:
+                    raise ValueError(f'{case_id}: READ_RESPONSE bytes exceed total Tx bytes in sample {sample_id}')
+                edge['decodeWireBytes'] += decode_bytes
     save_frame()
     if db.execute('SELECT 1 FROM node_path_stage WHERE used=0 LIMIT 1').fetchone():
         raise ValueError(f'{case_id}: node path windows/epochs do not match link samples')
@@ -294,6 +326,14 @@ def load_case(db, root, config, topology, reporter):
     if not num_frames:
         raise ValueError(f'{case_id}: no link samples')
     bounds = db.execute('SELECT MIN(t0),MAX(t1) FROM frames WHERE case_id=?', (case_id,)).fetchone()
+    total_windows, complete_windows, total_storage_bits, total_storage_capacity = db.execute(
+        'SELECT COUNT(*),COUNT(storage_bits),SUM(storage_bits),SUM(storage_capacity) '
+        'FROM global_samples WHERE case_id=?', (case_id,)).fetchone()
+    storage_utilization = (
+        total_storage_bits / total_storage_capacity
+        if complete_windows == total_windows and total_storage_capacity and total_storage_capacity > 0
+        else None
+    )
     route_evidence = []
     path_file = path / 'replay_path_samples.csv'
     final_epoch = max(snapshots)
@@ -315,6 +355,8 @@ def load_case(db, root, config, topology, reporter):
                 routeEvidence=route_evidence, hasPathSamples=path_file.exists() or Path(str(path_file) + '.gz').exists(),
                 capabilities=dict(accessSamples=access_sampled,nodePaths=has_node_paths),
                 detailWindows=detail_windows,maxRateGbps=max_rate,
+                storageUtilization=storage_utilization,
+                storageSampleComplete=(complete_windows == total_windows),
                 **task_info, frameCount=num_frames,
                 topologyStates=topology_states, pairScores=list(pair_scores.values()),
                 finalTopologyEpoch=final_epoch, finalEdges=list(final_edges.values()),
@@ -365,7 +407,7 @@ def prepare(manifest_path, cache_path, force=False, progress=None):
     cases = []
     with sqlite3.connect(temporary) as db:
         db.executescript("PRAGMA journal_mode=DELETE; PRAGMA synchronous=NORMAL; PRAGMA temp_store=FILE; PRAGMA cache_size=-65536; PRAGMA mmap_size=0; CREATE TABLE metadata(key TEXT PRIMARY KEY,value TEXT); CREATE TABLE frames(case_id TEXT,t0 REAL,t1 REAL,data BLOB,PRIMARY KEY(case_id,t0)); CREATE INDEX frames_range ON frames(case_id,t1);")
-        db.executescript('CREATE TABLE global_samples(case_id TEXT,t0 REAL,t1 REAL,max_util REAL,hot INTEGER,measured INTEGER,access_bits INTEGER,access_duration REAL,fabric_bits INTEGER,fabric_capacity REAL,fabric_util REAL,PRIMARY KEY(case_id,t0)); CREATE TABLE link_trends(case_id TEXT,t0 REAL,src INTEGER,dst INTEGER,capacity REAL,gbps REAL,util REAL,queue REAL,PRIMARY KEY(case_id,src,dst,t0)); CREATE TABLE node_paths(case_id TEXT,sample INTEGER,t0 REAL,t1 REAL,sn INTEGER,dn INTEGER,src INTEGER,dst INTEGER,mid INTEGER,bytes INTEGER);')
+        db.executescript('CREATE TABLE global_samples(case_id TEXT,t0 REAL,t1 REAL,max_util REAL,hot INTEGER,measured INTEGER,decode_bits INTEGER,decode_duration REAL,storage_bits INTEGER,storage_capacity REAL,fabric_bits INTEGER,fabric_capacity REAL,fabric_util REAL,PRIMARY KEY(case_id,t0)); CREATE TABLE link_trends(case_id TEXT,t0 REAL,src INTEGER,dst INTEGER,capacity REAL,gbps REAL,util REAL,queue REAL,PRIMARY KEY(case_id,src,dst,t0)); CREATE TABLE node_paths(case_id TEXT,sample INTEGER,t0 REAL,t1 REAL,sn INTEGER,dn INTEGER,src INTEGER,dst INTEGER,mid INTEGER,bytes INTEGER);')
         db.set_progress_handler(lambda: (reporter.update(),0)[1],200000)
         create_tables(db)
         reporter.stage('workload','分批导入 workload 到磁盘')

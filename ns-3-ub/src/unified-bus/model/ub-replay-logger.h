@@ -91,12 +91,15 @@ class UbReplayLogger
     bool m_taskEvents{false};
     std::vector<std::pair<Time, Time>> m_detailWindows;
     std::vector<EventId> m_detailEvents;
+    std::set<std::pair<uint32_t,uint32_t>> m_storageAccessPorts;
     std::map<std::pair<uint32_t,uint32_t>,uint32_t> m_hostPortToLeaf;
     std::map<std::pair<uint32_t,uint32_t>,uint32_t> m_portPeers;
     using PathKey = std::tuple<uint32_t,uint32_t,uint32_t,uint32_t,int32_t>;
     struct Shard
     {
         std::map<PathKey, std::pair<uint64_t,uint64_t>> paths;
+        // LP-local counters: only storage-host READ_RESPONSE on host -> Leaf links.
+        std::map<std::pair<uint32_t,uint32_t>,uint64_t> storageReadResponseBytes;
         std::string tasks;
         uint64_t unattributedPackets{0};
     };

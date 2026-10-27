@@ -34,3 +34,9 @@ main{margin-bottom:65px}
 @media(max-width:1450px){.network-row{grid-template-columns:125px minmax(0,1fr) 240px}.global-live b{font-size:14px}}
 @media(max-width:1050px){.network-row{grid-template-columns:115px minmax(0,1fr) 210px}.heading-right{gap:7px}.heat-legend{flex-wrap:wrap}.playback-status button{padding:7px 8px}}
 .transit-legend{font-size:9px;line-height:1.5}.transit-legend span{white-space:nowrap}
+
+/* v10: P50/P90/P99 and full-run storage access utilization. */
+.quantiles{grid-template-columns:repeat(4,minmax(0,1fr));gap:7px}
+.quantiles .metric-value{font-size:clamp(14px,1.35vw,20px)}
+.quantiles .metric-label{min-height:15px;white-space:nowrap}
+.quantiles .gain{font-size:8px}

@@ -135,7 +135,7 @@ UbReplayLogger::Configure(const std::string& casePath,
     m_links << std::setprecision(17)
             << "sample_id,case_id,mode,start_ns,end_ns,src_node,src_port,dst_node,dst_port,"
                "link_kind,topology_epoch,te_epoch,toe_decision_epoch,toe_phase,data_rate_bps,"
-               "connected_duration_ns,capacity_bits,tx_wire_bytes,tx_packets,boundary_reason,aggregation,circuit_count\n";
+               "connected_duration_ns,capacity_bits,tx_wire_bytes,tx_packets,boundary_reason,aggregation,circuit_count,read_response_tx_wire_bytes\n";
     m_nodePaths << "sample_id,case_id,start_ns,end_ns,topology_epoch,te_epoch,toe_decision_epoch,src_node,dst_node,src_leaf,dst_leaf,transit_leaf,tx_payload_bytes,tx_packets\n";
     m_queueSamples << "case_id,mode,time_ns,src_node,src_port,dst_node,dst_port,link_kind,"
                       "topology_epoch,te_epoch,toe_decision_epoch,toe_phase,voq_bytes,"
@@ -158,7 +158,9 @@ UbReplayLogger::Configure(const std::string& casePath,
     }
     m_enabled = true;
     Metadata("schema_version", "2");
-    Metadata("replay_logger_version", "4");
+    Metadata("replay_logger_version", "5");
+    Metadata("storage_decode_semantics",
+             "host-to-leaf successful READ_RESPONSE wire bytes including headers and retransmissions");
     Metadata("sampling_context", m_parallel ? "public-lp-after-worker-barrier" : "single-thread");
     Metadata("window_semantics", "counter snapshots after workers through end time; boundary-time sends counted before public control update");
     Metadata("task_event_order", "buffered per LP; rows may be interleaved, use time_ns and task_id");
@@ -197,10 +199,18 @@ void
 UbReplayLogger::DiscoverPorts()
 {
     m_ports.clear();
+    m_storageAccessPorts.clear();
     m_hostPortToLeaf.clear();m_portPeers.clear();m_fabricPairs.clear();
     for (uint32_t nodeId = 0; nodeId < NodeList::GetNNodes(); ++nodeId)
     {
         const auto node = NodeList::GetNode(nodeId);
+        // Match Dashboard topology.py's compute (64 UbPorts) / storage (other)
+        // role distinction. Count UbPorts rather than unrelated NetDevices.
+        uint32_t hostPorts = 0;
+        if (!IsSwitch(node))
+            for (uint32_t k = 0; k < node->GetNDevices(); ++k)
+                if (DynamicCast<UbPort>(node->GetDevice(k))) ++hostPorts;
+        const bool storage = !IsSwitch(node) && hostPorts != 64;
         for (uint32_t deviceId = 0; deviceId < node->GetNDevices(); ++deviceId)
         {
             const auto port = DynamicCast<UbPort>(node->GetDevice(deviceId));
@@ -210,7 +220,11 @@ UbReplayLogger::DiscoverPorts()
             if (!peer) continue;
             m_portPeers[{node->GetId(),port->GetIfIndex()}] = peer->GetNode()->GetId();
             if (!IsSwitch(node) && IsSwitch(peer->GetNode()))
+            {
                 m_hostPortToLeaf[{node->GetId(),port->GetIfIndex()}] = peer->GetNode()->GetId();
+                if (storage)
+                    m_storageAccessPorts.insert({node->GetId(),port->GetIfIndex()});
+            }
             if (IsSwitch(node) && IsSwitch(peer->GetNode()))
                 m_fabricPairs.insert({node->GetId(),peer->GetNode()->GetId()});
             m_ports.push_back({port, node->GetId(), port->GetIfIndex(),
@@ -261,18 +275,29 @@ UbReplayLogger::SampleAt(Time now, const std::string& reason)
     {
         ++m_sampleId;
         const Time duration = now - m_lastSample;
-        struct Aggregate { uint64_t rate{0},bytes{0},packets{0},circuits{0}; bool fabric{false}; };
+        struct Aggregate { uint64_t rate{0},bytes{0},packets{0},circuits{0},readResponseBytes{0}; bool fabric{false}; };
         std::map<std::pair<uint32_t,uint32_t>,Aggregate> pairs;
+        // Sampling runs on public LP after the worker barrier. Merge and reset
+        // worker-local counters at the same boundary as the port Tx counters.
+        std::map<std::pair<uint32_t,uint32_t>,uint64_t> readResponseByPort;
+        for (auto& shard : m_shards)
+        {
+            for (const auto& [key,bytes] : shard.storageReadResponseBytes)
+                readResponseByPort[key] += bytes;
+            shard.storageReadResponseBytes.clear();
+        }
         auto write = [&](uint32_t src, int64_t port, uint32_t dst, int64_t dp,
                          bool fabric, uint64_t rate, uint64_t bytes, uint64_t packets,
-                         uint64_t circuits, const char* aggregation) {
+                         uint64_t circuits, uint64_t readResponseBytes,
+                         const char* aggregation) {
             m_links << m_sampleId << ',' << Csv(m_caseId) << ',' << Csv(m_mode) << ','
                     << Ns(m_lastSample) << ',' << Ns(now) << ',' << src << ',' << port << ','
                     << dst << ',' << dp << ',' << (fabric ? "fabric" : "access") << ','
                     << m_topologyEpoch << ',' << m_teEpoch << ',' << m_toeDecisionEpoch << ','
                     << m_toePhase << ',' << rate << ',' << Ns(duration) << ','
                     << static_cast<double>(rate)*duration.GetSeconds() << ',' << bytes << ','
-                    << packets << ',' << Csv(reason) << ',' << aggregation << ',' << circuits << '\n';
+                    << packets << ',' << Csv(reason) << ',' << aggregation << ',' << circuits
+                    << ',' << readResponseBytes << '\n';
         };
         for (auto& state : m_ports)
         {
@@ -280,19 +305,24 @@ UbReplayLogger::SampleAt(Time now, const std::string& reason)
             NS_ABORT_MSG_IF(bytes<state.lastBytes || packets<state.lastPackets,
                             "Replay transmit counters unexpectedly decreased");
             const uint64_t deltaBytes=bytes-state.lastBytes,deltaPackets=packets-state.lastPackets;
+            const auto key=std::make_pair(state.sourceNode,state.sourcePort);
+            const uint64_t readBytes=readResponseByPort[key];
+            NS_ABORT_MSG_IF(readBytes > deltaBytes,
+                            "READ_RESPONSE sent bytes exceed physical port transmit counter delta");
             if (m_aggregatePairs)
             {
                 auto& pair=pairs[{state.sourceNode,state.destinationNode}];
                 pair.rate+=state.rateBps; pair.bytes+=deltaBytes; pair.packets+=deltaPackets;
+                pair.readResponseBytes+=readBytes;
                 ++pair.circuits; pair.fabric=state.fabric;
             }
             else write(state.sourceNode,state.sourcePort,state.destinationNode,state.destinationPort,
-                       state.fabric,state.rateBps,deltaBytes,deltaPackets,1,"physical_port");
+                       state.fabric,state.rateBps,deltaBytes,deltaPackets,1,readBytes,"physical_port");
             state.lastBytes=bytes;state.lastPackets=packets;
         }
         for (const auto& [key,value] : pairs)
             write(key.first,-1,key.second,-1,value.fabric,value.rate,value.bytes,value.packets,
-                  value.circuits,"node_pair");
+                  value.circuits,value.readResponseBytes,"node_pair");
         for (auto& shard : m_shards)
         {
             for (const auto& [key,value] : shard.paths)
@@ -426,6 +456,26 @@ UbReplayLogger::PathMetadata(Ptr<Packet> packet, uint32_t leaf, uint32_t sip, ui
 void
 UbReplayLogger::SuccessfulTransmit(Ptr<Packet> packet, uint32_t node, uint32_t port)
 {
+    if (!m_enabled) return;
+    // This runs for successful Tx starts only. Count storage read replies at
+    // their physical injection port, not again on each fabric hop.
+    if (m_storageAccessPorts.count({node,port}))
+    {
+        auto copy=packet->Copy();
+        UbDatalinkPacketHeader dl;
+        copy->RemoveHeader(dl);
+        if (dl.GetConfig()==static_cast<uint8_t>(UbDatalinkHeaderConfig::PACKET_IPV4))
+        {
+            UbIpBasedNetworkHeader nh; Ipv4Header ip; UdpHeader udp; UbTransportHeader tp;
+            copy->RemoveHeader(nh);copy->RemoveHeader(ip);copy->RemoveHeader(udp);copy->RemoveHeader(tp);
+            if (tp.GetTPOpcode()==static_cast<uint8_t>(TpOpcode::TP_OPCODE_RELIABLE_TA))
+            {
+                UbTransactionHeader ta;copy->RemoveHeader(ta);
+                if (ta.GetTaOpcode()==static_cast<uint8_t>(TaOpcode::TA_OPCODE_READ_RESPONSE))
+                    CurrentShard().storageReadResponseBytes[{node,port}]+=packet->GetSize();
+            }
+        }
+    }
     if (!DetailsActive()) return;
     const auto peer=m_portPeers.find({node,port});
     if (peer==m_portPeers.end() || !m_fabricPairs.count({node,peer->second})) return;
@@ -610,6 +660,7 @@ UbReplayLogger::Finish(const std::string& reason)
     for (auto* stream : {&m_links, &m_queueSamples, &m_topology, &m_events, &m_tasks, &m_metadata, &m_nodePaths})
         stream->close();
     m_ports.clear();
+    m_storageAccessPorts.clear();
     m_shards.clear();
     m_enabled = false;
 }
