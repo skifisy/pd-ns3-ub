@@ -79,8 +79,10 @@ taskId,sourceNode,destNode,dataSize(Byte),opType,taskStartTime(us),taskCompletes
 该配置不是整个进程内存的硬上限，仍需为任务、索引、临时排序和旧/新缓存预留磁盘。
 ## 吞吐、容量和利用率
 
-顶部每组 ECMP / TE / TOE 卡片在 P50 / P90 / P99 FCT 之外，新增**全程存储接入侧利用率**。取所有 `storage-server → Leaf` 有向接入端口、所有真实窗口的
-`SUM(tx_wire_bytes × 8) / SUM(capacity_bits)`，容量加权；包含控制包与重传。只要任一窗口缺少预期的存储发送端口，就显示「—」，不将缺失数据当成零。
+顶部每组 ECMP / TE / TOE 卡片统一展示 **P50 / P90 / P99 FCT、全程存储侧利用率、全程存储侧平均吞吐**。
+存储侧利用率取所有 `storage-server → Leaf` 有向接入端口、所有真实窗口的
+`SUM(tx_wire_bytes × 8) / SUM(capacity_bits)`，容量加权；平均吞吐为 `SUM(tx_wire_bytes × 8) / 仿真总时长`。
+两项指标均包含协议头与重传；只要任一窗口缺少预期的存储发送端口，就显示「—」，不将缺失数据当成零。
 
 中间每组网络左侧保留 **Decode 返回吞吐、Fabric 利用率、最大利用率**，删除「高负载方向」实时数字（下方热点变化图仍保留）。
 
@@ -93,7 +95,7 @@ taskId,sourceNode,destNode,dataSize(Byte),opType,taskStartTime(us),taskCompletes
 | 焦点链路发送 | 焦点 A→B 直连物理链路（含并行链路）的窗口平均发送速率 |
 | 节点载荷发送 | 源 Leaf 按实际首跳归属的端点业务载荷发送量，含重传 |
 
-中间 Decode 吞吐和顶部全程利用率都复用已有的 `tx_wire_bytes` 与 `capacity_bits`，不要求 `read_response_tx_wire_bytes` 字段；
+顶部全程存储侧平均吞吐、全程利用率和中间实时 Decode 吞吐都复用已有的 `tx_wire_bytes` 与 `capacity_bits`，不要求 `read_response_tx_wire_bytes` 字段；
 因此可以直接使用旧版 Replay 日志，无需重新编译或重新运行仿真。这里把存储 → Leaf 的全部端口发送量作为 Decode 返回流量的代理，前提是该实验中存储节点不发送其他业务类别。该指标是物理端口发送口径，包含协议开销与重传，并非去重后的业务 Payload Goodput。
 
 不能累加所有 Fabric 链路当作端到端吞吐；中转可能重复计数同一份数据。

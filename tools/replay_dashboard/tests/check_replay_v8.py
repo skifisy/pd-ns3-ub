@@ -44,6 +44,11 @@ class ReplayV8Checks(unittest.TestCase):
             te=next(c for c in info['cases'] if c['id']=='te')
             self.assertTrue(te['storageSampleComplete'])
             self.assertIsNotNone(te['storageUtilization'])
+            self.assertIsNotNone(te['storageThroughputGbps'])
+            expected_full_run=db.execute(
+                "SELECT SUM(storage_bits)/SUM(storage_duration)/1e9 FROM global_samples WHERE case_id='te'"
+            ).fetchone()[0]
+            self.assertAlmostEqual(te['storageThroughputGbps'],expected_full_run)
             frame=decode_frame(db.execute("SELECT data FROM frames WHERE case_id='te' AND t0=.11").fetchone()[0])
             self.assertTrue(frame['global']['storageSampleComplete'])
             with (HERE/'smoke10ms/te/replay_link_samples.csv').open(newline='') as stream:
@@ -97,6 +102,7 @@ class ReplayV8Checks(unittest.TestCase):
             info=json.loads(db.execute("SELECT value FROM metadata WHERE key='bootstrap'").fetchone()[0])
             te=next(c for c in info['cases'] if c['id']=='te')
             self.assertIsNone(te['storageUtilization'])
+            self.assertIsNone(te['storageThroughputGbps'])
             self.assertIsNotNone(row['fabricUtilization'])
 
 

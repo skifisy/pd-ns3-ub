@@ -144,8 +144,11 @@ def bootstrap():
         info = dict(info)
         info['rateScaleGbps'] = (info.get('rateScaleGbps') or 1) * scale
         info['throughputScale'] = scale
-        info['cases'] = [dict(c,topologyStates=[dict(s,edges=[dict(e,capacity=e['capacity']*scale)
-                          for e in s['edges']]) for s in c['topologyStates']],
+        info['cases'] = [dict(c,
+                          storageThroughputGbps=(c['storageThroughputGbps']*scale
+                              if c.get('storageThroughputGbps') is not None else None),
+                          topologyStates=[dict(s,edges=[dict(e,capacity=e['capacity']*scale)
+                              for e in s['edges']]) for s in c['topologyStates']],
                           finalEdges=[dict(e,capacity=e['capacity']*scale) for e in c['finalEdges']])
                          for c in info['cases']]
     return info

@@ -14,7 +14,7 @@ from progress import Progress
 from task_store import (create_tables, import_workload, import_tasks, completion_buckets,
                         common_quantiles, task_sources, picoseconds)
 
-CACHE_SCHEMA = 11
+CACHE_SCHEMA = 12
 
 
 def dumps(value):
@@ -309,12 +309,18 @@ def load_case(db, root, config, topology, reporter):
     if not num_frames:
         raise ValueError(f'{case_id}: no link samples')
     bounds = db.execute('SELECT MIN(t0),MAX(t1) FROM frames WHERE case_id=?', (case_id,)).fetchone()
-    total_windows, complete_windows, total_storage_bits, total_storage_capacity = db.execute(
-        'SELECT COUNT(*),COUNT(storage_bits),SUM(storage_bits),SUM(storage_capacity) '
+    total_windows, complete_windows, total_storage_bits, total_storage_capacity, total_storage_duration = db.execute(
+        'SELECT COUNT(*),COUNT(storage_bits),SUM(storage_bits),SUM(storage_capacity),SUM(storage_duration) '
         'FROM global_samples WHERE case_id=?', (case_id,)).fetchone()
     storage_utilization = (
         total_storage_bits / total_storage_capacity
         if complete_windows == total_windows and total_storage_capacity and total_storage_capacity > 0
+        else None
+    )
+    # Aggregate all storage-server -> Leaf wire bytes over the full simulated duration.
+    storage_throughput_gbps = (
+        total_storage_bits / total_storage_duration / 1e9
+        if complete_windows == total_windows and total_storage_duration and total_storage_duration > 0
         else None
     )
     route_evidence = []
@@ -339,6 +345,7 @@ def load_case(db, root, config, topology, reporter):
                 capabilities=dict(accessSamples=access_sampled,nodePaths=has_node_paths),
                 detailWindows=detail_windows,maxRateGbps=max_rate,
                 storageUtilization=storage_utilization,
+                storageThroughputGbps=storage_throughput_gbps,
                 storageSampleComplete=(complete_windows == total_windows),
                 **task_info, frameCount=num_frames,
                 topologyStates=topology_states, pairScores=list(pair_scores.values()),
