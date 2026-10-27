@@ -267,7 +267,7 @@ function cursor(){
  return {silent:true,symbol:'none',label:{show:false},lineStyle:{color:'#91a3b1',type:'dashed',width:1},data:[{xAxis:S.time},...events]};
 }
 function chartBase(){
- return {animation:false,tooltip:{trigger:'axis',confine:true,valueFormatter:v=>finite(v)?number(v,3):'无采样'},grid:{left:48,right:14,top:16,bottom:25},dataZoom:[{type:'inside',filterMode:'none',start:0,end:100}],xAxis:{type:'value',min:S.trendStart??recording.start,max:S.trendEnd??recording.end,axisLabel:{fontSize:8,color:'#8c9daa',formatter:v=>v.toFixed((S.trendEnd-S.trendStart)<10?2:0)+'s'},splitLine:{show:false},axisLine:{lineStyle:{color:'#dce6ec'}}},yAxis:{type:'value',min:0,splitNumber:2,axisLabel:{fontSize:8,color:'#8c9daa'},splitLine:{lineStyle:{color:'#edf2f5'}}}};
+ return {animation:false,tooltip:{trigger:'axis',confine:true,valueFormatter:v=>finite(v)?number(v,3):'无采样'},grid:{left:48,right:14,top:16,bottom:25},dataZoom:[{type:'inside',filterMode:'none',start:0,end:100,zoomOnMouseWheel:false,moveOnMouseWheel:false}],xAxis:{type:'value',min:S.trendStart??recording.start,max:S.trendEnd??recording.end,axisLabel:{fontSize:8,color:'#8c9daa',formatter:v=>v.toFixed((S.trendEnd-S.trendStart)<10?2:0)+'s'},splitLine:{show:false},axisLine:{lineStyle:{color:'#dce6ec'}}},yAxis:{type:'value',min:0,splitNumber:2,axisLabel:{fontSize:8,color:'#8c9daa'},splitLine:{lineStyle:{color:'#edf2f5'}}}};
 }
 function line(id,data,color,dashed=false,name=id){return {id,name,type:'line',showSymbol:false,step:'end',connectNulls:false,lineStyle:{color,width:dashed?1:1.6,type:dashed?'dashed':'solid'},data};}
 function trendQuery(chart){return 'start='+S.trendStart+'&end='+S.trendEnd+'&points='+Math.max(100,Math.min(1600,Math.round(chart.getWidth()*2)));}
@@ -297,18 +297,98 @@ async function loadGlobal(){
 function charts(){return [completionChart,hotspotChart,globalChart,throughputChart,utilizationChart];}
 async function reloadTrends(){await Promise.all([loadCompletion(),loadHotspot(true),loadGlobal()]);$('#trendStatus').textContent=number(S.trendStart,3)+'–'+number(S.trendEnd,3)+' s · 聚合均值 / 热点峰值；滚轮可放大，点击可定位';}
 function trendControls(){
- const setRange=(start,end)=>{S.trendStart=Math.max(recording.start,start);S.trendEnd=Math.min(recording.end,end);reloadTrends().catch(fail);};
- $('#trendAll').onclick=()=>setRange(recording.start,recording.end);
- $('#trendLocal').onclick=()=>{const width=Math.min(1,recording.end-recording.start),start=Math.max(recording.start,Math.min(S.time-width/2,recording.end-width));setRange(start,start+width);};
- $('#utilMetric').onchange=()=>loadGlobal().catch(fail);
- let zoomTimer;
- for(const chart of charts()){
-  chart.getZr().on('click',e=>{if(!chart.containPixel('grid',[e.offsetX,e.offsetY]))return;const point=chart.convertFromPixel('grid',[e.offsetX,e.offsetY]);if(point&&finite(point[0]))seekTo(point[0]).catch(fail);});
-  chart.on('datazoom',e=>{const z=e.batch?.[0]||e,span=S.trendEnd-S.trendStart;
-   const start=finite(z.startValue)?z.startValue:S.trendStart+span*(z.start??0)/100,end=finite(z.endValue)?z.endValue:S.trendStart+span*(z.end??100)/100;
-   clearTimeout(zoomTimer);zoomTimer=setTimeout(()=>{if(end-start>=meta.windowSeconds)setRange(start,end);},180);
-  });
- }
+  const clamp=(value,min,max)=>Math.max(min,Math.min(max,value));
+  const setRange=(start,end)=>{
+   const fullStart=recording.start,fullEnd=recording.end,total=fullEnd-fullStart;
+   if(!finite(start)||!finite(end)||end<=start||total<=0)return;
+   const minSpan=Math.min(meta.windowSeconds,total);
+   const span=clamp(end-start,minSpan,total);
+   const center=(start+end)/2;
+   start=center-span/2;end=center+span/2;
+   if(start<fullStart){end+=fullStart-start;start=fullStart;}
+   if(end>fullEnd){start-=end-fullEnd;end=fullEnd;}
+   S.trendStart=clamp(start,fullStart,fullEnd);
+   S.trendEnd=clamp(end,fullStart,fullEnd);
+   reloadTrends().catch(fail);
+  };
+  $('#trendAll').onclick=()=>setRange(recording.start,recording.end);
+  $('#trendLocal').onclick=()=>{
+   const width=Math.min(1,recording.end-recording.start);
+   const start=Math.max(recording.start,Math.min(S.time-width/2,recording.end-width));
+   setRange(start,start+width);
+  };
+  $('#utilMetric').onchange=()=>loadGlobal().catch(fail);
+
+  let zoomTimer,pendingRange=null;
+  const scheduleRange=(start,end,delayMs=100)=>{
+   if(!finite(start)||!finite(end)||end<=start)return;
+   pendingRange=[start,end];
+   clearTimeout(zoomTimer);
+   zoomTimer=setTimeout(()=>{
+    const range=pendingRange;
+    pendingRange=null;
+    if(range)setRange(range[0],range[1]);
+   },delayMs);
+  };
+  const dimension=(value,total,fallback)=>{
+   if(finite(value))return value;
+   if(typeof value==='string'&&value.endsWith('%'))return total*parseFloat(value)/100;
+   return fallback;
+  };
+
+  for(const chart of charts()){
+   chart.getZr().on('click',e=>{
+    if(!chart.containPixel('grid',[e.offsetX,e.offsetY]))return;
+    const point=chart.convertFromPixel('grid',[e.offsetX,e.offsetY]);
+    if(point&&finite(point[0]))seekTo(point[0]).catch(fail);
+   });
+
+   // Use a controlled wheel scale instead of ECharts' small default increments.
+   // Positive deltaY (wheel down) zooms out; negative deltaY zooms in.
+   chart.getDom().addEventListener('wheel',event=>{
+    const rect=chart.getDom().getBoundingClientRect();
+    const x=event.clientX-rect.left,y=event.clientY-rect.top;
+    if(!chart.containPixel('grid',[x,y]))return;
+    event.preventDefault();
+
+    const base=pendingRange||[S.trendStart,S.trendEnd];
+    const baseStart=base[0],baseEnd=base[1],span=baseEnd-baseStart;
+    const total=recording.end-recording.start;
+    if(span<=0||total<=0)return;
+
+    const option=chart.getOption();
+    const grid=Array.isArray(option.grid)?(option.grid[0]||{}):(option.grid||{});
+    const left=dimension(grid.left,chart.getWidth(),48);
+    const right=dimension(grid.right,chart.getWidth(),14);
+    const plotWidth=Math.max(1,chart.getWidth()-left-right);
+    const ratio=clamp((x-left)/plotWidth,0,1);
+    const anchor=baseStart+ratio*span;
+
+    const wheelUnits=event.deltaMode===1?event.deltaY*16/100:
+     event.deltaMode===2?event.deltaY*chart.getHeight()/100:event.deltaY/100;
+    const factor=Math.pow(1.4,clamp(wheelUnits,-3,3));
+    const minSpan=Math.min(meta.windowSeconds,total);
+    const nextSpan=clamp(span*factor,minSpan,total);
+    if(Math.abs(nextSpan-span)<1e-9)return;
+
+    let start=anchor-ratio*nextSpan,end=start+nextSpan;
+    if(start<recording.start){end+=recording.start-start;start=recording.start;}
+    if(end>recording.end){start-=end-recording.end;end=recording.end;}
+    start=clamp(start,recording.start,recording.end);
+    end=clamp(end,recording.start,recording.end);
+    scheduleRange(start,end,90);
+   },{passive:false});
+
+   // Keep drag-based dataZoom support; wheel zoom is handled above.
+   chart.on('datazoom',event=>{
+    const z=event.batch?.[0]||event;
+    const base=pendingRange||[S.trendStart,S.trendEnd];
+    const span=base[1]-base[0];
+    const start=finite(z.startValue)?z.startValue:base[0]+span*(z.start??0)/100;
+    const end=finite(z.endValue)?z.endValue:base[0]+span*(z.end??100)/100;
+    scheduleRange(start,end,120);
+   });
+  }
 }
 function updateText(){
  $('#time').textContent=number(S.time,3);
