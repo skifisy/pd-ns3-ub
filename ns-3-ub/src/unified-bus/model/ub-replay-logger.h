@@ -91,6 +91,8 @@ class UbReplayLogger
     bool m_taskEvents{false};
     std::vector<std::pair<Time, Time>> m_detailWindows;
     std::vector<EventId> m_detailEvents;
+    // Direct indexed role guard avoids tree lookups on every fabric packet.
+    std::vector<uint8_t> m_storageNodeFlags;
     std::set<std::pair<uint32_t,uint32_t>> m_storageAccessPorts;
     std::map<std::pair<uint32_t,uint32_t>,uint32_t> m_hostPortToLeaf;
     std::map<std::pair<uint32_t,uint32_t>,uint32_t> m_portPeers;

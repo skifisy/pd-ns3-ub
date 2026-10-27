@@ -200,6 +200,7 @@ UbReplayLogger::DiscoverPorts()
 {
     m_ports.clear();
     m_storageAccessPorts.clear();
+    m_storageNodeFlags.assign(NodeList::GetNNodes(),0);
     m_hostPortToLeaf.clear();m_portPeers.clear();m_fabricPairs.clear();
     for (uint32_t nodeId = 0; nodeId < NodeList::GetNNodes(); ++nodeId)
     {
@@ -211,6 +212,7 @@ UbReplayLogger::DiscoverPorts()
             for (uint32_t k = 0; k < node->GetNDevices(); ++k)
                 if (DynamicCast<UbPort>(node->GetDevice(k))) ++hostPorts;
         const bool storage = !IsSwitch(node) && hostPorts != 64;
+        if (storage) m_storageNodeFlags[nodeId] = 1;
         for (uint32_t deviceId = 0; deviceId < node->GetNDevices(); ++deviceId)
         {
             const auto port = DynamicCast<UbPort>(node->GetDevice(deviceId));
@@ -306,7 +308,8 @@ UbReplayLogger::SampleAt(Time now, const std::string& reason)
                             "Replay transmit counters unexpectedly decreased");
             const uint64_t deltaBytes=bytes-state.lastBytes,deltaPackets=packets-state.lastPackets;
             const auto key=std::make_pair(state.sourceNode,state.sourcePort);
-            const uint64_t readBytes=readResponseByPort[key];
+            const auto readIt=readResponseByPort.find(key);
+            const uint64_t readBytes=readIt==readResponseByPort.end() ? 0 : readIt->second;
             NS_ABORT_MSG_IF(readBytes > deltaBytes,
                             "READ_RESPONSE sent bytes exceed physical port transmit counter delta");
             if (m_aggregatePairs)
@@ -459,7 +462,8 @@ UbReplayLogger::SuccessfulTransmit(Ptr<Packet> packet, uint32_t node, uint32_t p
     if (!m_enabled) return;
     // This runs for successful Tx starts only. Count storage read replies at
     // their physical injection port, not again on each fabric hop.
-    if (m_storageAccessPorts.count({node,port}))
+    if (node < m_storageNodeFlags.size() && m_storageNodeFlags[node] &&
+        m_storageAccessPorts.count({node,port}))
     {
         auto copy=packet->Copy();
         UbDatalinkPacketHeader dl;
@@ -661,6 +665,7 @@ UbReplayLogger::Finish(const std::string& reason)
         stream->close();
     m_ports.clear();
     m_storageAccessPorts.clear();
+    m_storageNodeFlags.clear();
     m_shards.clear();
     m_enabled = false;
 }
