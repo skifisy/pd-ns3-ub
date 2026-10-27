@@ -295,7 +295,7 @@ async function loadGlobal(){
  ])},{notMerge:true});
 }
 function charts(){return [completionChart,hotspotChart,globalChart,throughputChart,utilizationChart];}
-async function reloadTrends(){await Promise.all([loadCompletion(),loadHotspot(true),loadGlobal()]);$('#trendStatus').textContent=number(S.trendStart,3)+'–'+number(S.trendEnd,3)+' s · 聚合均值 / 热点峰值；滚轮可放大，点击可定位';}
+async function reloadTrends(){await Promise.all([loadCompletion(),loadHotspot(true),loadGlobal()]);$('#trendStatus').textContent=number(S.trendStart,3)+'–'+number(S.trendEnd,3)+' s · 聚合均值 / 热点峰值；滚轮可放大 / 缩小，点击可定位';}
 function trendControls(){
   const clamp=(value,min,max)=>Math.max(min,Math.min(max,value));
   const setRange=(start,end)=>{
