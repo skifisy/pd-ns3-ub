@@ -166,8 +166,9 @@ def frames(start:float=Query(0,ge=0),end:float=Query(.5,ge=0)):
             case_frames = [decode_frame(r[0]) for r in db.execute('SELECT data FROM frames WHERE case_id=? AND t1>? AND t0<? ORDER BY t0',(c['id'],start,end))]
             if scale != 1:
                 for frame in case_frames:
-                    if frame['global'].get('storageDecodeGbps') is not None:
-                        frame['global']['storageDecodeGbps'] *= scale
+                    for field in ('storageThroughputGbps', 'storageTxGbps', 'storageRxGbps'):
+                        if frame['global'].get(field) is not None:
+                            frame['global'][field] *= scale
                     for edge in frame.get('edges', []):
                         if edge.get('gbps') is not None:
                             edge['gbps'] *= scale

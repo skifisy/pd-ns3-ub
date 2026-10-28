@@ -3,7 +3,7 @@ const $ = s => document.querySelector(s);
 const COLORS = ['#75889b','#267cae','#8264b3'];
 const TRANSIT_COLORS = ['#7852bb','#5369ba','#a3479a','#42699b','#77548e','#447f88'];
 const params = new URLSearchParams(location.search);
-const S = {time:0,playing:false,seeking:false,seekVersion:0,resumeAfterSeek:false,focus:null,blocks:new Map(),pending:new Map(),frames:{},scenes:new Map(),lastWall:0,lastDraw:0,key:'',dirty:true,trendKey:'',trendRequest:0,pathBlocks:new Map(),pathPending:new Map(),speed:1,controllers:new Map(),heat:true,loadVersion:0,trendStart:null,trendEnd:null,globalRequest:0,completionRequest:0};
+const S = {time:0,playing:false,buffering:false,bufferSince:0,totalBufferMs:0,seeking:false,seekVersion:0,resumeAfterSeek:false,focus:null,blocks:new Map(),pending:new Map(),frames:{},scenes:new Map(),lastWall:0,lastDraw:0,lastPaint:0,lastPrefetch:0,lastStats:0,key:'',dirty:true,trendKey:'',trendRequest:0,pathBlocks:new Map(),pathPending:new Map(),pathRetryAt:new Map(),frameRetryAt:new Map(),speed:1,controllers:new Map(),heat:true,loadVersion:0,frameLatencyMs:0,pathLatencyMs:0,trendStart:null,trendEnd:null,globalRequest:0,completionRequest:0};
 let meta, recording, completionChart, hotspotChart, globalChart, throughputChart, utilizationChart, nodes, leaves, devices, access;
 const esc = v => String(v ?? '').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 const finite = v => typeof v==='number' && Number.isFinite(v);
@@ -38,23 +38,35 @@ async function waitReady(){
  }
 }
 function blockId(t){return Math.floor(Math.max(meta.start,Math.min(t,meta.end-1e-8))/meta.blockSeconds);}
-function trimCache(cache,currentKey,newKey,budget){
+function trimCache(cache,currentKey,newKey,budget,maxBlocks){
  const size=()=>[...cache.values()].reduce((n,v)=>n+(v._bytes||0),0);
- while(cache.size>4||size()>budget){const key=[...cache.keys()].find(k=>k!==currentKey&&k!==newKey);if(key===undefined)break;cache.delete(key);}
+ const index=k=>Number(String(k).split('@').at(-1)),current=index(currentKey);
+ while(cache.size>maxBlocks||size()>budget){
+   // Keep the currently displayed and just-arrived blocks; prefer future over history.
+   const candidates=[...cache.keys()].filter(k=>k!==currentKey&&k!==newKey);
+   if(!candidates.length)break;
+   candidates.sort((a,b)=>{
+      const distance=k=>{const d=index(k)-current;return d<0?-d*2:d;};
+      return distance(b)-distance(a);
+   });
+   cache.delete(candidates[0]);
+ }
 }
 function cancelLoads(pathsOnly=false){
  if(!pathsOnly)++S.loadVersion;
  for(const [key,controller] of S.controllers){if(!pathsOnly||key.startsWith('path:')){controller.abort();S.controllers.delete(key);}}
- if(!pathsOnly)S.pending.clear();S.pathPending.clear();
+ if(!pathsOnly)S.pending.clear();
+ S.pathPending.clear();
+ if(pathsOnly){S.pathBlocks.clear();S.pathRetryAt.clear();}
 }
+function rememberLatency(field,start){const ms=performance.now()-start;S[field]=S[field] ? S[field]*.8+ms*.2 : ms;}
 async function ensureFrames(t){
  const id=blockId(t);if(S.blocks.has(id))return;if(S.pending.has(id))return S.pending.get(id);
- $('#buffer').textContent='缓存中';
- const controller=new AbortController(),requestKey='frame:'+id,version=S.loadVersion;S.controllers.set(requestKey,controller);
+ const controller=new AbortController(),requestKey='frame:'+id,version=S.loadVersion,start=performance.now();S.controllers.set(requestKey,controller);
  const p=get('/api/frames?start='+Math.max(meta.start,id*meta.blockSeconds)+'&end='+Math.min(meta.end,(id+1)*meta.blockSeconds),controller.signal).then(data=>{
-  if(controller.signal.aborted||version!==S.loadVersion)return;
-  S.blocks.set(id,data);S.dirty=true;
-  trimCache(S.blocks,blockId(S.time),id,16*1024*1024);
+   if(controller.signal.aborted||version!==S.loadVersion)return;
+   rememberLatency('frameLatencyMs',start);S.blocks.set(id,data);S.frameRetryAt.delete(id);S.dirty=true;
+   trimCache(S.blocks,blockId(S.time),id,32*1024*1024,12);
  }).finally(()=>{if(S.pending.get(id)===p){S.pending.delete(id);S.controllers.delete(requestKey);}});
  S.pending.set(id,p);return p;
 }
@@ -62,19 +74,59 @@ function pathKey(t){return direction(S.focus.src,S.focus.dst)+'@'+blockId(t);}
 async function ensurePaths(t){
  const id=blockId(t),key=pathKey(t);if(S.pathBlocks.has(key))return;if(S.pathPending.has(key))return S.pathPending.get(key);
  const focus={...S.focus};
- const controller=new AbortController(),requestKey='path:'+key,version=S.loadVersion;S.controllers.set(requestKey,controller);
+ const controller=new AbortController(),requestKey='path:'+key,version=S.loadVersion,start=performance.now();S.controllers.set(requestKey,controller);
  const p=get('/api/paths?src='+focus.src+'&dst='+focus.dst+'&start='+Math.max(meta.start,id*meta.blockSeconds)+'&end='+Math.min(meta.end,(id+1)*meta.blockSeconds),controller.signal).then(data=>{
-  if(controller.signal.aborted||version!==S.loadVersion)return;
-  S.pathBlocks.set(key,data);S.dirty=true;
-  trimCache(S.pathBlocks,pathKey(S.time),key,8*1024*1024);
+   if(controller.signal.aborted||version!==S.loadVersion||key!==direction(S.focus.src,S.focus.dst)+'@'+id)return;
+   rememberLatency('pathLatencyMs',start);S.pathBlocks.set(key,data);S.pathRetryAt.delete(key);S.dirty=true;
+   trimCache(S.pathBlocks,pathKey(S.time),key,16*1024*1024,8);
  }).finally(()=>{if(S.pathPending.get(key)===p){S.pathPending.delete(key);S.controllers.delete(requestKey);}});
  S.pathPending.set(key,p);return p;
 }
-async function ensure(t){await Promise.all([ensureFrames(t),ensurePaths(t)]);$('#buffer').textContent='数据就绪';}
+function pathFailure(key,error){
+ if(error.name==='AbortError')return;
+ S.pathRetryAt.set(key,performance.now()+3000);
+ if(params.get('debug')==='1')console.warn('Replay path fetch failed; will retry',key,error);
+}
+function requestPath(t){
+ const key=pathKey(t);
+ if(S.pathBlocks.has(key)||performance.now()<(S.pathRetryAt.get(key)||0))return;
+ ensurePaths(t).catch(e=>pathFailure(key,e));
+}
+function prefetchAhead(t){
+ const current=blockId(t),duration=meta.blockSeconds;
+ const frameAhead=Math.max(duration,Math.min(3,S.speed*Math.max(2,4*S.frameLatencyMs/1000)));
+ const pathAhead=Math.max(duration,Math.min(1.5,S.speed*Math.max(1.5,4*S.pathLatencyMs/1000)));
+ const last=blockId(meta.end-1e-8);
+ const futureTime=id=>Math.min(meta.end-1e-8,(id+.5)*duration);
+ for(let id=current+1;id<=Math.min(last,blockId(t+frameAhead))&&S.pending.size<2;id++){
+   if(S.blocks.has(id)||S.pending.has(id)||performance.now()<(S.frameRetryAt.get(id)||0))continue;
+   ensureFrames(futureTime(id)).catch(e=>{
+      if(e.name!=='AbortError'){
+        S.frameRetryAt.set(id,performance.now()+3000);
+        if(params.get('debug')==='1')console.warn('Replay frame prefetch failed',id,e);
+      }
+   });
+ }
+ for(let id=current+1;id<=Math.min(last,blockId(t+pathAhead))&&S.pathPending.size<1;id++){
+   const probe=futureTime(id),key=pathKey(probe);
+   if(S.pathBlocks.has(key)||S.pathPending.has(key)||performance.now()<(S.pathRetryAt.get(key)||0))continue;
+   requestPath(probe);
+ }
+}
+async function ensure(t){
+ await ensureFrames(t);
+ requestPath(t); // Path detail is optional for advancing the playback clock.
+}
+function setBuffering(value){
+ if(value===S.buffering)return;
+ if(value)S.bufferSince=performance.now();
+ else S.totalBufferMs+=performance.now()-S.bufferSince;
+ S.buffering=value;
+}
 function topologyAt(c,t){return [...c.topologyStates].reverse().find(s=>s.time<=t)||c.topologyStates[0];}
 function frameAt(c,t){
  const rows=S.blocks.get(blockId(t))?.cases[c.id]||[];
- const frame=rows.find(r=>r.start<=t&&r.end>t);if(frame){const detail=S.pathBlocks.get(pathKey(t))?.cases[c.id]?.[String(frame.id)]||[];return {...frame,nodePaths:detail};}
+ const frame=rows.find(r=>r.start<=t&&r.end>t);if(frame){const loaded=S.pathBlocks.has(pathKey(t)),detail=S.pathBlocks.get(pathKey(t))?.cases[c.id]?.[String(frame.id)]||[];return {...frame,nodePaths:detail,pathLoading:c.capabilities.nodePaths&&!loaded};}
  const top=topologyAt(c,t),event=[...c.events].reverse().find(e=>e.time<=t);
  return {id:t>=c.end?'finished':'missing',start:t,end:t,topologyEpoch:top.epoch,teEpoch:event?.teEpoch??0,phase:t>=c.end?'finished':'missing',edges:top.edges,pathSamples:[],nodePaths:[],global:{}};
 }
@@ -94,11 +146,11 @@ function setup(){
  $('#globalCards').innerHTML=meta.cases.map((c,i)=>'<article class="global-card" style="--case:'+COLORS[i%3]+'"><div class="card-heading"><h2>'+esc(c.label)+'</h2><span>最终 FCT · 固定共同完成任务集</span></div><div class="quantiles">'+['p50','p90','p99'].map(k=>{
   const q=c.quantiles[k],gain=c.mode==='ecmp'?'基线':q.improvement==null?'无共同完成任务':(q.improvement>=0?'降低 ':'增加 ')+number(Math.abs(q.improvement))+'%';
   return '<div><div class="metric-label">'+k.toUpperCase()+'</div><div class="metric-value">'+number(q.seconds,3)+'<small>s</small></div><div class="gain '+(q.improvement<0?'regression':'')+'">'+gain+'</div></div>';
- }).join('')+'<div><div class="metric-label" title="全程存储节点 → Leaf 实际发送比特 / 全程存储接入容量时间积分">存储侧利用率</div><div class="metric-value">'+percent(c.storageUtilization)+'</div><div class="gain">完整仿真时间段</div></div><div><div class="metric-label" title="全程存储节点 → Leaf 的 tx_wire_bytes × 8 / 仿真总时长，含协议头与重传">存储侧吞吐</div><div class="metric-value">'+number(c.storageThroughputGbps,1)+'</div><div class="gain">Gbps · 全程平均</div></div></div><div class="live-summary"><span>当前完成 <b id="complete-'+i+'">—</b> / '+c.totalTasks+'</span><span>进行中 <b id="running-'+i+'">—</b></span></div></article>').join('');
- $('#networks').innerHTML=meta.cases.map((c,i)=>'<article class="network-row" style="--case:'+COLORS[i%3]+'"><div class="case-side"><div><div class="case-name">'+esc(c.label)+'</div><div class="case-purpose">同一仿真时刻</div></div><div class="global-live"><div title="使用现有 tx_wire_bytes，统计存储节点 → Leaf 接入端口的全部实际发送量；按当前业务假设视为 Decode 返回流量，含协议头和重传"><label>Decode 返回吞吐</label><b id="throughput-'+i+'">—</b><small>Gbps · 存储侧发送</small></div><div title="Leaf 间发送比特数 / 有效容量时间积分"><label>Fabric 利用率</label><b id="util-'+i+'">—</b></div><div><label>最大利用率</label><b id="max-'+i+'">—</b></div></div></div><div class="network-space"><canvas class="network" id="network-'+i+'" aria-label="'+esc(c.label)+' 链路热力拓扑"></canvas><span class="network-watermark">上排 L＝交换机　下排 C＝计算 / S＝存储　接入间距已压缩</span></div><div class="action-side"><div class="action-label" id="action-label-'+i+'"></div><div class="action-title" id="action-title-'+i+'"></div><div class="action-lines" id="action-lines-'+i+'"></div><div class="action-footer" id="action-footer-'+i+'"></div></div></article>').join('');
+ }).join('')+'<div><div class="metric-label" title="存储接入链路双向实际发送比特 / 双向容量时间积分">存储侧双向利用率</div><div class="metric-value">'+percent(c.storageUtilization)+'</div><div class="gain">完整仿真时间段</div></div><div><div class="metric-label" title="Storage → Leaf 与 Leaf → Storage 的 tx_wire_bytes × 8 / 仿真总时长，含协议头与重传">存储侧总吞吐</div><div class="metric-value">'+number(c.storageThroughputGbps,1)+'</div><div class="gain">Gbps · 双向全程平均</div></div></div><div class="live-summary"><span>当前完成 <b id="complete-'+i+'">—</b> / '+c.totalTasks+'</span><span>进行中 <b id="running-'+i+'">—</b></span></div></article>').join('');
+ $('#networks').innerHTML=meta.cases.map((c,i)=>'<article class="network-row" style="--case:'+COLORS[i%3]+'"><div class="case-side"><div><div class="case-name">'+esc(c.label)+'</div><div class="case-purpose">同一仿真时刻</div></div><div class="global-live"><div title="存储侧 Storage → Leaf 与 Leaf → Storage 双向接入发送量，含协议头和重传"><label>存储侧双向吞吐</label><b id="throughput-'+i+'">—</b><small>Gbps · TX + RX</small></div><div title="Leaf 间发送比特数 / 有效容量时间积分"><label>Fabric 利用率</label><b id="util-'+i+'">—</b></div><div><label>最大利用率</label><b id="max-'+i+'">—</b></div></div></div><div class="network-space"><canvas class="network" id="network-'+i+'" aria-label="'+esc(c.label)+' 链路热力拓扑"></canvas><span class="network-watermark">上排 L＝交换机　下排 C＝计算 / S＝存储　接入间距已压缩</span></div><div class="action-side"><div class="action-label" id="action-label-'+i+'"></div><div class="action-title" id="action-title-'+i+'"></div><div class="action-lines" id="action-lines-'+i+'"></div><div class="action-footer" id="action-footer-'+i+'"></div></div></article>').join('');
  $('#focus').innerHTML=meta.focusOptions.map(p=>'<option value="'+direction(p.src,p.dst)+'">L'+p.src+' → L'+p.dst+'</option>').join('');
  $('#focus').value=direction(S.focus.src,S.focus.dst);$('#focus').disabled=false;
- $('#focus').onchange=e=>{const [src,dst]=e.target.value.split('-').map(Number);cancelLoads(true);S.focus={src,dst};S.dirty=true;ensurePaths(S.time).catch(fail);loadHotspot().catch(fail);};
+ $('#focus').onchange=e=>{const [src,dst]=e.target.value.split('-').map(Number);cancelLoads(true);S.focus={src,dst};S.dirty=true;requestPath(S.time);prefetchAhead(S.time);loadHotspot().catch(fail);};
  $('#focus').onpointerdown=updateOptions;
  $('#focus').onfocus=updateOptions;
  $('#heatToggle').disabled=false;
@@ -242,12 +294,12 @@ function action(c,frame,i){
   if(paths.length){
    const largest=[...paths].sort((a,b)=>b.gbps-a.gbps).slice(0,2);
    lines+='<div>该方向节点载荷发送 '+number(payload,0)+' Gbps</div>'+largest.map(p=>'<div>节点 '+p.srcNode+' → '+p.dstNode+'　'+number(p.gbps,0)+' Gbps</div>').join('');
-  }else lines+='<div>'+(detailAvailable(c,S.time)?'本窗口无该方向载荷记录':'此时间段未采集端到端路径详情')+'</div>';
+ }else lines+='<div>'+(frame.pathLoading?'路径详情加载中':detailAvailable(c,S.time)?'本窗口无该方向载荷记录':'此时间段未采集端到端路径详情')+'</div>';
  }
  const phase={steady:'正常转发',draining:'排空',guard:'保护等待',applied:'拓扑生效',finished:'实验结束',missing:'无采样'}[frame.phase]||frame.phase;
  if(c.mode.startsWith('toe')&&change){
   lines+=mids.map(m=>'<div class="route-label" style="color:'+transitColor(m)+'">L'+f.src+' → L'+m+' → L'+f.dst+'</div>').join('');
-  lines+='<div>'+(paths.length?'该方向节点载荷发送 '+number(payload,2)+' Gbps':detailAvailable(c,S.time)?'本窗口无该方向载荷记录':'此时间段未采集端到端路径详情')+'</div>';
+  lines+='<div>'+(paths.length?'该方向节点载荷发送 '+number(payload,2)+' Gbps':frame.pathLoading?'路径详情加载中':detailAvailable(c,S.time)?'本窗口无该方向载荷记录':'此时间段未采集端到端路径详情')+'</div>';
  }
  if(mids.length)lines+='<div class="transit-legend">'+mids.map(m=>'<span style="color:'+transitColor(m)+'">● L'+m+' 中转</span>').join('　')+'</div>';
  $('#action-title-'+i).textContent=title;$('#action-lines-'+i).innerHTML=lines;
@@ -256,7 +308,7 @@ function action(c,frame,i){
 function draw(){
  meta.cases.forEach((c,i)=>{
   const frame=frameAt(c,S.time);S.frames[c.id]=frame;makeScene(c,frame,i);action(c,frame,i);
-  $('#throughput-'+i).textContent=number(frame.global?.storageDecodeGbps,2);
+  $('#throughput-'+i).textContent=number(frame.global?.storageThroughputGbps,2);
   $('#util-'+i).textContent=percent(frame.global?.fabricUtilization);
   $('#max-'+i).textContent=percent(frame.global?.maxUtilization);
  });
@@ -285,7 +337,7 @@ async function loadHotspot(force=false){
 }
 async function loadGlobal(){
  const request=++S.globalRequest,data=await get('/api/global-trend?'+trendQuery(throughputChart));if(request!==S.globalRequest)return;
- throughputChart.setOption({...chartBase(),series:meta.cases.map((c,i)=>({...line(c.id+'-throughput',data.cases[c.id].map(p=>[p.time,p.storageDecodeGbps]),COLORS[i%3],false,c.label+' Decode 返回 Gbps'),markLine:i===0?cursor():undefined}))},{notMerge:true});
+ throughputChart.setOption({...chartBase(),series:meta.cases.map((c,i)=>({...line(c.id+'-throughput',data.cases[c.id].map(p=>[p.time,p.storageThroughputGbps]),COLORS[i%3],false,c.label+' 存储双向 Gbps'),markLine:i===0?cursor():undefined}))},{notMerge:true});
  const metric=$('#utilMetric').value;
  utilizationChart.setOption({...chartBase(),series:meta.cases.map((c,i)=>({...line(c.id+'-util',data.cases[c.id].map(p=>[p.time,finite(p[metric])?p[metric]*100:null]),COLORS[i%3],false,c.label+' 利用率 %'),markLine:i===0?cursor():undefined}))},{notMerge:true});
  globalChart.setOption({...chartBase(),grid:{left:39,right:28,top:16,bottom:25},yAxis:[{...chartBase().yAxis,max:v=>Math.max(100,Math.ceil(v.max/20)*20)},{...chartBase().yAxis,position:'right',splitLine:{show:false}}],series:meta.cases.flatMap((c,i)=>[
@@ -399,11 +451,12 @@ function updateText(){
  if(!S.seeking)$('#timeline').value=S.time;
  $('#currentClock').textContent=number(S.time,3)+' s';
  $('#play').textContent=S.playing?'暂停播放':S.time>=recording.end?'重新播放':'开始播放';
- $('#playbackState').textContent=S.seeking?'正在定位':S.time>=recording.end?'回放完成':S.playing?'播放中':'已暂停';
- if(performance.now()-(S.lastCursor||0)<100)return;S.lastCursor=performance.now();
+ $('#playbackState').textContent=S.seeking?'正在定位':S.buffering?'缓冲中（等待 Frame）':S.time>=recording.end?'回放完成':S.playing?'播放中':'已暂停';
+ $('#buffer').textContent=S.buffering?'加载播放帧中':S.pathPending.has(pathKey(S.time))?'路径详情后台加载中':'数据就绪';
+ if(performance.now()-(S.lastCursor||0)<250)return;S.lastCursor=performance.now();
  for(const [chart,id] of [[completionChart,meta.cases[0].id],[hotspotChart,meta.cases[0].id+'-rate'],[globalChart,meta.cases[0].id+'-max'],[throughputChart,meta.cases[0].id+'-throughput'],[utilizationChart,meta.cases[0].id+'-util']])chart.setOption({series:[{id,markLine:cursor()}]});
 }
-function setPlaying(value){S.playing=value;S.lastWall=performance.now();updateText();}
+function setPlaying(value){S.playing=value;if(!value)setBuffering(false);S.lastWall=performance.now();updateText();}
 async function stepFrame(delta){
  const version=S.stepRequest=(S.stepRequest||0)+1,at=S.time;
  S.seeking=false;S.resumeAfterSeek=false;S.playing=false;
@@ -417,7 +470,7 @@ async function stepFrame(delta){
 }
 async function seekTo(time,resume=false){
  S.stepRequest=(S.stepRequest||0)+1;
- const version=++S.seekVersion;cancelLoads();
+ const version=++S.seekVersion;cancelLoads();setBuffering(false);
  S.time=Math.max(recording.start,Math.min(recording.end,time));S.playing=false;S.lastWall=performance.now();S.dirty=true;
  $('#buffer').textContent='正在定位';updateText();
  await ensure(S.time);
@@ -437,12 +490,19 @@ function controls(){
   if(S.time>=recording.end)seekTo(recording.start,true).catch(fail);else setPlaying(!S.playing);
  };
  $('#restart').onclick=()=>{S.seeking=false;S.resumeAfterSeek=false;seekTo(recording.start,true).catch(fail);};
+ let seekTimer=null;
  timeline.oninput=()=>{
-  if(!S.seeking){S.resumeAfterSeek=S.playing;S.seeking=true;}
-  seekTo(Number(timeline.value)).catch(fail);
+  if(!S.seeking){S.resumeAfterSeek=S.playing;S.seeking=true;setPlaying(false);}
+  const target=Number(timeline.value);
+  $('#currentClock').textContent=number(target,3)+' s';
+  $('#time').textContent=number(target,3);
+  $('#playbackState').textContent='拖动定位';
+  clearTimeout(seekTimer);
+  seekTimer=setTimeout(()=>seekTo(target).catch(fail),180);
  };
  const finish=()=>{
   if(!S.seeking)return;
+  clearTimeout(seekTimer);
   const resume=S.resumeAfterSeek;S.seeking=false;S.resumeAfterSeek=false;
   seekTo(Number(timeline.value),resume).catch(fail);
  };
@@ -457,15 +517,33 @@ function tick(wall){
    if(toEnd<=remaining){next=segment.end;remaining-=toEnd;}else{next+=remaining*S.speed;remaining=0;}
   }
   next=Math.min(next,recording.end);
-  if(S.blocks.has(blockId(next))&&S.pathBlocks.has(pathKey(next))){S.time=next;if(next>=recording.end){if(params.get('loop')==='1'){S.time=recording.start;ensure(S.time).catch(fail);}else S.playing=false;}}else ensure(next).catch(fail);
-  const id=blockId(S.time);if(S.time>(id+1)*meta.blockSeconds-meta.blockSeconds*.6)ensure(Math.min(recording.end-1e-8,(id+1)*meta.blockSeconds+1e-8)).catch(fail);
+  if(S.blocks.has(blockId(next))){
+    S.time=next;setBuffering(false);
+    if(next>=recording.end){
+      if(params.get('loop')==='1'){S.time=recording.start;ensure(S.time).catch(fail);}
+      else S.playing=false;
+    }
+  }else{
+    setBuffering(true);
+    ensureFrames(next).catch(fail);
+  }
+  requestPath(S.time); // Slow path details cannot block live topology or global metrics.
+  if(wall-S.lastPrefetch>=200){prefetchAhead(S.time);S.lastPrefetch=wall;}
+  if(params.get('debug')==='1'&&wall-S.lastStats>=10000){
+    console.debug('[Replay playback]',{time:S.time,speed:S.speed,framePending:S.pending.size,
+      pathPending:S.pathPending.size,frameCache:S.blocks.size,pathCache:S.pathBlocks.size,
+      frameLatencyMs:Math.round(S.frameLatencyMs),pathLatencyMs:Math.round(S.pathLatencyMs),
+      totalBufferMs:Math.round(S.totalBufferMs+(S.buffering?performance.now()-S.bufferSince:0))});
+    S.lastStats=wall;
+  }
  }
  if(wall-S.lastDraw>33){
   const frames=meta.cases.map(c=>frameAt(c,S.time)),key=frames.map(f=>f.id).join('|')+'|'+direction(S.focus.src,S.focus.dst)+'|'+Math.floor(S.time/meta.windowSeconds);
   if(S.dirty||key!==S.key){draw();S.key=key;S.dirty=meta.cases.some(c=>!S.scenes.has(c.id));}
   updateText();S.lastDraw=wall;
  }
- paint(wall);requestAnimationFrame(frameLoop);
+ if(S.dirty||wall-S.lastPaint>=33){paint(wall);S.lastPaint=wall;}
+ requestAnimationFrame(frameLoop);
 }
 function frameLoop(wall){try{tick(wall);}catch(error){fail(error);}}
 async function init(){
@@ -481,6 +559,7 @@ async function init(){
  $('#completedLegend').innerHTML=meta.cases.map((c,i)=>'<span style="color:'+COLORS[i%3]+'">● '+esc(c.label)+'</span>').join('　');
  setup();completionChart=echarts.init($('#completionChart'));hotspotChart=echarts.init($('#hotspotChart'));globalChart=echarts.init($('#globalChart'));throughputChart=echarts.init($('#throughputChart'));utilizationChart=echarts.init($('#utilizationChart'));trendControls();
  await Promise.all([ensure(S.time),reloadTrends()]);
+ prefetchAhead(S.time);
  await new Promise(resolve=>requestAnimationFrame(resolve));
  draw();paint();controls();updateText();updateOptions();
  window.addEventListener('resize',()=>{charts().forEach(c=>c.resize());S.dirty=true;});

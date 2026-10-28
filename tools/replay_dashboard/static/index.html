@@ -5,7 +5,7 @@
 <title>TE / TOE · 网络热点与完成时间</title>
 <link rel="stylesheet" href="/static/style.css?v=11">
 <script defer src="/static/vendor/echarts.min.js"></script>
-<script defer src="/static/app.js?v=12"></script>
+<script defer src="/static/app.js?v=13"></script>
 </head>
 <body>
 <header class="heading">
@@ -19,7 +19,7 @@
  <section id="networks" class="networks" aria-label="三组固定两行拓扑"></section>
  <div class="trend-toolbar"><span id="trendStatus">趋势加载中</span><button id="trendAll" type="button">全程趋势</button><button id="trendLocal" type="button">查看当前位置前后 1 秒</button></div>
  <section class="performance-evidence">
-  <article><div class="chart-heading"><strong>Decode / URMA READ 返回吞吐 · Gbps</strong><span>存储节点 → Leaf；使用现有 tx_wire_bytes，含协议头和重传</span></div><div id="throughputChart" class="chart"></div></article>
+  <article><div class="chart-heading"><strong>存储侧双向吞吐 · Gbps</strong><span>Storage ↔ Leaf 双向接入发送量，含 READ / WRITE、协议头和重传</span></div><div id="throughputChart" class="chart"></div></article>
   <article><div class="chart-heading"><strong>Fabric 带宽利用率 · %</strong><select id="utilMetric" aria-label="利用率统计口径"><option value="fabricUtilization">整体：按容量加权</option><option value="maxUtilization">最热链路：区间峰值</option></select></div><div id="utilizationChart" class="chart"></div></article>
  </section>
  <section class="evidence">
@@ -27,8 +27,8 @@
   <article><div class="chart-heading"><strong id="hotspotTitle">焦点方向</strong><span>实线：链路发送 Gbps　虚线：容量</span></div><div id="hotspotChart" class="chart"></div></article>
   <article><div class="chart-heading"><strong>全网热点变化</strong><span>实线：最大利用率 %　虚线：高负载方向数</span></div><div id="globalChart" class="chart"></div></article>
  </section>
- <div class="footnote"><span id="cohort"></span><span>顶部存储侧吞吐与利用率均使用现有存储节点 → Leaf 接入端口 tx_wire_bytes / capacity_bits；包含协议头与重传。Fabric 利用率另按 Leaf 间链路计算。</span></div>
- <div class="playback-status" aria-label="回放控制"><button id="play" disabled>开始播放</button><button id="restart" class="secondary" disabled>从头播放</button><button id="prevFrame" class="secondary" disabled aria-label="上一采样窗口">上一帧</button><button id="nextFrame" class="secondary" disabled aria-label="下一采样窗口">下一帧</button><span id="playbackState">准备中</span><span id="currentClock">0.000 s</span><input id="timeline" type="range" min="0" max="1" value="0" step="0.01" disabled aria-label="拖动定位仿真时间"><span id="endClock">—</span><label>速度 <select id="speed" aria-label="播放速度"><option value="1">1 ×</option><option value="0.5">0.5 ×</option><option value="0.2">0.2 ×</option><option value="0.1">0.1 ×</option></select></label><span id="buffer"></span></div>
+ <div class="footnote"><span id="cohort"></span><span>存储侧统计包含 Storage → Leaf 发送和 Leaf → Storage 发送，按双向容量加权；包含协议头与重传，不等于接收端去重后的 Goodput。Fabric 利用率另按 Leaf 间链路计算。</span></div>
+ <div class="playback-status" aria-label="回放控制"><button id="play" disabled>开始播放</button><button id="restart" class="secondary" disabled>从头播放</button><button id="prevFrame" class="secondary" disabled aria-label="上一采样窗口">上一帧</button><button id="nextFrame" class="secondary" disabled aria-label="下一采样窗口">下一帧</button><span id="playbackState">准备中</span><span id="currentClock">0.000 s</span><input id="timeline" type="range" min="0" max="1" value="0" step="0.01" disabled aria-label="拖动定位仿真时间"><span id="endClock">—</span><label>速度 <select id="speed" aria-label="播放速度"><option value="1">1 ×</option><option value="0.5">0.5 ×</option><option value="0.2">0.2 ×</option><option value="0.1">0.1 ×</option><option value="0.05">0.05 ×</option><option value="0.02">0.02 ×</option><option value="0.01">0.01 ×</option></select></label><span id="buffer"></span></div>
 </main>
 <div id="preparing" class="preparing" role="status" aria-live="polite"><div class="prepare-card"><span class="eyebrow">PREPARING EXPERIMENT DATA</span><h2 id="prepareTitle">准备日志</h2><p id="prepareCase"></p><p id="prepareFile" class="prepare-file"></p><div class="prepare-track"><i id="prepareFill"></i></div><p id="prepareNumbers"></p><p id="prepareDetail">后台处理日志，完成后自动进入回放。</p></div></div>
 <div id="error" class="error" hidden><h2>无法加载实验日志</h2><p id="errorText"></p></div>

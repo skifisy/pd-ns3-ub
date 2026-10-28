@@ -37,8 +37,9 @@ class ReplayV8Checks(unittest.TestCase):
             windows=list(db.execute("SELECT t0,t1 FROM frames WHERE case_id='te' AND t0>=.1 AND t0<.11"))
             self.assertEqual(windows,[(.1,.1035),(.1035,.11)])
 
-    def test_existing_tx_wire_bytes_drive_storage_throughput(self):
-        # Fixture logs intentionally contain no READ_RESPONSE-specific column.
+    def test_bidirectional_tx_wire_bytes_drive_storage_throughput(self):
+        # Fixture logs include WRITE payload directed from a Leaf to Storage.
+        # No READ_RESPONSE-specific column is necessary.
         with sqlite3.connect(self.cache) as db:
             info=json.loads(db.execute("SELECT value FROM metadata WHERE key='bootstrap'").fetchone()[0])
             te=next(c for c in info['cases'] if c['id']=='te')
@@ -53,14 +54,26 @@ class ReplayV8Checks(unittest.TestCase):
             self.assertTrue(frame['global']['storageSampleComplete'])
             with (HERE/'smoke10ms/te/replay_link_samples.csv').open(newline='') as stream:
                 selected=[row for row in csv.DictReader(stream)
-                          if row['src_node']=='1' and row['dst_node']=='11'
+                          if (row['src_node'],row['dst_node']) in {('1','11'),('11','1')}
                           and row['start_ns']=='110000000']
-            expected=sum(int(row['tx_wire_bytes']) for row in selected)*8/.01/1e9
-            self.assertGreater(expected,0)
-            self.assertAlmostEqual(frame['global']['storageDecodeGbps'],expected)
+            sent=sum(int(row['tx_wire_bytes']) for row in selected if row['src_node']=='1')
+            received=sum(int(row['tx_wire_bytes']) for row in selected if row['src_node']=='11')
+            expected=(sent+received)*8/.01/1e9
+            self.assertEqual((sent,received),(250,6000))
+            self.assertAlmostEqual(frame['global']['storageThroughputGbps'],expected)
+            self.assertAlmostEqual(frame['global']['storageTxGbps'],sent*8/.01/1e9)
+            self.assertAlmostEqual(frame['global']['storageRxGbps'],received*8/.01/1e9)
+            wire,capacity,tx_bits,rx_bits=db.execute(
+                "SELECT storage_bits,storage_capacity,storage_tx_bits,storage_rx_bits "
+                "FROM global_samples WHERE case_id='te' AND t0=.11"
+            ).fetchone()
+            self.assertEqual((wire,tx_bits,rx_bits),(50000,2000,48000))
+            self.assertAlmostEqual(capacity,160000)
+            self.assertAlmostEqual(wire/capacity,0.3125)
             self.assertAlmostEqual(frame['global']['fabricUtilization'],.185)
             points=global_trend(db,'te',.11,.12,2,100000)
-            self.assertAlmostEqual(points[0]['storageDecodeGbps'],expected*100000)
+            self.assertAlmostEqual(points[0]['storageThroughputGbps'],expected*100000)
+            self.assertAlmostEqual(points[0]['storageTxGbps']+points[0]['storageRxGbps'],expected*100000)
 
     def test_reconfiguration_trend_uses_duration_and_capacity_integrals(self):
         with sqlite3.connect(self.cache) as db:
@@ -98,12 +111,30 @@ class ReplayV8Checks(unittest.TestCase):
         cache=self.root/'missing.sqlite';prepare(copied/'experiment.json',cache)
         with sqlite3.connect(cache) as db:
             row=global_trend(db,'te',0,1,10,100000)[0]
-            self.assertIsNone(row['storageDecodeGbps'])
+            self.assertIsNone(row['storageThroughputGbps'])
             info=json.loads(db.execute("SELECT value FROM metadata WHERE key='bootstrap'").fetchone()[0])
             te=next(c for c in info['cases'] if c['id']=='te')
             self.assertIsNone(te['storageUtilization'])
             self.assertIsNone(te['storageThroughputGbps'])
             self.assertIsNotNone(row['fabricUtilization'])
+
+
+    def test_missing_leaf_to_storage_sample_is_unknown(self):
+        copied=self.root/'missing_rx'
+        shutil.copytree(HERE/'smoke10ms',copied)
+        path=copied/'te/replay_link_samples.csv'
+        with path.open(newline='') as stream:
+            reader=csv.DictReader(stream);fields=reader.fieldnames
+            rows=[r for r in reader if not (r['src_node']=='11' and r['dst_node']=='1')]
+        with path.open('w',newline='') as stream:
+            writer=csv.DictWriter(stream,fieldnames=fields);writer.writeheader();writer.writerows(rows)
+        cache=self.root/'missing_rx.sqlite';prepare(copied/'experiment.json',cache)
+        with sqlite3.connect(cache) as db:
+            info=json.loads(db.execute("SELECT value FROM metadata WHERE key='bootstrap'").fetchone()[0])
+            te=next(c for c in info['cases'] if c['id']=='te')
+            self.assertFalse(te['storageSampleComplete'])
+            self.assertIsNone(te['storageUtilization'])
+            self.assertIsNone(te['storageThroughputGbps'])
 
 
 if __name__=='__main__':
