@@ -142,6 +142,33 @@ function changeAt(c,t){
  const g=groups.at(-1),applied=g.time!=null&&g.time<=t;
  return {...g,applied,failed:!applied&&c.events.some(e=>e.event==='toe-drain-timeout'&&e.toeEpoch===g.epoch&&e.time<=t)};
 }
+function edgeForPair(state,src,dst){
+ return state?.edges?.find(e=>e.src===src&&e.dst===dst)||state?.edges?.find(e=>e.src===dst&&e.dst===src)||null;
+}
+function capacityLabel(v){
+ if(!finite(v))return '待确认';
+ return Math.abs(v)>=1000?number(v/1000,2)+' Tbps':number(v,0)+' Gbps';
+}
+function focusChangeDetails(c,change,focus){
+ const delta=change.changes.find(d=>pair(d.src,d.dst)===pair(focus.src,focus.dst));
+ if(!delta)return null;
+ if(change.applied){
+  const states=[...c.topologyStates].sort((a,b)=>a.time-b.time);
+  let afterIndex=states.findIndex(s=>s.epoch===change.epoch);
+  if(afterIndex<0)afterIndex=states.findIndex(s=>Math.abs(s.time-change.time)<1e-8);
+  const afterState=afterIndex>=0?states[afterIndex]:topologyAt(c,change.time);
+  const beforeState=afterIndex>0?states[afterIndex-1]:states.filter(s=>s.time<change.time).at(-1);
+  const beforeEdge=edgeForPair(beforeState,focus.src,focus.dst),afterEdge=edgeForPair(afterState,focus.src,focus.dst);
+  const beforeCapacity=delta.before===0?0:finite(beforeEdge?.capacity)?beforeEdge.capacity:null;
+  const afterCapacity=delta.after===0?0:finite(afterEdge?.capacity)?afterEdge.capacity:null;
+  return {...delta,beforeCapacity,afterCapacity,capacityKnown:beforeCapacity!==null&&afterCapacity!==null};
+ }
+ const state=topologyAt(c,change.planTime??S.time),edge=edgeForPair(state,focus.src,focus.dst);
+ const perCircuit=edge&&edge.circuits>0&&finite(edge.capacity)?edge.capacity/edge.circuits:null;
+ const beforeCapacity=delta.before===0?0:perCircuit===null?null:delta.before*perCircuit;
+ const afterCapacity=delta.after===0?0:perCircuit===null?null:delta.after*perCircuit;
+ return {...delta,beforeCapacity,afterCapacity,capacityKnown:beforeCapacity!==null&&afterCapacity!==null};
+}
 function setup(){
  $('#globalCards').innerHTML=meta.cases.map((c,i)=>'<article class="global-card" style="--case:'+COLORS[i%3]+'"><div class="card-heading"><h2>'+esc(c.label)+'</h2><span>最终 FCT · 固定共同完成任务集</span></div><div class="quantiles">'+['p50','p90','p99'].map(k=>{
   const q=c.quantiles[k],gain=c.mode==='ecmp'?'基线':q.improvement==null?'无共同完成任务':(q.improvement>=0?'降低 ':'增加 ')+number(Math.abs(q.improvement))+'%';
@@ -199,9 +226,11 @@ function makeScene(c,frame,i){
  const buffer=document.createElement('canvas');buffer.width=canvas.width;buffer.height=canvas.height;
  const ctx=buffer.getContext('2d');ctx.scale(dpr,dpr);ctx.lineCap='round';
  const {positions}=layout(w,h),observed=new Map(frame.edges.map(e=>[direction(e.src,e.dst),e]));
- const paths=focusedPaths(frame),mids=midpoints(c,frame),focusKeys=new Set([pair(S.focus.src,S.focus.dst)]),flow=new Map(),nodeRates=new Map(),pathColors=new Map();
+ const paths=focusedPaths(frame),mids=midpoints(c,frame),focusKeys=new Set([pair(S.focus.src,S.focus.dst)]),flow=new Map(),nodeRates=new Map(),pathColors=new Map(),endpointRoles=new Map();
  const addFlow=(a,b,rate)=>{const k=direction(a,b),old=flow.get(k);flow.set(k,{a,b,rate:(old?.rate||0)+rate});focusKeys.add(pair(a,b));};
  for(const p of paths){
+   const sourceRoles=endpointRoles.get(p.srcNode)||new Set();sourceRoles.add('P');endpointRoles.set(p.srcNode,sourceRoles);
+   const destRoles=endpointRoles.get(p.dstNode)||new Set();destRoles.add('D');endpointRoles.set(p.dstNode,destRoles);
   addFlow(p.srcNode,p.src,p.gbps);addFlow(p.dst,p.dstNode,p.gbps);
   if(p.transit<0)addFlow(p.src,p.dst,p.gbps);else{addFlow(p.src,p.transit,p.gbps);addFlow(p.transit,p.dst,p.gbps);}
   if(p.transit>=0)for(const [a,b] of [[p.src,p.transit],[p.transit,p.dst]])pathColors.set(pair(a,b),transitColor(p.transit));
@@ -249,18 +278,27 @@ function makeScene(c,frame,i){
   badge(ctx,(d.delta>0?'+':'')+d.delta+' '+d.before+'→'+d.after+(change.applied?'':' 待'),p[0],p[1]+10,color);
  }
  const topRates=new Set([...nodeRates].sort((a,b)=>(b[1].tx+b[1].rx)-(a[1].tx+a[1].rx)).slice(0,5).map(([id])=>id));
- for(const n of nodes){
-  const [x,y]=positions.get(n.id),upper=leaves.includes(n.id),active=upper?(n.id===S.focus.src||n.id===S.focus.dst||mids.includes(n.id)):nodeRates.has(n.id);
-  ctx.save();ctx.fillStyle=active?'#244c69':upper?'#edf3f7':n.role==='storage-server'?'#e3daef':'#d7eaf4';ctx.strokeStyle=active?'#173a55':upper?'#8ca6b9':n.role==='storage-server'?'#9a83b6':'#75a6c0';ctx.lineWidth=active?1.8:1;
-  if(upper){ctx.fillStyle=n.role==='storage-leaf'?'#e3daef':'#d7eaf4';if(mids.includes(n.id)){ctx.fillStyle=transitColor(n.id);ctx.strokeStyle=transitColor(n.id);}else if(active){ctx.strokeStyle='#173a55';ctx.lineWidth=2.5;}}
-  ctx.beginPath();if(upper)ctx.rect(x-10,y-6,20,12);else if(n.role==='storage-server')ctx.rect(x-5,y-5,10,10);else ctx.arc(x,y,5,0,Math.PI*2);ctx.fill();ctx.stroke();
-  ctx.textAlign='center';ctx.fillStyle=active?'#24445b':'#7c91a0';ctx.font=(upper?'10':'9')+'px ui-monospace,monospace';
-  if(upper&&mids.includes(n.id))ctx.fillStyle=transitColor(n.id);
-  ctx.fillText((upper?'L':n.role==='storage-server'?'S':'C')+n.id+(upper&&mids.includes(n.id)?' 中转':''),x,y+17);
-  if(topRates.has(n.id)){const rate=nodeRates.get(n.id);ctx.font='8px ui-monospace,monospace';ctx.fillText((rate.tx?'↑'+number(rate.tx,0):'')+(rate.tx&&rate.rx?' / ':'')+(rate.rx?'↓'+number(rate.rx,0):'')+'G',x,y-10);}
-  ctx.restore();
- }
- const routes=[];
+  for(const n of nodes){
+   const [x,y]=positions.get(n.id),upper=leaves.includes(n.id),active=upper?(n.id===S.focus.src||n.id===S.focus.dst||mids.includes(n.id)):nodeRates.has(n.id);
+   const roles=n.role==='compute-server'?endpointRoles.get(n.id):null;
+   const endpointRole=roles?.size===2?'P/D':roles?.has('P')?'P':roles?.has('D')?'D':null;
+   ctx.save();ctx.fillStyle=active?'#244c69':upper?'#edf3f7':n.role==='storage-server'?'#e3daef':'#d7eaf4';ctx.strokeStyle=active?'#173a55':upper?'#8ca6b9':n.role==='storage-server'?'#9a83b6':'#75a6c0';ctx.lineWidth=active?1.8:1;
+   if(upper){ctx.fillStyle=n.role==='storage-leaf'?'#e3daef':'#d7eaf4';if(mids.includes(n.id)){ctx.fillStyle=transitColor(n.id);ctx.strokeStyle=transitColor(n.id);}else if(active){ctx.strokeStyle='#173a55';ctx.lineWidth=2.5;}}
+   ctx.beginPath();
+   if(upper)ctx.rect(x-10,y-6,20,12);
+   else if(n.role==='storage-server')ctx.rect(x-5,y-5,10,10);
+   else if(endpointRole==='D'){ctx.moveTo(x,y-6);ctx.lineTo(x+6,y);ctx.lineTo(x,y+6);ctx.lineTo(x-6,y);ctx.closePath();}
+   else if(endpointRole==='P/D'){ctx.moveTo(x-5,y-3);ctx.lineTo(x,y-6);ctx.lineTo(x+5,y-3);ctx.lineTo(x+5,y+3);ctx.lineTo(x,y+6);ctx.lineTo(x-5,y+3);ctx.closePath();}
+   else ctx.arc(x,y,5,0,Math.PI*2);
+   ctx.fill();ctx.stroke();
+   ctx.textAlign='center';ctx.fillStyle=active?'#24445b':'#7c91a0';ctx.font=(upper?'10':'9')+'px ui-monospace,monospace';
+   if(upper&&mids.includes(n.id))ctx.fillStyle=transitColor(n.id);
+   const prefix=upper?'L':n.role==='storage-server'?'S':endpointRole||'C';
+   ctx.fillText(prefix+n.id+(upper&&mids.includes(n.id)?' 中转':''),x,y+17);
+   if(topRates.has(n.id)){const rate=nodeRates.get(n.id);ctx.font='8px ui-monospace,monospace';ctx.fillText((rate.tx?'↑'+number(rate.tx,0):'')+(rate.tx&&rate.rx?' / ':'')+(rate.rx?'↓'+number(rate.rx,0):'')+'G',x,y-10);}
+   ctx.restore();
+  }
+  const routes=[];
  for(const f of flow.values()){
   const base=geometries.get(pair(f.a,f.b));if(!base||f.rate<=0)continue;
   const g=positions.get(f.a)===base.a?base:{a:base.b,b:base.a,c:base.c};
@@ -279,31 +317,55 @@ function paint(wall){
 }
 function action(c,frame,i){
  const f=S.focus,e=frame.edges.find(e=>e.src===f.src&&e.dst===f.dst),reverse=frame.edges.find(e=>e.src===f.dst&&e.dst===f.src),paths=focusedPaths(frame),mids=midpoints(c,frame),change=changeAt(c,S.time);
- $('#action-label-'+i).textContent='焦点 L'+f.src+' → L'+f.dst+'　·　'+percent(e?.utilization);
- const payload=paths.reduce((n,p)=>n+p.gbps,0);
+ $('#action-label-'+i).textContent='焦点 L'+f.src+' → L'+f.dst+'　·　正向 '+percent(e?.utilization)+' / 反向 '+percent(reverse?.utilization);
+ const payload=paths.reduce((n,p)=>n+(finite(p.gbps)?p.gbps:0),0);
+ const isToe=c.mode.startsWith('toe')&&change;
  let title=mids.length?'实际中转路径':'直达方向与接入流量',lines='';
- if(c.mode.startsWith('toe')&&change){
+ if(isToe){
   title=change.failed?'重配未生效':change.applied?'重配已生效':'重配待生效';
-  const rotate=rows=>{if(rows.length<=2)return rows;const at=Math.floor(Math.max(0,S.time-(change.planTime??change.time))/2)%rows.length;return [rows[at],rows[(at+1)%rows.length]];};
-  lines='<div>'+(!change.applied?'计划：':'已变更：')+'增加 '+change.added+' / 减少 '+change.removed+' 条</div>'+
-   [...rotate(change.changes.filter(d=>d.delta>0)),...rotate(change.changes.filter(d=>d.delta<0))].map(d=>'<div class="'+(d.delta>0?'added':'removed')+'">L'+d.src+'↔L'+d.dst+' '+(d.delta>0?'+':'')+d.delta+'　'+d.before+'→'+d.after+'</div>').join('');
-  if(change.failed)lines='<div>排空超时；实际连接和容量保持原值。</div>';
- }else{
-  lines=mids.map(m=>'<div class="route-label" style="color:'+transitColor(m)+'">L'+f.src+' → L'+m+' → L'+f.dst+'</div>').join('');
-  if(!mids.length)lines='<div>观察 L'+f.src+' → L'+f.dst+'</div>';
-  if(paths.length){
-   const largest=[...paths].sort((a,b)=>b.gbps-a.gbps).slice(0,2);
-   lines+='<div>该方向节点载荷发送 '+number(payload,0)+' Gbps</div>'+largest.map(p=>'<div>节点 '+p.srcNode+' → '+p.dstNode+'　'+number(p.gbps,0)+' Gbps</div>').join('');
- }else lines+='<div>'+(frame.pathLoading?'路径详情加载中':detailAvailable(c,S.time)?'本窗口无该方向载荷记录':'此时间段未采集端到端路径详情')+'</div>';
+  const globalLabel=change.applied?'全局拓扑变化':'计划拓扑变化';
+  lines+='<div class="toe-summary">'+globalLabel+'：新增 '+change.added+' 条连接 · 拆除 '+change.removed+' 条连接 · 影响 '+change.changes.length+' 对 Leaf</div>';
+  const focal=focusChangeDetails(c,change,f);
+  if(!focal){
+   lines+='<div class="focus-change">焦点 L'+f.src+' ↔ L'+f.dst+'：本次重配未调整该 Leaf 对</div>';
+  }else if(change.applied){
+   lines+='<div class="focus-change">焦点连接数 '+focal.before+' → '+focal.after+' 条</div>';
+   lines+='<div>单方向容量 '+capacityLabel(focal.beforeCapacity)+' → '+capacityLabel(focal.afterCapacity)+'</div>';
+  }else{
+   lines+='<div class="focus-change">计划连接数 '+focal.before+' → '+focal.after+' 条</div>';
+   if(change.failed){
+    const actualEdge=edgeForPair(topologyAt(c,S.time),f.src,f.dst),actualCapacity=actualEdge?.capacity??0;
+    lines+='<div>实际单方向容量 '+capacityLabel(actualCapacity)+'（未变化）</div>';
+   }else if(focal.capacityKnown){
+    lines+='<div>计划单方向容量 '+capacityLabel(focal.beforeCapacity)+' → '+capacityLabel(focal.afterCapacity)+'</div>';
+   }else{
+    lines+='<div>计划单方向容量待生效后确认</div>';
+   }
+  }
  }
- const phase={steady:'正常转发',draining:'排空',guard:'保护等待',applied:'拓扑生效',finished:'实验结束',missing:'无采样'}[frame.phase]||frame.phase;
- if(c.mode.startsWith('toe')&&change){
+ if(mids.length){
   lines+=mids.map(m=>'<div class="route-label" style="color:'+transitColor(m)+'">L'+f.src+' → L'+m+' → L'+f.dst+'</div>').join('');
-  lines+='<div>'+(paths.length?'该方向节点载荷发送 '+number(payload,2)+' Gbps':frame.pathLoading?'路径详情加载中':detailAvailable(c,S.time)?'本窗口无该方向载荷记录':'此时间段未采集端到端路径详情')+'</div>';
+ }else{
+  lines+='<div class="route-label">直达：L'+f.src+' → L'+f.dst+'</div>';
  }
- if(mids.length)lines+='<div class="transit-legend">'+mids.map(m=>'<span style="color:'+transitColor(m)+'">● L'+m+' 中转</span>').join('　')+'</div>';
+ if(paths.length){
+  const pairs=new Map();
+  for(const p of paths){
+   const key=String(p.srcNode)+'-'+String(p.dstNode);
+   const row=pairs.get(key)||{srcNode:p.srcNode,dstNode:p.dstNode,gbps:0};
+   row.gbps+=finite(p.gbps)?p.gbps:0;pairs.set(key,row);
+  }
+  const largest=[...pairs.values()].sort((a,b)=>b.gbps-a.gbps||a.srcNode-b.srcNode||a.dstNode-b.dstNode);
+  lines+='<div>端点载荷合计 '+number(payload,2)+' Gbps</div>';
+  lines+='<ul class="endpoint-list">'+largest.slice(0,3).map(p=>'<li><span>P'+p.srcNode+' → D'+p.dstNode+'</span><span>'+number(p.gbps,2)+' Gbps</span></li>').join('')+(largest.length>3?'<li class="endpoint-ellipsis">…</li>':'')+'</ul>';
+ }else{
+  lines+='<div>'+(frame.pathLoading?'路径详情加载中':detailAvailable(c,S.time)?'当前窗口未观测到该方向的端点载荷':'此时间段未采集端到端路径详情')+'</div>';
+ }
  $('#action-title-'+i).textContent=title;$('#action-lines-'+i).innerHTML=lines;
- $('#action-footer-'+i).innerHTML='窗口 '+number(frame.start,6)+'–'+number(frame.end,6)+' s<br>链路发送 <b>'+number(e?.gbps,0)+'</b> / 容量 <b>'+number(e?.capacity,0)+'</b> Gbps<br>反向 '+percent(reverse?.utilization)+'　·　'+esc(phase)+'　·　拓扑 v'+frame.topologyEpoch+'<br>'+(c.capabilities.accessSamples?'接入层有链路采样':'接入层无采样，保留灰色结构线');
+ const phase={draining:'排空',guard:'保护等待',applied:'拓扑生效',missing:'无采样'}[frame.phase]||'';
+ const footer=['窗口 '+number(frame.start,6)+'–'+number(frame.end,6)+' s','正向发送 '+number(e?.gbps,0)+' / 容量 '+number(e?.capacity,0)+' Gbps'];
+ if(phase)footer.push(phase);
+ $('#action-footer-'+i).innerHTML=footer.join('<br>');
 }
 function draw(){
  meta.cases.forEach((c,i)=>{
