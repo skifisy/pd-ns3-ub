@@ -74,7 +74,7 @@ taskId,sourceNode,destNode,dataSize(Byte),opType,taskStartTime(us),taskCompletes
 
 缺少 CSV、CSV 列不完整、时间戳无效、没有有效完成任务或各组没有共同完成任务时，程序会在终端报错并以非零退出码结束，不启动可继续使用的空 Dashboard。
 
-沿用 `traffic.csv` 的全局 `taskId` 校验任务身份。顶部 P50/P90/P99 使用所有实验组共同完成任务的原始 FCT；同时保留各组总数、完成数和未完成数。
+沿用 `traffic.csv` 的全局 `taskId` 校验任务身份。顶部 P50/P90/P99 使用所有实验组共同完成任务的原始 FCT 计算，页面以 ms 展示并保留两位小数；同时保留各组总数、完成数和未完成数。
 任务以最多 20000 条一批写入 SQLite；精确分位数使用磁盘排序。数据库缓存约 64 MiB，临时排序落盘。
 该配置不是整个进程内存的硬上限，仍需为任务、索引、临时排序和旧/新缓存预留磁盘。
 ## 吞吐、容量和利用率
