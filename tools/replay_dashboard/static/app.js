@@ -154,8 +154,8 @@ function focusChangeDetails(c,change,focus){
  if(!delta)return null;
  if(change.applied){
   const states=[...c.topologyStates].sort((a,b)=>a.time-b.time);
-  let afterIndex=states.findIndex(s=>s.epoch===change.epoch);
-  if(afterIndex<0)afterIndex=states.findIndex(s=>Math.abs(s.time-change.time)<1e-8);
+  let afterIndex=states.findIndex(s=>Math.abs(s.time-change.time)<1e-8);
+  if(afterIndex<0)afterIndex=states.findIndex(s=>s.epoch===change.epoch);
   const afterState=afterIndex>=0?states[afterIndex]:topologyAt(c,change.time);
   const beforeState=afterIndex>0?states[afterIndex-1]:states.filter(s=>s.time<change.time).at(-1);
   const beforeEdge=edgeForPair(beforeState,focus.src,focus.dst),afterEdge=edgeForPair(afterState,focus.src,focus.dst);
@@ -323,8 +323,8 @@ function action(c,frame,i){
  let title=mids.length?'实际中转路径':'直达方向与接入流量',lines='';
  if(isToe){
   title=change.failed?'重配未生效':change.applied?'重配已生效':'重配待生效';
-  const globalLabel=change.applied?'全局拓扑变化':'计划拓扑变化';
-  lines+='<div class="toe-summary">'+globalLabel+'：新增 '+change.added+' 条连接 · 拆除 '+change.removed+' 条连接 · 影响 '+change.changes.length+' 对 Leaf</div>';
+  const globalLabel=change.applied?'全局拓扑变化':change.failed?'未生效计划':'待生效计划',globalVerb=change.applied?'影响':'涉及';
+  lines+='<div class="toe-summary">'+globalLabel+'：新增 '+change.added+' / 拆除 '+change.removed+' 条连接 · '+globalVerb+' '+change.changes.length+' 对 Leaf</div>';
   const focal=focusChangeDetails(c,change,f);
   if(!focal){
    lines+='<div class="focus-change">焦点 L'+f.src+' ↔ L'+f.dst+'：本次重配未调整该 Leaf 对</div>';
