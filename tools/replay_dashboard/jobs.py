@@ -6,7 +6,7 @@ import sqlite3
 from prepare import prepare
 
 
-def import_worker(manifest, cache, messages, allow_synthetic):
+def import_worker(manifest, cache, messages, allow_synthetic, use_cache=False, force=False):
     last = {}
     def send(state):
         nonlocal last
@@ -26,7 +26,7 @@ def import_worker(manifest, cache, messages, allow_synthetic):
             except Full:
                 pass
     try:
-        prepare(manifest, cache, progress=send)
+        prepare(manifest, cache, force=force, progress=send, use_cache=use_cache)
         with sqlite3.connect(cache) as db:
             info = json.loads(db.execute("SELECT value FROM metadata WHERE key='bootstrap'").fetchone()[0])
         if info['synthetic'] and not allow_synthetic:

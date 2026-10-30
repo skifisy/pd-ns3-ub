@@ -14,7 +14,47 @@ from progress import Progress
 from task_store import (create_tables, import_workload, import_tasks, completion_buckets,
                         common_quantiles, task_sources, picoseconds)
 
-CACHE_SCHEMA = 13
+CACHE_SCHEMA = 14
+PROCESSING_FILES = ('prepare.py', 'topology.py', 'recording.py', 'progress.py', 'task_store.py')
+
+
+def code_fingerprint():
+    return [(name, hashlib.sha256(Path(__file__).with_name(name).read_bytes()).hexdigest())
+            for name in PROCESSING_FILES]
+
+
+def validate_cache(cache_path):
+    """Check serving compatibility without touching any original experiment files."""
+    cache_path = Path(cache_path).resolve()
+    if not cache_path.is_file():
+        raise FileNotFoundError(f'SQLite cache not found: {cache_path}')
+    required = {
+        'metadata': 'key value', 'frames': 'case_id t0 t1 data',
+        'global_samples': ('case_id t0 t1 max_util hot measured storage_bits storage_duration '
+                           'storage_capacity fabric_bits fabric_capacity storage_tx_bits storage_rx_bits'),
+        'link_trends': 'case_id t0 src dst capacity gbps util queue',
+        'node_paths': 'case_id sample t0 t1 sn dn src dst mid bytes',
+        'playback_progress': 'case_id time_ps started completed running',
+    }
+    try:
+        with sqlite3.connect(f'{cache_path.as_uri()}?mode=ro', uri=True) as db:
+            for table, columns in required.items():
+                actual = {r[1] for r in db.execute(f'PRAGMA table_info({table})')}
+                if not set(columns.split()) <= actual:
+                    raise ValueError(f'Incompatible SQLite cache: missing columns in {table}')
+            row = db.execute("SELECT value FROM metadata WHERE key='schema'").fetchone()
+            if row and int(row[0]) not in (13, CACHE_SCHEMA):
+                raise ValueError(f'Unsupported SQLite cache schema: {row[0]}')
+            row = db.execute("SELECT value FROM metadata WHERE key='bootstrap'").fetchone()
+            info = json.loads(row[0]) if row else None
+            if not isinstance(info, dict) or not info.get('cases') or not info.get('topology'):
+                raise ValueError('Incompatible SQLite cache: missing bootstrap data')
+            if any(c.get('capabilities', {}).get('wcmpPolicy') for c in info['cases']):
+                db.execute('SELECT case_id,epoch,time FROM policy_epochs LIMIT 0')
+                db.execute('SELECT case_id,epoch,src,dst,transit,weight FROM policy_weights LIMIT 0')
+    except (sqlite3.DatabaseError, json.JSONDecodeError, TypeError, KeyError) as error:
+        raise ValueError(f'Invalid SQLite cache: {error}') from error
+    return cache_path
 
 
 def dumps(value):
@@ -54,7 +94,7 @@ def quantile(values, q=.99, ordered=False):
 def fingerprint(manifest):
     manifest = Path(manifest).resolve()
     config = json.loads(manifest.read_text(encoding='utf-8'))
-    files = {manifest, Path(__file__), Path(__file__).with_name('topology.py'), Path(__file__).with_name('recording.py'), Path(__file__).with_name('progress.py'), Path(__file__).with_name('task_store.py'), Path(__file__).with_name('queries.py')}
+    files = {manifest}
     root = manifest.parent
     for case in config['cases']:
         case_path = (root / case['path']).resolve()
@@ -73,7 +113,7 @@ def fingerprint(manifest):
         path = (root / config['workload']).resolve()
         files.add(path if path.exists() else Path(str(path) + '.gz'))
     info = [(str(p), p.stat().st_size, p.stat().st_mtime_ns) for p in sorted(files)]
-    return hashlib.sha256(dumps([CACHE_SCHEMA, info]).encode()).hexdigest()
+    return hashlib.sha256(dumps([CACHE_SCHEMA, info, code_fingerprint()]).encode()).hexdigest()
 
 
 def load_case(db, root, config, topology, reporter):
@@ -160,7 +200,20 @@ def load_case(db, root, config, topology, reporter):
         events.append(dict(id=int(r['event_id']), time=float(r['time_ns']) / 1e9, event=r['event'], topologyEpoch=int(r['topology_epoch']), teEpoch=int(r['te_epoch']), toeEpoch=int(r['toe_decision_epoch']), phase=r['toe_phase']))
     task_info = import_tasks(db, root, config, reporter)
     epochs = {int(r['epoch']): float(r['sim_time_seconds']) for r in optional_rows(te_directory / 'epoch_summary.csv')}
+    # Publication events take precedence over solver timestamps. Include fallback
+    # epochs too: a publication with no weights must clear the previous policy.
+    epochs.update({e['teEpoch']: e['time'] for e in events
+                   if e['event'] in ('te-policy-published', 'te-fallback-published')})
     weights = [dict(time=epochs.get(int(r['epoch'])), epoch=int(r['epoch']), src=int(r['src_leaf']), dst=int(r['dst_leaf']), transit=int(r['transit_leaf']), weight=float(r['weight'])) for r in optional_rows(te_directory / 'weights.csv')]
+    for weight in weights:
+        if weight['time'] is None or not math.isfinite(weight['weight']) or weight['weight'] < 0:
+            raise ValueError(f'{case_id}: invalid WCMP weight or missing publication time')
+    db.executemany('INSERT INTO policy_epochs VALUES(?,?,?)',
+                   [(case_id, epoch, time) for epoch, time in epochs.items()])
+    db.executemany('INSERT INTO policy_weights VALUES(?,?,?,?,?,?)',
+                   [(case_id, w['epoch'], w['src'], w['dst'], w['transit'], w['weight']) for w in weights])
+    weight_file = te_directory / 'weights.csv'
+    has_policy = weight_file.exists() or Path(str(weight_file) + '.gz').exists()
     plans = [dict(epoch=int(r['epoch']), time=float(r['time_seconds']), status=r['status'], src=int(r['src_leaf']), srcPort=int(r['src_port']), dst=int(r['dst_leaf']), dstPort=int(r['dst_port'])) for r in optional_rows(toe_directory / 'toe_circuits.csv') if r['status'] in ('remove', 'add')]
     path_samples = defaultdict(list)
     for r in (() if has_node_paths else optional_rows(path / 'replay_path_samples.csv')):
@@ -355,7 +408,7 @@ def load_case(db, root, config, topology, reporter):
     info = dict(id=case_id, mode=mode, label=config.get('label', case_id.upper()), metadata=metadata,
                 synthetic=metadata.get('synthetic', '').lower() == 'true', events=events, weights=weights, plans=plans,
                 routeEvidence=route_evidence, hasPathSamples=path_file.exists() or Path(str(path_file) + '.gz').exists(),
-                capabilities=dict(accessSamples=access_sampled,nodePaths=has_node_paths),
+                capabilities=dict(accessSamples=access_sampled,nodePaths=has_node_paths,wcmpPolicy=has_policy),
                 detailWindows=detail_windows,maxRateGbps=max_rate,
                 storageUtilization=storage_utilization,
                 storageThroughputGbps=storage_throughput_gbps,
@@ -369,9 +422,15 @@ def load_case(db, root, config, topology, reporter):
     return info
 
 
-def prepare(manifest_path, cache_path, force=False, progress=None):
+def prepare(manifest_path, cache_path, force=False, progress=None, use_cache=False):
     reporter = Progress(progress)
     reporter.stage('checking','检查输入与缓存')
+    if force and use_cache:
+        raise ValueError('--force and --use-cache are mutually exclusive')
+    if use_cache:
+        cached = validate_cache(cache_path)
+        reporter.stage('cached','强制复用 SQLite 缓存，跳过原始日志检查与导入')
+        return cached
     manifest_path, cache_path = Path(manifest_path).resolve(), Path(cache_path).resolve()
     token = fingerprint(manifest_path)
     if cache_path.exists() and not force:
@@ -379,9 +438,10 @@ def prepare(manifest_path, cache_path, force=False, progress=None):
             try:
                 row = old.execute("SELECT value FROM metadata WHERE key='fingerprint'").fetchone()
                 if row and row[0] == token:
+                    validate_cache(cache_path)
                     reporter.stage('cached','命中缓存，读取已处理数据')
                     return cache_path
-            except sqlite3.DatabaseError:
+            except (sqlite3.DatabaseError, ValueError):
                 pass
     config = json.loads(manifest_path.read_text(encoding='utf-8'))
     step_ms = float(config.get('window_ms',10))
@@ -411,6 +471,7 @@ def prepare(manifest_path, cache_path, force=False, progress=None):
     with sqlite3.connect(temporary) as db:
         db.executescript("PRAGMA journal_mode=DELETE; PRAGMA synchronous=NORMAL; PRAGMA temp_store=FILE; PRAGMA cache_size=-65536; PRAGMA mmap_size=0; CREATE TABLE metadata(key TEXT PRIMARY KEY,value TEXT); CREATE TABLE frames(case_id TEXT,t0 REAL,t1 REAL,data BLOB,PRIMARY KEY(case_id,t0)); CREATE INDEX frames_range ON frames(case_id,t1);")
         db.executescript('CREATE TABLE global_samples(case_id TEXT,t0 REAL,t1 REAL,max_util REAL,hot INTEGER,measured INTEGER,storage_bits INTEGER,storage_duration REAL,storage_capacity REAL,fabric_bits INTEGER,fabric_capacity REAL,fabric_util REAL,storage_tx_bits INTEGER,storage_rx_bits INTEGER,PRIMARY KEY(case_id,t0)); CREATE TABLE link_trends(case_id TEXT,t0 REAL,src INTEGER,dst INTEGER,capacity REAL,gbps REAL,util REAL,queue REAL,PRIMARY KEY(case_id,src,dst,t0)); CREATE TABLE node_paths(case_id TEXT,sample INTEGER,t0 REAL,t1 REAL,sn INTEGER,dn INTEGER,src INTEGER,dst INTEGER,mid INTEGER,bytes INTEGER);')
+        db.executescript('CREATE TABLE policy_epochs(case_id TEXT,epoch INTEGER,time REAL,PRIMARY KEY(case_id,epoch)); CREATE INDEX policy_time ON policy_epochs(case_id,time); CREATE TABLE policy_weights(case_id TEXT,epoch INTEGER,src INTEGER,dst INTEGER,transit INTEGER,weight REAL,PRIMARY KEY(case_id,epoch,src,dst,transit));')
         db.set_progress_handler(lambda: (reporter.update(),0)[1],200000)
         create_tables(db)
         reporter.stage('workload','分批导入 workload 到磁盘')
@@ -457,7 +518,7 @@ def prepare(manifest_path, cache_path, force=False, progress=None):
                          selectedTask=selected, recording=recording, statistics=config.get('statistics',{}),
                          rateScaleGbps=max((c['maxRateGbps'] for c in cases),default=1))
         reporter.stage('indexing','提交统计与索引，准备回放')
-        for k, value in [('fingerprint', token), ('bootstrap', dumps(bootstrap)), ('manifest', str(manifest_path))]:
+        for k, value in [('schema', str(CACHE_SCHEMA)), ('fingerprint', token), ('bootstrap', dumps(bootstrap)), ('manifest', str(manifest_path))]:
             db.execute('INSERT INTO metadata VALUES(?,?)', (k, value))
     temporary.replace(cache_path)
     return cache_path
@@ -471,9 +532,11 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--manifest', type=Path, required=True)
     parser.add_argument('--cache', type=Path, default=Path(__file__).parent / 'cache/replay.sqlite')
-    parser.add_argument('--force', action='store_true')
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument('--force', action='store_true', help='Rebuild the SQLite cache')
+    mode.add_argument('--use-cache', action='store_true', help='Use the existing SQLite cache without checking source logs')
     args = parser.parse_args()
     try:
-        print(prepare(args.manifest, args.cache, args.force))
+        print(prepare(args.manifest, args.cache, args.force, use_cache=args.use_cache))
     except Exception as error:
         parser.exit(2, f'ERROR: {error}\n')

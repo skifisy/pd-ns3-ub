@@ -53,3 +53,7 @@ main{margin-bottom:65px}
 .action-lines .endpoint-list li span:first-child{min-width:0}
 .action-lines .endpoint-list li span:last-child{white-space:nowrap;font-variant-numeric:tabular-nums;margin-left:5px}
 .action-lines .endpoint-ellipsis{list-style:none;margin-left:-15px}
+.heat-legend{flex-wrap:wrap}
+.heat-legend .policy{border-color:#7852bb;border-top-style:dashed}
+.action-lines{overflow:auto}
+.action-lines .policy-route{border-left:2px dashed;padding-left:4px;margin:2px 0}

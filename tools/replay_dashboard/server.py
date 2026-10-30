@@ -19,9 +19,9 @@ from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 
 from jobs import import_worker
-from prepare import decode_frame
+from prepare import decode_frame, validate_cache
 from task_store import task_sources
-from queries import interval, progress_rows, completion_trend, global_trend as query_global, link_trend
+from queries import interval, progress_rows, completion_trend, global_trend as query_global, link_trend, policy_windows
 
 HERE = Path(__file__).resolve().parent
 
@@ -50,7 +50,7 @@ async def lifespan(application):
         raise ValueError('throughputScale must be positive and finite')
     context = multiprocessing.get_context('spawn')
     messages = context.Queue(maxsize=64)
-    process = context.Process(target=import_worker,args=(str(manifest),str(cache),messages,os.environ.get('REPLAY_ALLOW_SYNTHETIC')=='1'),daemon=True)
+    process = context.Process(target=import_worker,args=(str(manifest),str(cache),messages,os.environ.get('REPLAY_ALLOW_SYNTHETIC')=='1',os.environ.get('REPLAY_USE_CACHE')=='1',os.environ.get('REPLAY_FORCE')=='1'),daemon=True)
     process.start()
 
     async def monitor():
@@ -197,7 +197,7 @@ def paths(src:int,dst:int,start:float=Query(0,ge=0),end:float=Query(.5,ge=0)):
     if not math.isfinite(start) or not math.isfinite(end) or end<=start or end-start>2:
         raise HTTPException(400,'Path detail requests are limited to 2 simulation seconds')
     scale = getattr(app.state, 'scale', 1)
-    result={}
+    result={}; policies={}
     with connection() as db:
         for case in info['cases']:
             windows={}
@@ -205,7 +205,9 @@ def paths(src:int,dst:int,start:float=Query(0,ge=0),end:float=Query(.5,ge=0)):
                 if t1<=start: continue
                 windows.setdefault(str(sample),[]).append(dict(srcNode=sn,dstNode=dn,src=src,dst=dst,transit=mid,payloadBytes=n,gbps=n*8/(t1-t0)/1e9*scale))
             result[case['id']]=windows
-    return dict(src=src,dst=dst,start=start,end=end,cases=result)
+            policies[case['id']] = (policy_windows(db,case['id'],src,dst,start,end)
+                                   if case.get('capabilities',{}).get('wcmpPolicy') else None)
+    return dict(src=src,dst=dst,start=start,end=end,cases=result,policies=policies)
 
 
 @app.get('/api/trend')
@@ -241,6 +243,9 @@ if __name__=='__main__':
     parser.add_argument('--host',default='127.0.0.1')
     parser.add_argument('--port',type=int,default=8000)
     parser.add_argument('--cache',type=Path)
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument('--use-cache',action='store_true',help='Use existing SQLite without checking source logs')
+    mode.add_argument('--force',action='store_true',help='Rebuild the SQLite cache')
     args = parser.parse_args()
     if args.smoke:
         args.manifest = HERE/'smoke10ms/experiment.json'
@@ -253,16 +258,26 @@ if __name__=='__main__':
         os.environ['REPLAY_MANIFEST']=str(args.manifest.resolve())
     if args.cache:
         os.environ['REPLAY_CACHE']=str(args.cache.resolve())
+    if args.use_cache:
+        os.environ['REPLAY_USE_CACHE']='1'
+    if args.force:
+        os.environ['REPLAY_FORCE']='1'
+    use_cache = os.environ.get('REPLAY_USE_CACHE')=='1'
+    if use_cache and os.environ.get('REPLAY_FORCE')=='1':
+        parser.error('--force and --use-cache are mutually exclusive (including environment settings)')
     manifest_path = Path(os.environ['REPLAY_MANIFEST']).resolve()
     try:
         manifest_config = json.loads(manifest_path.read_text(encoding='utf-8'))
         cases = manifest_config.get('cases')
         if not isinstance(cases, list) or not cases:
             raise ValueError('Experiment manifest must define at least one case')
-        for case in cases:
-            task_sources(manifest_path.parent, case)
+        if use_cache:
+            validate_cache(Path(os.environ.get('REPLAY_CACHE', HERE/'cache/replay.sqlite')))
+        else:
+            for case in cases:
+                task_sources(manifest_path.parent, case)
     except Exception as error:
-        print(f'ERROR: Replay requires a usable output/task_statistics.csv for every case: {error}', file=sys.stderr, flush=True)
+        print(f'ERROR: Replay input/cache validation failed: {error}', file=sys.stderr, flush=True)
         raise SystemExit(2)
     import uvicorn
     server = uvicorn.Server(uvicorn.Config(app, host=args.host, port=args.port))

@@ -1,17 +1,20 @@
 """Manual v8 regression checks. Not executed while producing this delivery."""
 import csv
 import json
+import os
 from pathlib import Path
 import shutil
 import sqlite3
 import sys
 import tempfile
 import unittest
+from unittest.mock import patch
 
 HERE = Path(__file__).resolve().parents[1]
 sys.path.insert(0,str(HERE))
-from prepare import prepare, decode_frame
-from queries import global_trend, link_trend, progress_rows
+import prepare as preparation
+from prepare import prepare, decode_frame, fingerprint, validate_cache, PROCESSING_FILES
+from queries import global_trend, link_trend, progress_rows, policy_windows
 
 
 class ReplayV8Checks(unittest.TestCase):
@@ -90,6 +93,76 @@ class ReplayV8Checks(unittest.TestCase):
             self.assertEqual(rows[1]['time'],.13)
             self.assertEqual(rows[1]['completed'],1)
             self.assertEqual(progress_rows(db,'toe',.29,.30)[0]['completed'],2)
+
+    def test_code_content_changes_invalidate_cache_but_timestamps_do_not(self):
+        with tempfile.TemporaryDirectory() as name:
+            code = Path(name)
+            for source in PROCESSING_FILES:
+                shutil.copyfile(HERE/source, code/source)
+            with patch.object(preparation, '__file__', str(code/'prepare.py')):
+                manifest = HERE/'smoke10ms/experiment.json'
+                before = fingerprint(manifest)
+                source = code/'recording.py'
+                stat = source.stat()
+                os.utime(source, ns=(stat.st_atime_ns, stat.st_mtime_ns+10**9))
+                self.assertEqual(fingerprint(manifest), before)
+                content = source.read_bytes()
+                source.write_bytes(b'#'+content[1:])
+                os.utime(source, ns=(stat.st_atime_ns, stat.st_mtime_ns))
+                self.assertNotEqual(fingerprint(manifest), before)
+
+    def test_use_cache_never_checks_sources_or_rewrites_database(self):
+        before = self.cache.stat().st_mtime_ns
+        with patch.object(preparation, 'fingerprint', side_effect=AssertionError('read source')):
+            self.assertEqual(prepare(self.root/'absent.json',self.cache,use_cache=True),self.cache)
+        self.assertEqual(self.cache.stat().st_mtime_ns, before)
+        missing = self.root/'absent.sqlite'
+        with self.assertRaises(FileNotFoundError):
+            prepare(self.root/'absent.json',missing,use_cache=True)
+        self.assertFalse(missing.exists())
+        with self.assertRaisesRegex(ValueError, 'mutually exclusive'):
+            prepare(None,self.cache,force=True,use_cache=True)
+
+    def test_use_cache_rejects_incompatible_database_without_rebuilding(self):
+        copied = self.root/'incompatible.sqlite'
+        shutil.copyfile(self.cache,copied)
+        with sqlite3.connect(copied) as db:
+            db.execute('DROP TABLE node_paths')
+        before = copied.read_bytes()
+        with self.assertRaisesRegex(ValueError,'Incompatible SQLite cache'):
+            prepare(None,copied,use_cache=True)
+        self.assertEqual(copied.read_bytes(),before)
+
+    def test_legacy_cache_can_be_served_without_policy_details(self):
+        copied = self.root/'legacy.sqlite'
+        shutil.copyfile(self.cache,copied)
+        with sqlite3.connect(copied) as db:
+            db.execute("DELETE FROM metadata WHERE key='schema'")
+            info = json.loads(db.execute("SELECT value FROM metadata WHERE key='bootstrap'").fetchone()[0])
+            for case in info['cases']:
+                case['capabilities'].pop('wcmpPolicy')
+            db.execute("UPDATE metadata SET value=? WHERE key='bootstrap'",(json.dumps(info),))
+            db.execute('DROP TABLE policy_epochs')
+            db.execute('DROP TABLE policy_weights')
+        self.assertEqual(validate_cache(copied),copied)
+
+    def test_wcmp_policy_survives_idle_windows_and_resets_on_publication(self):
+        copied = self.root/'policy.sqlite'
+        shutil.copyfile(self.cache,copied)
+        with sqlite3.connect(copied) as db:
+            db.execute("DELETE FROM node_paths WHERE case_id='te' AND t0>=.5")
+            policy = policy_windows(db,'te',10,11,.5,.6)
+            self.assertEqual(policy,[dict(epoch=1,time=.1035,paths=[
+                dict(transit=-1,weight=.5),dict(transit=12,weight=.5)])])
+            self.assertEqual(policy_windows(db,'te',10,11,0,.1035),[])
+            self.assertEqual(policy_windows(db,'te',10,11,.1035,.11),policy)
+            # A new global publication with no OD weights must not reuse epoch 1.
+            db.execute("INSERT INTO policy_epochs VALUES('te',2,.6)")
+            rows = policy_windows(db,'te',10,11,.59,.61)
+            self.assertEqual([p['epoch'] for p in rows],[1,2])
+            self.assertEqual(policy_windows(db,'te',10,11,.6,.7),[
+                dict(epoch=2,time=.6,paths=[])])
+            self.assertEqual(policy_windows(db,'te',11,10,.5,.6)[0]['paths'],[])
 
     def test_old_sampling_interval_cannot_be_relabelled_as_ten_ms(self):
         copied=self.root/'mismatch'

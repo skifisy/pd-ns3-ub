@@ -13,6 +13,12 @@ const pair = (a,b) => Math.min(a,b)+'-'+Math.max(a,b);
 const direction = (a,b) => a+'-'+b;
 const heat = u => !finite(u) ? ['#c6cdd4',.2,.7] : u>=.9 ? ['#df6257',.98,3.7] : u>=.7 ? ['#df9d37',.86,2.8] : u>=.35 ? ['#428ec0',.58,1.8] : ['#a8cfe6',u>0 ? .35 : .14,.9];
 const transitColor = id => {const index=Math.max(0,leaves.indexOf(id));return TRANSIT_COLORS[index]||'hsl('+(205+100*(index-6)/Math.max(1,leaves.length-6))+',55%,44%)';};
+function nodePrefix(n){
+ if(leaves.includes(n.id))return 'L';
+ if(n.role==='storage-server')return 'S';
+ return n.id>=0&&n.id<=11?'P':n.id>=12&&n.id<=15?'D':'C';
+}
+function nodeLabel(id){const n=nodes.find(n=>n.id===id);return n?nodePrefix(n)+id:String(id);}
 function progressAt(c,t){const rows=S.blocks.get(blockId(t))?.progress?.[c.id]||[];let a=0,b=rows.length;while(a<b){const m=(a+b)>>1;if(rows[m].time<=t+1e-12)a=m+1;else b=m;}return a?rows[a-1]:{completed:0,running:0};}
 async function get(url,signal){const r=await fetch(url,{signal});if(!r.ok||r.status===202)throw Error(r.status+': '+await r.text());const raw=await r.text(),data=JSON.parse(raw);Object.defineProperty(data,'_bytes',{value:new TextEncoder().encode(raw).byteLength});return data;}
 function fail(e){if(e.name==='AbortError')return;S.playing=false;$('#play').textContent='开始播放';$('#error').hidden=false;$('#errorText').textContent=e.message||String(e);}
@@ -132,10 +138,21 @@ function frameAt(c,t){
 }
 function detailAvailable(c,t){return c.capabilities.nodePaths&&(c.detailWindows===null||c.detailWindows.some(w=>w[0]<=t&&t<w[1]));}
 function focusedPaths(frame){return (frame.nodePaths||[]).filter(p=>p.src===S.focus.src&&p.dst===S.focus.dst&&p.payloadBytes>0);}
+function observedPaths(c,frame){
+ if(c.capabilities.nodePaths)return focusedPaths(frame);
+ return (frame.pathSamples||[]).filter(p=>p.src===S.focus.src&&p.dst===S.focus.dst&&p.payloadBytes>0)
+  .map(p=>({...p,gbps:p.payloadBytes*8/(frame.end-frame.start)/1e9*(meta.throughputScale||1)}));
+}
 function midpoints(c,frame){
- if(c.capabilities.nodePaths)return [...new Set(focusedPaths(frame).filter(p=>p.transit>=0).map(p=>p.transit))];
- if(c.hasPathSamples)return [...new Set((frame.pathSamples||[]).filter(p=>p.src===S.focus.src&&p.dst===S.focus.dst&&p.transit>=0&&p.payloadBytes>0).map(p=>p.transit))];
- return [...new Set(c.routeIntervals.filter(r=>r.src===S.focus.src&&r.dst===S.focus.dst&&r.transit>=0&&r.start<=S.time&&r.end>S.time).map(r=>r.transit))];
+ return [...new Set(observedPaths(c,frame).filter(p=>p.transit>=0).map(p=>p.transit))];
+}
+function policyAt(c,frame){
+ if(!c.capabilities.wcmpPolicy)return null;
+ const block=S.pathBlocks.get(pathKey(S.time));
+ if(!block)return undefined;
+ const policies=block.policies?.[c.id];
+ if(!policies)return null;
+ return [...policies].reverse().find(p=>p.time<=S.time&&p.epoch===frame.teEpoch)||{epoch:null,paths:[]};
 }
 function changeAt(c,t){
  const groups=c.changes.filter(g=>(g.planTime??g.time)<=t);if(!groups.length)return null;
@@ -174,14 +191,14 @@ function setup(){
   const q=c.quantiles[k],gain=c.mode==='ecmp'?'基线':q.improvement==null?'无共同完成任务':(q.improvement>=0?'降低 ':'增加 ')+number(Math.abs(q.improvement))+'%';
   return '<div><div class="metric-label">'+k.toUpperCase()+'</div><div class="metric-value">'+number(q.seconds*1000,2)+'<small>ms</small></div><div class="gain '+(q.improvement<0?'regression':'')+'">'+gain+'</div></div>';
  }).join('')+'<div><div class="metric-label" title="存储接入链路双向实际发送比特 / 双向容量时间积分">存储侧双向利用率</div><div class="metric-value">'+percent(c.storageUtilization)+'</div><div class="gain">完整仿真时间段</div></div><div><div class="metric-label" title="Storage → Leaf 与 Leaf → Storage 的 tx_wire_bytes × 8 / 仿真总时长，含协议头与重传">存储侧总吞吐</div><div class="metric-value">'+number(c.storageThroughputGbps,1)+'</div><div class="gain">Gbps · 双向全程平均</div></div></div><div class="live-summary"><span>当前完成 <b id="complete-'+i+'">—</b> / '+c.totalTasks+'</span><span>进行中 <b id="running-'+i+'">—</b></span></div></article>').join('');
- $('#networks').innerHTML=meta.cases.map((c,i)=>'<article class="network-row" style="--case:'+COLORS[i%3]+'"><div class="case-side"><div><div class="case-name">'+esc(c.label)+'</div><div class="case-purpose">同一仿真时刻</div></div><div class="global-live"><div title="存储侧 Storage → Leaf 与 Leaf → Storage 双向接入发送量，含协议头和重传"><label>存储侧双向吞吐</label><b id="throughput-'+i+'">—</b><small>Gbps · TX + RX</small></div><div title="Leaf 间发送比特数 / 有效容量时间积分"><label>Fabric 利用率</label><b id="util-'+i+'">—</b></div><div><label>最大利用率</label><b id="max-'+i+'">—</b></div></div></div><div class="network-space"><canvas class="network" id="network-'+i+'" aria-label="'+esc(c.label)+' 链路热力拓扑"></canvas><span class="network-watermark">L＝Leaf　P＝源计算　D＝目的计算　C＝其他计算　S＝存储</span></div><div class="action-side"><div class="action-label" id="action-label-'+i+'"></div><div class="action-title" id="action-title-'+i+'"></div><div class="action-lines" id="action-lines-'+i+'"></div><div class="action-footer" id="action-footer-'+i+'"></div></div></article>').join('');
+ $('#networks').innerHTML=meta.cases.map((c,i)=>'<article class="network-row" style="--case:'+COLORS[i%3]+'"><div class="case-side"><div><div class="case-name">'+esc(c.label)+'</div><div class="case-purpose">同一仿真时刻</div></div><div class="global-live"><div title="存储侧 Storage → Leaf 与 Leaf → Storage 双向接入发送量，含协议头和重传"><label>存储侧双向吞吐</label><b id="throughput-'+i+'">—</b><small>Gbps · 双向发送量</small></div><div title="Leaf 间发送比特数 / 有效容量时间积分"><label>Fabric 利用率</label><b id="util-'+i+'">—</b></div><div><label>最大利用率</label><b id="max-'+i+'">—</b></div></div></div><div class="network-space"><canvas class="network" id="network-'+i+'" aria-label="'+esc(c.label)+' 链路热力拓扑"></canvas><span class="network-watermark">L＝Leaf　P0–P11＝Prefill　D12–D15＝Decode　S＝存储</span></div><div class="action-side"><div class="action-label" id="action-label-'+i+'"></div><div class="action-title" id="action-title-'+i+'"></div><div class="action-lines" id="action-lines-'+i+'"></div><div class="action-footer" id="action-footer-'+i+'"></div></div></article>').join('');
  $('#focus').innerHTML=meta.focusOptions.map(p=>'<option value="'+direction(p.src,p.dst)+'">L'+p.src+' → L'+p.dst+'</option>').join('');
  $('#focus').value=direction(S.focus.src,S.focus.dst);$('#focus').disabled=false;
  $('#focus').onchange=e=>{const [src,dst]=e.target.value.split('-').map(Number);cancelLoads(true);S.focus={src,dst};S.dirty=true;requestPath(S.time);prefetchAhead(S.time);loadHotspot().catch(fail);};
  $('#focus').onpointerdown=updateOptions;
  $('#focus').onfocus=updateOptions;
  $('#heatToggle').disabled=false;
- $('#heatToggle').onclick=()=>{S.heat=!S.heat;$('#heatToggle').setAttribute('aria-pressed',String(S.heat));$('#heatToggle').textContent='热点展示：'+(S.heat?'开':'关');$('#heatLegend').classList.toggle('heat-off',!S.heat);$('#heatDescription').textContent=S.heat?'颜色＝利用率；线宽＝发送速率（各组同尺度）':'背景为灰色结构线；彩色路径与交换机＝当前焦点的中转';S.dirty=true;};
+ $('#heatToggle').onclick=()=>{S.heat=!S.heat;$('#heatToggle').setAttribute('aria-pressed',String(S.heat));$('#heatToggle').textContent='热点展示：'+(S.heat?'开':'关');$('#heatLegend').classList.toggle('heat-off',!S.heat);$('#heatDescription').textContent=S.heat?'背景颜色＝双向较高利用率；线宽＝该方向链路总发送速率':'背景＝灰色结构线；虚线＝WCMP 策略；实线与动画＝观测到的焦点载荷路径';S.dirty=true;};
 }
 function updateOptions(){
  const maps=meta.cases.map(c=>new Map((S.frames[c.id]?.edges||[]).map(e=>[direction(e.src,e.dst),e])));
@@ -226,20 +243,17 @@ function makeScene(c,frame,i){
  const buffer=document.createElement('canvas');buffer.width=canvas.width;buffer.height=canvas.height;
  const ctx=buffer.getContext('2d');ctx.scale(dpr,dpr);ctx.lineCap='round';
  const {positions}=layout(w,h),observed=new Map(frame.edges.map(e=>[direction(e.src,e.dst),e]));
- const paths=focusedPaths(frame),mids=midpoints(c,frame),focusKeys=new Set([pair(S.focus.src,S.focus.dst)]),flow=new Map(),nodeRates=new Map(),pathColors=new Map(),endpointRoles=new Map();
+ const paths=observedPaths(c,frame),policy=policyAt(c,frame),configured=policy?.paths||[];
+ const mids=[...new Set([...midpoints(c,frame),...configured.filter(p=>p.transit>=0).map(p=>p.transit)])];
+ const focusKeys=new Set(),flow=new Map(),nodeRates=new Map(),pathColors=new Map();
  const addFlow=(a,b,rate)=>{const k=direction(a,b),old=flow.get(k);flow.set(k,{a,b,rate:(old?.rate||0)+rate});focusKeys.add(pair(a,b));};
  for(const p of paths){
-   const sourceRoles=endpointRoles.get(p.srcNode)||new Set();sourceRoles.add('P');endpointRoles.set(p.srcNode,sourceRoles);
-   const destRoles=endpointRoles.get(p.dstNode)||new Set();destRoles.add('D');endpointRoles.set(p.dstNode,destRoles);
-  addFlow(p.srcNode,p.src,p.gbps);addFlow(p.dst,p.dstNode,p.gbps);
+  if(finite(p.srcNode)&&finite(p.dstNode)){
+   addFlow(p.srcNode,p.src,p.gbps);addFlow(p.dst,p.dstNode,p.gbps);
+   for(const [id,key] of [[p.srcNode,'tx'],[p.dstNode,'rx']]){const n=nodeRates.get(id)||{tx:0,rx:0};n[key]+=p.gbps;nodeRates.set(id,n);}
+  }
   if(p.transit<0)addFlow(p.src,p.dst,p.gbps);else{addFlow(p.src,p.transit,p.gbps);addFlow(p.transit,p.dst,p.gbps);}
   if(p.transit>=0)for(const [a,b] of [[p.src,p.transit],[p.transit,p.dst]])pathColors.set(pair(a,b),transitColor(p.transit));
-  for(const [id,key] of [[p.srcNode,'tx'],[p.dstNode,'rx']]){const n=nodeRates.get(id)||{tx:0,rx:0};n[key]+=p.gbps;nodeRates.set(id,n);}
- }
- if(!c.capabilities.nodePaths){
-  const hops=[[S.focus.src,S.focus.dst],...mids.flatMap(m=>[[S.focus.src,m],[m,S.focus.dst]])];
-  for(const [a,b] of hops){focusKeys.add(pair(a,b));const e=observed.get(direction(a,b));if(e?.gbps>0)addFlow(a,b,e.gbps);}
-  for(const m of mids)for(const [a,b] of [[S.focus.src,m],[m,S.focus.dst]])pathColors.set(pair(a,b),transitColor(m));
  }
  const bundles=new Map();
  for(const e of topologyAt(c,S.time).edges)if(e.src<e.dst&&leaves.includes(e.src)&&leaves.includes(e.dst))bundles.set(pair(e.src,e.dst),{...e,fabric:true});
@@ -261,12 +275,20 @@ function makeScene(c,frame,i){
   if(!deleted)stroke(ctx,g,S.heat?color:focal?pathColor:'#c4cdd5',S.heat?(.7+3.3*Math.log1p(measured?.gbps||0)/Math.log1p(Math.max(1,meta.rateScaleGbps)))*(e.fabric?1:.65):focal?2:.7,S.heat?focal?Math.max(.65,opacity):opacity:focal?1:.28,S.heat&&!finite(u));
   if(S.heat&&finite(u)&&u>=.7&&measured)arrow(ctx,g,color,measured.src===e.dst);
  }
+ // A configured path remains visible without any payload or animation.
+ for(const p of configured){
+  const hops=p.transit<0?[[S.focus.src,S.focus.dst]]:[[S.focus.src,p.transit],[p.transit,S.focus.dst]];
+  const color=p.transit<0?'#52728a':transitColor(p.transit);
+  for(const [a,b] of hops){const g=geometries.get(pair(a,b));if(g)stroke(ctx,g,color,2,.9,true);}
+  const first=geometries.get(pair(S.focus.src,p.transit<0?S.focus.dst:p.transit));
+  if(first){const xy=at(first,.27);badge(ctx,'策略 '+percent(p.weight),xy[0],xy[1]-12,color);}
+ }
  // Focus labels keep the selected direction explicit; background heat remains max(A→B,B→A).
  const hops=[[S.focus.src,S.focus.dst],...mids.flatMap(m=>[[S.focus.src,m],[m,S.focus.dst]])];
  hops.forEach(([a,b],index)=>{
   const g=geometries.get(pair(a,b));if(!g)return;
   const e=observed.get(direction(a,b)),p=at(g,index===0 ? .5 : .42);
-  const text='L'+a+'→L'+b+' '+percent(e?.utilization)+(index===0?' · '+number(e?.gbps,0)+'/'+number(e?.capacity,0)+'G':'');
+  const text='L'+a+'→L'+b+' 链路总量 '+number(e?.gbps,0)+'/'+number(e?.capacity,0)+'G · '+percent(e?.utilization);
   const color=pathColors.get(pair(a,b))||'#244c69';
   if(e?.gbps>0)arrow(ctx,g,color,positions.get(a)!==g.a);
   badge(ctx,text,p[0],p[1]+(index%2?9:-9),color);
@@ -280,22 +302,19 @@ function makeScene(c,frame,i){
  const topRates=new Set([...nodeRates].sort((a,b)=>(b[1].tx+b[1].rx)-(a[1].tx+a[1].rx)).slice(0,5).map(([id])=>id));
   for(const n of nodes){
    const [x,y]=positions.get(n.id),upper=leaves.includes(n.id),active=upper?(n.id===S.focus.src||n.id===S.focus.dst||mids.includes(n.id)):nodeRates.has(n.id);
-   const roles=n.role==='compute-server'?endpointRoles.get(n.id):null;
-   const endpointRole=roles?.size===2?'P/D':roles?.has('P')?'P':roles?.has('D')?'D':null;
+   const prefix=nodePrefix(n);
    ctx.save();ctx.fillStyle=active?'#244c69':upper?'#edf3f7':n.role==='storage-server'?'#e3daef':'#d7eaf4';ctx.strokeStyle=active?'#173a55':upper?'#8ca6b9':n.role==='storage-server'?'#9a83b6':'#75a6c0';ctx.lineWidth=active?1.8:1;
    if(upper){ctx.fillStyle=n.role==='storage-leaf'?'#e3daef':'#d7eaf4';if(mids.includes(n.id)){ctx.fillStyle=transitColor(n.id);ctx.strokeStyle=transitColor(n.id);}else if(active){ctx.strokeStyle='#173a55';ctx.lineWidth=2.5;}}
    ctx.beginPath();
    if(upper)ctx.rect(x-10,y-6,20,12);
    else if(n.role==='storage-server')ctx.rect(x-5,y-5,10,10);
-   else if(endpointRole==='D'){ctx.moveTo(x,y-6);ctx.lineTo(x+6,y);ctx.lineTo(x,y+6);ctx.lineTo(x-6,y);ctx.closePath();}
-   else if(endpointRole==='P/D'){ctx.moveTo(x-5,y-3);ctx.lineTo(x,y-6);ctx.lineTo(x+5,y-3);ctx.lineTo(x+5,y+3);ctx.lineTo(x,y+6);ctx.lineTo(x-5,y+3);ctx.closePath();}
+   else if(prefix==='D'){ctx.moveTo(x,y-6);ctx.lineTo(x+6,y);ctx.lineTo(x,y+6);ctx.lineTo(x-6,y);ctx.closePath();}
    else ctx.arc(x,y,5,0,Math.PI*2);
    ctx.fill();ctx.stroke();
    ctx.textAlign='center';ctx.fillStyle=active?'#24445b':'#7c91a0';ctx.font=(upper?'10':'9')+'px ui-monospace,monospace';
    if(upper&&mids.includes(n.id))ctx.fillStyle=transitColor(n.id);
-   const prefix=upper?'L':n.role==='storage-server'?'S':endpointRole||'C';
    ctx.fillText(prefix+n.id+(upper&&mids.includes(n.id)?' 中转':''),x,y+17);
-   if(topRates.has(n.id)){const rate=nodeRates.get(n.id);ctx.font='8px ui-monospace,monospace';ctx.fillText((rate.tx?'↑'+number(rate.tx,0):'')+(rate.tx&&rate.rx?' / ':'')+(rate.rx?'↓'+number(rate.rx,0):'')+'G',x,y-10);}
+   if(topRates.has(n.id)){const rate=nodeRates.get(n.id);ctx.font='8px ui-monospace,monospace';ctx.fillText('焦点 '+(rate.tx?'发'+number(rate.tx,0):'')+(rate.tx&&rate.rx?' / ':'')+(rate.rx?'发往'+number(rate.rx,0):'')+'G',x,y-10);}
    ctx.restore();
   }
   const routes=[];
@@ -316,11 +335,11 @@ function paint(wall){
  }
 }
 function action(c,frame,i){
- const f=S.focus,e=frame.edges.find(e=>e.src===f.src&&e.dst===f.dst),reverse=frame.edges.find(e=>e.src===f.dst&&e.dst===f.src),paths=focusedPaths(frame),mids=midpoints(c,frame),change=changeAt(c,S.time);
- $('#action-label-'+i).textContent='焦点 L'+f.src+' → L'+f.dst+'　·　正向 '+percent(e?.utilization)+' / 反向 '+percent(reverse?.utilization);
+ const f=S.focus,e=frame.edges.find(e=>e.src===f.src&&e.dst===f.dst),reverse=frame.edges.find(e=>e.src===f.dst&&e.dst===f.src),paths=focusedPaths(frame),change=changeAt(c,S.time),policy=policyAt(c,frame);
+ $('#action-label-'+i).textContent='直连链路 L'+f.src+' ↔ L'+f.dst+'　·　正向 '+percent(e?.utilization)+' / 反向 '+percent(reverse?.utilization);
  const payload=paths.reduce((n,p)=>n+(finite(p.gbps)?p.gbps:0),0);
  const isToe=c.mode.startsWith('toe')&&change;
- let title=mids.length?'实际中转路径':'直达方向与接入流量',lines='';
+ let title='焦点路径与载荷发送',lines='';
  if(isToe){
   title=change.failed?'重配未生效':change.applied?'重配已生效':'重配待生效';
   const globalLabel=change.applied?'全局拓扑变化':change.failed?'未生效计划':'待生效计划',globalVerb=change.applied?'影响':'涉及';
@@ -343,11 +362,14 @@ function action(c,frame,i){
    }
   }
  }
- if(mids.length){
-  lines+=mids.map(m=>'<div class="route-label" style="color:'+transitColor(m)+'">L'+f.src+' → L'+m+' → L'+f.dst+'</div>').join('');
- }else{
-  lines+='<div class="route-label">直达：L'+f.src+' → L'+f.dst+'</div>';
+ if(c.mode==='te'||c.mode==='wcmp'||c.mode==='toe+te'||c.capabilities.wcmpPolicy){
+  if(policy===undefined)lines+='<div>WCMP 策略加载中</div>';
+  else if(policy===null)lines+='<div>WCMP 策略路径未知（日志或缓存缺少明细）</div>';
+  else if(!policy.paths.length)lines+='<div>当前 epoch 未记录该方向的 WCMP 策略路径</div>';
+  else lines+='<div>生效 WCMP 策略 · epoch '+policy.epoch+'</div>'+policy.paths.map(p=>'<div class="route-label policy-route" style="color:'+(p.transit<0?'#52728a':transitColor(p.transit))+'">L'+f.src+' → '+(p.transit<0?'':'L'+p.transit+' → ')+'L'+f.dst+' · 权重 '+percent(p.weight)+'</div>').join('');
  }
+ const actual=observedPaths(c,frame),observedMids=[...new Set(actual.map(p=>p.transit))];
+ lines+=observedMids.map(m=>'<div class="route-label">观测发送：L'+f.src+' → '+(m<0?'':'L'+m+' → ')+'L'+f.dst+'</div>').join('');
  if(paths.length){
   const pairs=new Map();
   for(const p of paths){
@@ -356,14 +378,14 @@ function action(c,frame,i){
    row.gbps+=finite(p.gbps)?p.gbps:0;pairs.set(key,row);
   }
   const largest=[...pairs.values()].sort((a,b)=>b.gbps-a.gbps||a.srcNode-b.srcNode||a.dstNode-b.dstNode);
-  lines+='<div>端点载荷合计 '+number(payload,2)+' Gbps</div>';
-  lines+='<ul class="endpoint-list">'+largest.slice(0,3).map(p=>'<li><span>P'+p.srcNode+' → D'+p.dstNode+'</span><span>'+number(p.gbps,2)+' Gbps</span></li>').join('')+(largest.length>3?'<li class="endpoint-ellipsis">…</li>':'')+'</ul>';
+  lines+='<div title="源 Leaf 成功发送的焦点载荷，含重传；不是接收端实测或去重交付量">焦点载荷发送 '+number(payload,2)+' Gbps</div>';
+  lines+='<ul class="endpoint-list">'+largest.slice(0,3).map(p=>'<li><span>'+esc(nodeLabel(p.srcNode))+' → '+esc(nodeLabel(p.dstNode))+'</span><span>'+number(p.gbps,2)+' Gbps</span></li>').join('')+(largest.length>3?'<li class="endpoint-ellipsis">…</li>':'')+'</ul>';
  }else{
-  lines+='<div>'+(frame.pathLoading?'路径详情加载中':detailAvailable(c,S.time)?'当前窗口未观测到该方向的端点载荷':'此时间段未采集端到端路径详情')+'</div>';
+  lines+='<div>'+(frame.pathLoading?'路径详情加载中':detailAvailable(c,S.time)?'当前窗口未观测到该方向的载荷发送':'此时间段未采集端点路径详情')+'</div>';
  }
  $('#action-title-'+i).textContent=title;$('#action-lines-'+i).innerHTML=lines;
  const phase={draining:'排空',guard:'保护等待',applied:'拓扑生效',missing:'无采样'}[frame.phase]||'';
- const footer=['窗口 '+number(frame.start,6)+'–'+number(frame.end,6)+' s','正向发送 '+number(e?.gbps,0)+' / 容量 '+number(e?.capacity,0)+' Gbps'];
+ const footer=['窗口 '+number(frame.start,6)+'–'+number(frame.end,6)+' s','直连链路总发送 '+number(e?.gbps,0)+' / 容量 '+number(e?.capacity,0)+' Gbps'];
  if(phase)footer.push(phase);
  $('#action-footer-'+i).innerHTML=footer.join('<br>');
 }
@@ -509,7 +531,7 @@ function updateText(){
  const parts=meta.cases.map(c=>{const f=S.frames[c.id],e=f?.edges.find(e=>e.src===S.focus.src&&e.dst===S.focus.dst);return c.label+' '+percent(e?.utilization);});
  const selected=$('#focus').selectedOptions[0];
  if(selected)selected.textContent='L'+S.focus.src+' → L'+S.focus.dst+'　'+parts.join(' / ');
- $('#caption').textContent='L'+S.focus.src+' → L'+S.focus.dst+'：'+parts.join(' / ')+'。'+(S.heat?'热力表示链路负载；':'热点已关闭；')+'彩色中转 Leaf 对应当前窗口的实际路径。';
+ $('#caption').textContent='直连 L'+S.focus.src+' → L'+S.focus.dst+'：'+parts.join(' / ')+'。'+(S.heat?'热力表示链路总负载；':'热点已关闭；')+'虚线＝生效 WCMP 策略；实线与动画＝源 Leaf 观测到的焦点载荷路径。';
  if(!S.seeking)$('#timeline').value=S.time;
  $('#currentClock').textContent=number(S.time,3)+' s';
  $('#play').textContent=S.playing?'暂停播放':S.time>=recording.end?'重新播放':'开始播放';

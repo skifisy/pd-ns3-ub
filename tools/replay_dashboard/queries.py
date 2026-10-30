@@ -5,6 +5,19 @@ from decimal import Decimal
 PS = 10**12
 
 
+def policy_windows(db, case_id, src, dst, start, end):
+    """Return publications in the block plus the policy effective at its start."""
+    seed = db.execute('SELECT epoch,time FROM policy_epochs WHERE case_id=? AND time<=? '
+                      'ORDER BY time DESC,epoch DESC LIMIT 1', (case_id, start)).fetchall()
+    epochs = seed + db.execute('SELECT epoch,time FROM policy_epochs WHERE case_id=? '
+                              'AND time>? AND time<? ORDER BY time,epoch',
+                              (case_id, start, end)).fetchall()
+    return [dict(epoch=epoch, time=time, paths=[dict(transit=mid, weight=weight)
+                 for mid, weight in db.execute('SELECT transit,weight FROM policy_weights '
+                     'WHERE case_id=? AND epoch=? AND src=? AND dst=? AND weight>0 ORDER BY transit',
+                     (case_id, epoch, src, dst))]) for epoch, time in epochs]
+
+
 def interval(info, start, end):
     start = info['recording']['start'] if start is None else start
     end = info['recording']['end'] if end is None else end
