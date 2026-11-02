@@ -1,4 +1,4 @@
-"""Bounded task import and exact disk-backed cohort statistics (no task arrays)."""
+"""Bounded task import and disk-backed playback progress (no task arrays)."""
 import sqlite3
 from decimal import Decimal, InvalidOperation
 from itertools import chain
@@ -38,7 +38,7 @@ def task_statistics_path(root, config):
 
 
 def task_sources(root, config):
-    """Return the sole permitted FCT source; never fall back to events or .tr files."""
+    """Return the playback-progress source; never fall back to events or .tr files."""
     return 'statistics', [task_statistics_path(root, config)]
 
 
@@ -51,9 +51,6 @@ def create_tables(db):
                                      PRIMARY KEY(case_id,time_ps)) WITHOUT ROWID;
         CREATE TABLE playback_progress(case_id TEXT,time_ps INTEGER,started INTEGER,completed INTEGER,running INTEGER,
                                        PRIMARY KEY(case_id,time_ps)) WITHOUT ROWID;
-        CREATE TABLE cohort(task_id INTEGER PRIMARY KEY);
-        CREATE TABLE fct_values(case_id TEXT,fct_ps INTEGER,task_id INTEGER,
-                                PRIMARY KEY(case_id,fct_ps,task_id)) WITHOUT ROWID;
     ''')
 
 
@@ -201,48 +198,3 @@ def completion_buckets(db,case,step_ps,end,reporter,retain=True):
     return result
 
 
-def common_quantiles(db,cases,config,reporter):
-    baseline=next((c for c in cases if c['mode']=='ecmp'),None)
-    if baseline is None: raise ValueError('An ECMP baseline is required')
-    reporter.stage('cohort','磁盘匹配共同完成任务集')
-    db.execute('INSERT INTO cohort SELECT task_id FROM tasks WHERE start_ps IS NOT NULL AND end_ps IS NOT NULL GROUP BY task_id HAVING COUNT(*)=?',(len(cases),))
-    settings=config.get('statistics',{})
-    clauses=[]; args=[baseline['id']]
-    for key,operator in (('baseline_start_seconds','>='),('baseline_end_seconds','<')):
-        if key in settings:
-            clauses.append(f't.start_ps {operator} ?');args.append(picoseconds(settings[key],PS))
-    if 'op_types' in settings:
-        db.execute('CREATE TEMP TABLE selected_ops(op TEXT PRIMARY KEY)')
-        db.executemany('INSERT INTO selected_ops VALUES(?)',[(v,) for v in settings['op_types']])
-        clauses.append('w.op IN (SELECT op FROM selected_ops)')
-    if 'task_ids' in settings:
-        db.execute('CREATE TEMP TABLE selected_ids(task_id INTEGER PRIMARY KEY)')
-        db.executemany('INSERT INTO selected_ids VALUES(?)',[(int(v),) for v in settings['task_ids']])
-        clauses.append('t.task_id IN (SELECT task_id FROM selected_ids)')
-    if clauses:
-        db.execute('DELETE FROM cohort WHERE task_id NOT IN (SELECT t.task_id FROM tasks t JOIN workload w USING(task_id) WHERE t.case_id=? AND '+ ' AND '.join(clauses)+')',args)
-    n=db.execute('SELECT COUNT(*) FROM cohort').fetchone()[0]
-    if n == 0:
-        raise ValueError('No common completed task IDs across all cases; verify output/task_statistics.csv files and timestamps')
-    values={}
-    for case in cases:
-        cid=case['id'];reporter.stage('fct-sort','磁盘排序并计算精确 FCT 分位数',cid)
-        db.execute('INSERT INTO fct_values SELECT case_id,end_ps-start_ps,t.task_id FROM tasks t JOIN cohort c USING(task_id) WHERE case_id=?',(cid,))
-        ranks={}
-        for label,q in (('p50',.5),('p90',.9),('p99',.99)):
-            x=(n-1)*q if n else 0;ranks[label]=(int(x),min(int(x)+1,n-1),x-int(x))
-        wanted={r for lo,hi,_ in ranks.values() for r in (lo,hi)} if n else set()
-        found={};max_rank=max(wanted,default=-1)
-        for rank,(value,) in enumerate(db.execute('SELECT fct_ps FROM fct_values WHERE case_id=? ORDER BY fct_ps,task_id',(cid,))):
-            if rank in wanted:found[rank]=value
-            if rank%200000==0:reporter.update(rows=rank+1)
-            if rank>=max_rank:break
-        values[cid]={label:((found[lo]*(1-frac)+found[hi]*frac)/PS if n else None) for label,(lo,hi,frac) in ranks.items()}
-        db.commit()
-    for case in cases:
-        case['quantiles']={}
-        for label in ('p50','p90','p99'):
-            base=values[baseline['id']][label];value=values[case['id']][label]
-            case['quantiles'][label]=dict(seconds=value,improvement=(base-value)/base*100 if base and value is not None else None)
-        case['p99']=case['quantiles']['p99']['seconds'];case['improvement']=case['quantiles']['p99']['improvement']
-    return n,baseline

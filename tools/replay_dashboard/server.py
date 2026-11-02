@@ -20,6 +20,7 @@ from fastapi.staticfiles import StaticFiles
 
 from jobs import import_worker
 from prepare import decode_frame, validate_cache
+from metrics import load_metrics, attach_metrics
 from task_store import task_sources
 from queries import interval, progress_rows, completion_trend, global_trend as query_global, link_trend, policy_windows
 
@@ -42,10 +43,9 @@ async def lifespan(application):
     application.state.progress = dict(status='queued',phase='queued',phaseLabel='等待处理',file='',rows=0)
     # Optional throughput rescale for bandwidth/data-size scaled simulations.
     # Only displayed Gbps/capacity values change; utilization stays unchanged.
-    try:
-        application.state.scale = float(json.loads(manifest.read_text(encoding='utf-8')).get('throughputScale', 1))
-    except (json.JSONDecodeError, OSError):
-        application.state.scale = 1
+    config = json.loads(manifest.read_text(encoding='utf-8'))
+    application.state.metrics = load_metrics(manifest, config, os.environ.get('REPLAY_METRICS_CSV'))
+    application.state.scale = float(config.get('throughputScale', 1))
     if not math.isfinite(application.state.scale) or application.state.scale <= 0:
         raise ValueError('throughputScale must be positive and finite')
     context = multiprocessing.get_context('spawn')
@@ -61,7 +61,8 @@ async def lifespan(application):
                     state = messages.get_nowait()
                     if state['status']=='ready':
                         with sqlite3.connect(cache) as db:
-                            application.state.bootstrap = json.loads(db.execute("SELECT value FROM metadata WHERE key='bootstrap'").fetchone()[0])
+                            cached = json.loads(db.execute("SELECT value FROM metadata WHERE key='bootstrap'").fetchone()[0])
+                        application.state.bootstrap = attach_metrics(cached, application.state.metrics)
                     application.state.progress = state
             except Empty:
                 pass
@@ -145,8 +146,6 @@ def bootstrap():
         info['rateScaleGbps'] = (info.get('rateScaleGbps') or 1) * scale
         info['throughputScale'] = scale
         info['cases'] = [dict(c,
-                          storageThroughputGbps=(c['storageThroughputGbps']*scale
-                              if c.get('storageThroughputGbps') is not None else None),
                           topologyStates=[dict(s,edges=[dict(e,capacity=e['capacity']*scale)
                               for e in s['edges']]) for s in c['topologyStates']],
                           finalEdges=[dict(e,capacity=e['capacity']*scale) for e in c['finalEdges']])
@@ -164,11 +163,11 @@ def frames(start:float=Query(0,ge=0),end:float=Query(.5,ge=0)):
         cases = {}; progress = {}
         for c in info['cases']:
             case_frames = [decode_frame(r[0]) for r in db.execute('SELECT data FROM frames WHERE case_id=? AND t1>? AND t0<? ORDER BY t0',(c['id'],start,end))]
+            for frame in case_frames:
+                for field in ('storageThroughputGbps', 'storageTxGbps', 'storageRxGbps', 'storageSampleComplete'):
+                    frame.get('global', {}).pop(field, None)
             if scale != 1:
                 for frame in case_frames:
-                    for field in ('storageThroughputGbps', 'storageTxGbps', 'storageRxGbps'):
-                        if frame['global'].get(field) is not None:
-                            frame['global'][field] *= scale
                     for edge in frame.get('edges', []):
                         if edge.get('gbps') is not None:
                             edge['gbps'] *= scale
@@ -243,6 +242,7 @@ if __name__=='__main__':
     parser.add_argument('--host',default='127.0.0.1')
     parser.add_argument('--port',type=int,default=8000)
     parser.add_argument('--cache',type=Path)
+    parser.add_argument('--metrics-csv',type=Path,help='Precomputed FCT / TTFT / average TPS / throughput CSV')
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument('--use-cache',action='store_true',help='Use existing SQLite without checking source logs')
     mode.add_argument('--force',action='store_true',help='Rebuild the SQLite cache')
@@ -258,6 +258,8 @@ if __name__=='__main__':
         os.environ['REPLAY_MANIFEST']=str(args.manifest.resolve())
     if args.cache:
         os.environ['REPLAY_CACHE']=str(args.cache.resolve())
+    if args.metrics_csv:
+        os.environ['REPLAY_METRICS_CSV']=str(args.metrics_csv.resolve())
     if args.use_cache:
         os.environ['REPLAY_USE_CACHE']='1'
     if args.force:
@@ -271,6 +273,7 @@ if __name__=='__main__':
         cases = manifest_config.get('cases')
         if not isinstance(cases, list) or not cases:
             raise ValueError('Experiment manifest must define at least one case')
+        load_metrics(manifest_path, manifest_config, os.environ.get('REPLAY_METRICS_CSV'))
         if use_cache:
             validate_cache(Path(os.environ.get('REPLAY_CACHE', HERE/'cache/replay.sqlite')))
         else:

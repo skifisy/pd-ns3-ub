@@ -15,6 +15,7 @@ sys.path.insert(0,str(HERE))
 import prepare as preparation
 from prepare import prepare, decode_frame, fingerprint, validate_cache, PROCESSING_FILES
 from queries import global_trend, link_trend, progress_rows, policy_windows
+from metrics import load_metrics, attach_metrics, COUNTS, VALUES
 
 
 class ReplayV8Checks(unittest.TestCase):
@@ -33,7 +34,11 @@ class ReplayV8Checks(unittest.TestCase):
         with sqlite3.connect(self.cache) as db:
             info=json.loads(db.execute("SELECT value FROM metadata WHERE key='bootstrap'").fetchone()[0])
             self.assertEqual(info['windowSeconds'],.01)
-            self.assertEqual(info['commonTasks'],5)
+            self.assertNotIn('commonTasks',info)
+            self.assertTrue(all('quantiles' not in c for c in info['cases']))
+            tables = {r[0] for r in db.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+            self.assertNotIn('cohort',tables)
+            self.assertNotIn('fct_values',tables)
             self.assertTrue(all(c['taskSource']=='statistics' for c in info['cases']))
             self.assertTrue(info['synthetic'])
             self.assertTrue(all('completionBins' not in c for c in info['cases']))
@@ -46,13 +51,8 @@ class ReplayV8Checks(unittest.TestCase):
         with sqlite3.connect(self.cache) as db:
             info=json.loads(db.execute("SELECT value FROM metadata WHERE key='bootstrap'").fetchone()[0])
             te=next(c for c in info['cases'] if c['id']=='te')
-            self.assertTrue(te['storageSampleComplete'])
-            self.assertIsNotNone(te['storageUtilization'])
-            self.assertIsNotNone(te['storageThroughputGbps'])
-            expected_full_run=db.execute(
-                "SELECT SUM(storage_bits)/SUM(storage_duration)/1e9 FROM global_samples WHERE case_id='te'"
-            ).fetchone()[0]
-            self.assertAlmostEqual(te['storageThroughputGbps'],expected_full_run)
+            self.assertNotIn('storageUtilization',te)
+            self.assertNotIn('storageThroughputGbps',te)
             frame=decode_frame(db.execute("SELECT data FROM frames WHERE case_id='te' AND t0=.11").fetchone()[0])
             self.assertTrue(frame['global']['storageSampleComplete'])
             with (HERE/'smoke10ms/te/replay_link_samples.csv').open(newline='') as stream:
@@ -75,8 +75,8 @@ class ReplayV8Checks(unittest.TestCase):
             self.assertAlmostEqual(wire/capacity,0.3125)
             self.assertAlmostEqual(frame['global']['fabricUtilization'],.185)
             points=global_trend(db,'te',.11,.12,2,100000)
-            self.assertAlmostEqual(points[0]['storageThroughputGbps'],expected*100000)
-            self.assertAlmostEqual(points[0]['storageTxGbps']+points[0]['storageRxGbps'],expected*100000)
+            self.assertNotIn('storageThroughputGbps',points[0])
+            self.assertAlmostEqual(points[0]['fabricUtilization'],.185)
 
     def test_reconfiguration_trend_uses_duration_and_capacity_integrals(self):
         with sqlite3.connect(self.cache) as db:
@@ -110,6 +110,34 @@ class ReplayV8Checks(unittest.TestCase):
                 source.write_bytes(b'#'+content[1:])
                 os.utime(source, ns=(stat.st_atime_ns, stat.st_mtime_ns))
                 self.assertNotEqual(fingerprint(manifest), before)
+
+    def test_summary_changes_do_not_invalidate_replay_cache(self):
+        copied = self.root/'independent_summary'
+        shutil.copytree(HERE/'smoke10ms',copied)
+        manifest = copied/'experiment.json'
+        before = fingerprint(manifest)
+        config = json.loads(manifest.read_text())
+        config['metrics_csv'] = 'te/summary.tsv'
+        config['metrics_tps_unit'] = 'token/s'
+        config['cases'][0]['metrics_scheme'] = 'ECMP'
+        manifest.write_text(json.dumps(config))
+        summary = copied/'te/summary.tsv'
+        summary.write_text('summary is loaded by the server, not the replay importer')
+        self.assertEqual(fingerprint(manifest),before)
+        summary.write_text('updated externally computed metrics')
+        self.assertEqual(fingerprint(manifest),before)
+
+    def test_new_summary_overlays_an_existing_cache_without_reimport(self):
+        config = json.loads((HERE/'smoke10ms/experiment.json').read_text())
+        metrics = load_metrics(HERE/'smoke10ms/experiment.json',config)
+        with sqlite3.connect(self.cache) as db:
+            cached = json.loads(db.execute("SELECT value FROM metadata WHERE key='bootstrap'").fetchone()[0])
+        before = self.cache.stat().st_mtime_ns
+        with patch.object(preparation,'fingerprint',side_effect=AssertionError('read trace')):
+            prepare(None,self.cache,use_cache=True)
+            info = attach_metrics(cached,metrics)
+        self.assertEqual(info['cases'][0]['metrics']['fct_p999_ms'],450)
+        self.assertEqual(self.cache.stat().st_mtime_ns,before)
 
     def test_use_cache_never_checks_sources_or_rewrites_database(self):
         before = self.cache.stat().st_mtime_ns
@@ -184,11 +212,11 @@ class ReplayV8Checks(unittest.TestCase):
         cache=self.root/'missing.sqlite';prepare(copied/'experiment.json',cache)
         with sqlite3.connect(cache) as db:
             row=global_trend(db,'te',0,1,10,100000)[0]
-            self.assertIsNone(row['storageThroughputGbps'])
+            self.assertNotIn('storageThroughputGbps',row)
             info=json.loads(db.execute("SELECT value FROM metadata WHERE key='bootstrap'").fetchone()[0])
             te=next(c for c in info['cases'] if c['id']=='te')
-            self.assertIsNone(te['storageUtilization'])
-            self.assertIsNone(te['storageThroughputGbps'])
+            self.assertNotIn('storageUtilization',te)
+            self.assertNotIn('storageThroughputGbps',te)
             self.assertIsNotNone(row['fabricUtilization'])
 
 
@@ -205,9 +233,96 @@ class ReplayV8Checks(unittest.TestCase):
         with sqlite3.connect(cache) as db:
             info=json.loads(db.execute("SELECT value FROM metadata WHERE key='bootstrap'").fetchone()[0])
             te=next(c for c in info['cases'] if c['id']=='te')
-            self.assertFalse(te['storageSampleComplete'])
-            self.assertIsNone(te['storageUtilization'])
-            self.assertIsNone(te['storageThroughputGbps'])
+            self.assertNotIn('storageUtilization',te)
+            self.assertNotIn('storageThroughputGbps',te)
+            frame=decode_frame(db.execute("SELECT data FROM frames WHERE case_id='te' LIMIT 1").fetchone()[0])
+            self.assertFalse(frame['global']['storageSampleComplete'])
+
+
+class SummaryMetricsChecks(unittest.TestCase):
+    def setUp(self):
+        self.scratch = tempfile.TemporaryDirectory()
+        self.addCleanup(self.scratch.cleanup)
+        self.root = Path(self.scratch.name)
+        self.manifest = self.root/'experiment.json'
+        self.config = dict(metrics_csv='summary.csv',throughputScale=100000,
+                           cases=[dict(id='ecmp'),dict(id='te'),dict(id='toe')])
+        self.rows = []
+        for scheme in ('ECMP','TE','TOE'):
+            self.rows.append(dict(scheme=scheme, **dict.fromkeys(COUNTS,1092),
+                **dict(zip(VALUES,('12263.93644','20277.81115','25343.88748','25343.88748',
+                                   '7.526006','38.022006','90.786006','139.028128',
+                                   '1.929938722','6.22583117')))))
+            self.rows[-1].update(valid_fct_flows=16517940,common_valid_fct_flows=16517940)
+
+    def write_summary(self,delimiter=',',fields=None):
+        with (self.root/'summary.csv').open('w',encoding='utf-8-sig',newline='') as stream:
+            writer = csv.DictWriter(stream,fieldnames=fields or ['scheme',*COUNTS,*VALUES],
+                                    delimiter=delimiter,extrasaction='ignore')
+            writer.writeheader()
+            writer.writerows(self.rows)
+
+    def test_reads_all_quantiles_and_averages_without_rescaling(self):
+        for delimiter in (',','\t'):
+            with self.subTest(delimiter=delimiter):
+                self.write_summary(delimiter)
+                metrics = load_metrics(self.manifest,self.config)
+                self.assertEqual(metrics['cases']['ecmp']['fct_p999_ms'],139.028128)
+                self.assertEqual(metrics['cases']['ecmp']['ttft_p999_ms'],25343.88748)
+                self.assertEqual(metrics['cases']['ecmp']['avg_tps'],1.929938722)
+                self.assertEqual(metrics['cases']['ecmp']['avg_throughput_gbps'],6.22583117)
+
+    def test_legacy_values_are_ignored_without_mutating_cached_bootstrap(self):
+        self.write_summary()
+        cached = dict(commonTasks=42,statistics={'op_types':['WRITE']},cases=[
+            dict(id=case['id'],quantiles={'p99':999},storageThroughputGbps=123,
+                 storageUtilization=.9) for case in self.config['cases']])
+        info = attach_metrics(cached,load_metrics(self.manifest,self.config))
+        self.assertNotIn('commonTasks',info)
+        for case in info['cases']:
+            self.assertNotIn('quantiles',case)
+            self.assertNotIn('storageUtilization',case)
+            self.assertNotIn('storageThroughputGbps',case)
+            self.assertEqual(case['metrics']['fct_p999_ms'],139.028128)
+        self.assertIn('quantiles',cached['cases'][0])
+
+    def test_explicit_mapping_and_override(self):
+        self.write_summary()
+        self.config['metrics_csv'] = 'absent.csv'
+        self.config['cases'] = [dict(id='custom-case',metrics_scheme='te')]
+        metrics = load_metrics(self.manifest,self.config,self.root/'summary.csv')
+        self.assertEqual(metrics['cases']['custom-case']['scheme'],'TE')
+
+    def test_missing_or_duplicate_schemes_and_missing_p999_are_errors(self):
+        self.write_summary(fields=[key for key in ['scheme',*COUNTS,*VALUES] if key!='fct_p999_ms'])
+        with self.assertRaisesRegex(ValueError,'fct_p999_ms'):
+            load_metrics(self.manifest,self.config)
+        self.rows.append(dict(self.rows[0]))
+        self.write_summary()
+        with self.assertRaisesRegex(ValueError,'duplicate scheme'):
+            load_metrics(self.manifest,self.config)
+        self.rows = self.rows[:1]
+        self.write_summary()
+        with self.assertRaisesRegex(ValueError,'no metrics row'):
+            load_metrics(self.manifest,self.config)
+
+    def test_missing_values_and_zero_sample_counts_are_not_displayed_as_zero(self):
+        self.rows[0].update(fct_p999_ms='',avg_tps='NaN',common_valid_throughput_requests=0)
+        self.write_summary()
+        values = load_metrics(self.manifest,self.config)['cases']['ecmp']
+        self.assertIsNone(values['fct_p999_ms'])
+        self.assertIsNone(values['avg_tps'])
+        self.assertIsNone(values['avg_throughput_gbps'])
+
+    def test_invalid_values_and_obsolete_statistics_filters_are_rejected(self):
+        for invalid in ('-1','inf','not-a-number'):
+            self.rows[0]['fct_p999_ms'] = invalid
+            self.write_summary()
+            with self.assertRaisesRegex(ValueError,'fct_p999_ms'):
+                load_metrics(self.manifest,self.config)
+        self.config['statistics'] = {'task_ids':[1]}
+        with self.assertRaisesRegex(ValueError,'filters no longer apply'):
+            load_metrics(self.manifest,self.config)
 
 
 if __name__=='__main__':

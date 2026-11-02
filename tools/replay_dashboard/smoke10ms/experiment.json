@@ -1,6 +1,7 @@
 {
   "title": "SMOKE v8 · 10 ms 合成数据（非仿真结果）",
   "synthetic": true,
+  "metrics_csv": "metrics.csv",
   "window_ms": 10,
   "throughputScale": 100000,
   "topology": "topology",

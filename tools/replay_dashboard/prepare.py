@@ -12,9 +12,9 @@ from topology import csv_rows, read_topology
 from recording import build_recording
 from progress import Progress
 from task_store import (create_tables, import_workload, import_tasks, completion_buckets,
-                        common_quantiles, task_sources, picoseconds)
+                        task_sources, picoseconds)
 
-CACHE_SCHEMA = 14
+CACHE_SCHEMA = 15
 PROCESSING_FILES = ('prepare.py', 'topology.py', 'recording.py', 'progress.py', 'task_store.py')
 
 
@@ -30,8 +30,7 @@ def validate_cache(cache_path):
         raise FileNotFoundError(f'SQLite cache not found: {cache_path}')
     required = {
         'metadata': 'key value', 'frames': 'case_id t0 t1 data',
-        'global_samples': ('case_id t0 t1 max_util hot measured storage_bits storage_duration '
-                           'storage_capacity fabric_bits fabric_capacity storage_tx_bits storage_rx_bits'),
+        'global_samples': 'case_id t0 t1 max_util hot measured fabric_bits fabric_capacity',
         'link_trends': 'case_id t0 src dst capacity gbps util queue',
         'node_paths': 'case_id sample t0 t1 sn dn src dst mid bytes',
         'playback_progress': 'case_id time_ps started completed running',
@@ -43,7 +42,7 @@ def validate_cache(cache_path):
                 if not set(columns.split()) <= actual:
                     raise ValueError(f'Incompatible SQLite cache: missing columns in {table}')
             row = db.execute("SELECT value FROM metadata WHERE key='schema'").fetchone()
-            if row and int(row[0]) not in (13, CACHE_SCHEMA):
+            if row and int(row[0]) not in (13, 14, CACHE_SCHEMA):
                 raise ValueError(f'Unsupported SQLite cache schema: {row[0]}')
             row = db.execute("SELECT value FROM metadata WHERE key='bootstrap'").fetchone()
             info = json.loads(row[0]) if row else None
@@ -81,31 +80,37 @@ def audit_directory(root, case_path, config, metadata, name):
     return next((p for p in candidates if p.is_dir()), candidates[0])
 
 
-def quantile(values, q=.99, ordered=False):
-    values = values if ordered else sorted(values)
-    if not values:
-        return None
-    x = (len(values) - 1) * q
-    lo = int(x)
-    hi = min(lo + 1, len(values) - 1)
-    return values[lo] * (hi - x) + values[hi] * (x - lo) if hi != lo else values[lo]
-
-
 def fingerprint(manifest):
     manifest = Path(manifest).resolve()
     config = json.loads(manifest.read_text(encoding='utf-8'))
-    files = {manifest}
     root = manifest.parent
+    # Display-only settings and the independently loaded summary do not affect
+    # replay aggregation. Hash the remaining manifest content rather than mtime.
+    replay_config = {key: value for key, value in config.items()
+                     if key not in ('metrics_csv', 'metrics_tps_unit', 'statistics', 'throughputScale')}
+    replay_config['cases'] = [{key: value for key, value in case.items() if key != 'metrics_scheme'}
+                              for case in config['cases']]
+    files = set()
+    def add_input(path):
+        path = path if path.exists() else Path(str(path) + '.gz')
+        if path.is_file():
+            files.add(path)
     for case in config['cases']:
         case_path = (root / case['path']).resolve()
-        files.update(p for p in case_path.rglob('*') if p.is_file())
+        # Only fingerprint files actually consumed by the importer. In particular,
+        # a summary CSV inside a case directory is still independent of replay.
+        for name in ('replay_run.csv', 'replay_topology.csv', 'replay_link_samples.csv',
+                     'replay_queue_samples.csv', 'replay_events.csv',
+                     'replay_node_path_samples.csv', 'replay_path_samples.csv'):
+            add_input(case_path / name)
         _, sources = task_sources(root, case)
         files.update(sources)
         metadata = {r['key']: r['value'] for r in csv_rows(case_path / 'replay_run.csv')}
-        for name in ('jupiter_te', 'toe'):
+        for name, logs in (('jupiter_te', ('epoch_summary.csv', 'weights.csv')),
+                           ('toe', ('toe_circuits.csv',))):
             audit = audit_directory(root, case_path, case, metadata, name)
-            if audit.is_dir():
-                files.update(p for p in audit.rglob('*') if p.is_file())
+            for log in logs:
+                add_input(audit / log)
     for name in ('node.csv', 'topology.csv'):
         path = (root / config['topology'] / name).resolve()
         files.add(path if path.exists() else Path(str(path) + '.gz'))
@@ -113,7 +118,7 @@ def fingerprint(manifest):
         path = (root / config['workload']).resolve()
         files.add(path if path.exists() else Path(str(path) + '.gz'))
     info = [(str(p), p.stat().st_size, p.stat().st_mtime_ns) for p in sorted(files)]
-    return hashlib.sha256(dumps([CACHE_SCHEMA, info, code_fingerprint()]).encode()).hexdigest()
+    return hashlib.sha256(dumps([CACHE_SCHEMA, replay_config, info, code_fingerprint()]).encode()).hexdigest()
 
 
 def load_case(db, root, config, topology, reporter):
@@ -375,20 +380,6 @@ def load_case(db, root, config, topology, reporter):
     if not num_frames:
         raise ValueError(f'{case_id}: no link samples')
     bounds = db.execute('SELECT MIN(t0),MAX(t1) FROM frames WHERE case_id=?', (case_id,)).fetchone()
-    total_windows, complete_windows, total_storage_bits, total_storage_capacity, total_storage_duration = db.execute(
-        'SELECT COUNT(*),COUNT(storage_bits),SUM(storage_bits),SUM(storage_capacity),SUM(storage_duration) '
-        'FROM global_samples WHERE case_id=?', (case_id,)).fetchone()
-    storage_utilization = (
-        total_storage_bits / total_storage_capacity
-        if complete_windows == total_windows and total_storage_capacity and total_storage_capacity > 0
-        else None
-    )
-    # Aggregate both storage ingress and egress over the full simulated duration.
-    storage_throughput_gbps = (
-        total_storage_bits / total_storage_duration / 1e9
-        if complete_windows == total_windows and total_storage_duration and total_storage_duration > 0
-        else None
-    )
     route_evidence = []
     path_file = path / 'replay_path_samples.csv'
     final_epoch = max(snapshots)
@@ -410,9 +401,6 @@ def load_case(db, root, config, topology, reporter):
                 routeEvidence=route_evidence, hasPathSamples=path_file.exists() or Path(str(path_file) + '.gz').exists(),
                 capabilities=dict(accessSamples=access_sampled,nodePaths=has_node_paths,wcmpPolicy=has_policy),
                 detailWindows=detail_windows,maxRateGbps=max_rate,
-                storageUtilization=storage_utilization,
-                storageThroughputGbps=storage_throughput_gbps,
-                storageSampleComplete=(complete_windows == total_windows),
                 **task_info, frameCount=num_frames,
                 topologyStates=topology_states, pairScores=list(pair_scores.values()),
                 finalTopologyEpoch=final_epoch, finalEdges=list(final_edges.values()),
@@ -444,6 +432,9 @@ def prepare(manifest_path, cache_path, force=False, progress=None, use_cache=Fal
             except (sqlite3.DatabaseError, ValueError):
                 pass
     config = json.loads(manifest_path.read_text(encoding='utf-8'))
+    if config.get('statistics'):
+        raise ValueError('Apply statistics filters when generating metrics_csv; '
+                         'dashboard no longer calculates FCT quantiles')
     step_ms = float(config.get('window_ms',10))
     if not math.isfinite(step_ms) or step_ms <= 0 or picoseconds(step_ms,10**9) <= 0:
         raise ValueError('window_ms must be a positive finite sampling interval')
@@ -482,11 +473,13 @@ def prepare(manifest_path, cache_path, force=False, progress=None, use_cache=Fal
             info = load_case(db, root, {**case,'window_ms':step_ms,'hotspot_threshold':threshold}, topology,reporter)
             cases.append(info)
             db.commit()
-        reporter.stage('statistics','计算共同任务集与 FCT 分位数')
+        reporter.stage('statistics','生成任务播放进度')
         workload_fingerprints = {c['metadata']['traffic_fnv1a64'] for c in cases if c['metadata'].get('traffic_fnv1a64') not in (None, '', 'unavailable')}
         if len(workload_fingerprints) > 1:
             raise ValueError('Input workload fingerprints differ across cases')
-        common_count, baseline = common_quantiles(db,cases,config,reporter)
+        baseline = next((case for case in cases if case['mode']=='ecmp'), None)
+        if baseline is None:
+            raise ValueError('An ECMP baseline is required')
         for case in cases:
             completion_buckets(db,case['id'],picoseconds(step_ms,10**9),case['end'],reporter,retain=False)
         recording = build_recording(config,cases,baseline,topology['leaves'])
@@ -510,12 +503,12 @@ def prepare(manifest_path, cache_path, force=False, progress=None, use_cache=Fal
         bootstrap = dict(title=config.get('title', 'TE / TOE 回放'), description=config.get('description', ''),
                          synthetic=bool(config.get('synthetic', False)) or any(c['synthetic'] for c in cases),
                          topologySource=config.get('topologySource', 'experiment node.csv / topology.csv'),
-                         topology=topology, cases=cases, commonTasks=common_count, windowSeconds=step_ms/1000,
+                         topology=topology, cases=cases, windowSeconds=step_ms/1000,
                          blockSeconds=max(step_ms/1000,min(.5,50*step_ms/1000)),
                          start=min(c['start'] for c in cases), end=max(c['end'] for c in cases),
                          focus=default_focus,
                          focusOptions=[dict(src=a,dst=b) for a in topology['leaves'] for b in topology['leaves'] if a!=b],
-                         selectedTask=selected, recording=recording, statistics=config.get('statistics',{}),
+                         selectedTask=selected, recording=recording,
                          rateScaleGbps=max((c['maxRateGbps'] for c in cases),default=1))
         reporter.stage('indexing','提交统计与索引，准备回放')
         for k, value in [('schema', str(CACHE_SCHEMA)), ('fingerprint', token), ('bootstrap', dumps(bootstrap)), ('manifest', str(manifest_path))]:

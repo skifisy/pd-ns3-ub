@@ -4,7 +4,7 @@ const COLORS = ['#75889b','#267cae','#8264b3'];
 const TRANSIT_COLORS = ['#7852bb','#5369ba','#a3479a','#42699b','#77548e','#447f88'];
 const params = new URLSearchParams(location.search);
 const S = {time:0,playing:false,buffering:false,bufferSince:0,totalBufferMs:0,seeking:false,seekVersion:0,resumeAfterSeek:false,focus:null,blocks:new Map(),pending:new Map(),frames:{},scenes:new Map(),lastWall:0,lastDraw:0,lastPaint:0,lastPrefetch:0,lastStats:0,key:'',dirty:true,trendKey:'',trendRequest:0,pathBlocks:new Map(),pathPending:new Map(),pathRetryAt:new Map(),frameRetryAt:new Map(),speed:1,controllers:new Map(),heat:true,loadVersion:0,frameLatencyMs:0,pathLatencyMs:0,trendStart:null,trendEnd:null,globalRequest:0,completionRequest:0};
-let meta, recording, completionChart, hotspotChart, globalChart, throughputChart, utilizationChart, nodes, leaves, devices, access;
+let meta, recording, completionChart, hotspotChart, globalChart, utilizationChart, nodes, leaves, devices, access;
 const esc = v => String(v ?? '').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 const finite = v => typeof v==='number' && Number.isFinite(v);
 const number = (v,d=1) => finite(v) ? v.toFixed(d) : '—';
@@ -186,12 +186,27 @@ function focusChangeDetails(c,change,focus){
  const afterCapacity=delta.after===0?0:perCircuit===null?null:delta.after*perCircuit;
  return {...delta,beforeCapacity,afterCapacity,capacityKnown:beforeCapacity!==null&&afterCapacity!==null};
 }
+function summaryMetric(c,key,label,unit,countKey,higherBetter=false){
+ const value=c.metrics[key],baseline=meta.cases.find(row=>row.metrics.scheme==='ECMP'),base=baseline?.metrics[key];
+ let gain='缺失',change=null;
+ if(finite(value)){
+  if(c===baseline)gain='ECMP 基线';
+  else if(finite(base)&&base>0){change=(higherBetter?value-base:base-value)/base*100;gain=(change>=0?'改善 ':'下降 ')+number(Math.abs(change),2)+'%';}
+  else gain='无有效 ECMP 基线';
+ }
+ const tooltip='CSV 原始值：'+(finite(value)?value:'缺失')+' '+unit+'；共同有效样本：'+c.metrics[countKey]+(label==='P999'?'；99.9% 分位':'');
+ return '<div class="summary-metric" title="'+esc(tooltip)+'"><div class="metric-label">'+esc(label)+'</div><div class="metric-value">'+number(value,3)+'<small>'+esc(unit)+'</small></div><div class="gain '+(change<0?'regression':'')+'">'+gain+'</div></div>';
+}
 function setup(){
- $('#globalCards').innerHTML=meta.cases.map((c,i)=>'<article class="global-card" style="--case:'+COLORS[i%3]+'"><div class="card-heading"><h2>'+esc(c.label)+'</h2><span>最终 FCT · 固定共同完成任务集</span></div><div class="quantiles">'+['p50','p90','p99'].map(k=>{
-  const q=c.quantiles[k],gain=c.mode==='ecmp'?'基线':q.improvement==null?'无共同完成任务':(q.improvement>=0?'降低 ':'增加 ')+number(Math.abs(q.improvement))+'%';
-  return '<div><div class="metric-label">'+k.toUpperCase()+'</div><div class="metric-value">'+number(q.seconds*1000,2)+'<small>ms</small></div><div class="gain '+(q.improvement<0?'regression':'')+'">'+gain+'</div></div>';
- }).join('')+'<div><div class="metric-label" title="存储接入链路双向实际发送比特 / 双向容量时间积分">存储侧双向利用率</div><div class="metric-value">'+percent(c.storageUtilization)+'</div><div class="gain">完整仿真时间段</div></div><div><div class="metric-label" title="Storage → Leaf 与 Leaf → Storage 的 tx_wire_bytes × 8 / 仿真总时长，含协议头与重传">存储侧总吞吐</div><div class="metric-value">'+number(c.storageThroughputGbps,1)+'</div><div class="gain">Gbps · 双向全程平均</div></div></div><div class="live-summary"><span>当前完成 <b id="complete-'+i+'">—</b> / '+c.totalTasks+'</span><span>进行中 <b id="running-'+i+'">—</b></span></div></article>').join('');
- $('#networks').innerHTML=meta.cases.map((c,i)=>'<article class="network-row" style="--case:'+COLORS[i%3]+'"><div class="case-side"><div><div class="case-name">'+esc(c.label)+'</div><div class="case-purpose">同一仿真时刻</div></div><div class="global-live"><div title="存储侧 Storage → Leaf 与 Leaf → Storage 双向接入发送量，含协议头和重传"><label>存储侧双向吞吐</label><b id="throughput-'+i+'">—</b><small>Gbps · 双向发送量</small></div><div title="Leaf 间发送比特数 / 有效容量时间积分"><label>Fabric 利用率</label><b id="util-'+i+'">—</b></div><div><label>最大利用率</label><b id="max-'+i+'">—</b></div></div></div><div class="network-space"><canvas class="network" id="network-'+i+'" aria-label="'+esc(c.label)+' 链路热力拓扑"></canvas><span class="network-watermark">L＝Leaf　P0–P11＝Prefill　D12–D15＝Decode　S＝存储</span></div><div class="action-side"><div class="action-label" id="action-label-'+i+'"></div><div class="action-title" id="action-title-'+i+'"></div><div class="action-lines" id="action-lines-'+i+'"></div><div class="action-footer" id="action-footer-'+i+'"></div></div></article>').join('');
+ $('#globalCards').innerHTML=meta.cases.map((c,i)=>{
+  const quantiles=['p50','p90','p99','p999'];
+  const rows=['fct','ttft'].map(metric=>{
+   const countKey=metric==='fct'?'common_valid_fct_flows':'common_valid_ttft_requests';
+   return '<div class="summary-row-heading"><strong>'+metric.toUpperCase()+'</strong><span>共同有效'+(metric==='fct'?'流':'请求')+' '+c.metrics[countKey]+'</span></div><div class="summary-quantiles">'+quantiles.map(q=>summaryMetric(c,metric+'_'+q+'_ms',q.toUpperCase(),'ms',countKey)).join('')+'</div>';
+  }).join('');
+  return '<article class="global-card" style="--case:'+COLORS[i%3]+'"><div class="card-heading"><h2>'+esc(c.label)+'</h2><span>全程汇总 · P999＝99.9% 分位</span></div>'+rows+'<div class="summary-averages">'+summaryMetric(c,'avg_tps','平均 TPS',meta.metricsTpsUnit,'common_valid_tps_requests',true)+summaryMetric(c,'avg_throughput_gbps','平均吞吐','Gbps','common_valid_throughput_requests',true)+'</div><div class="summary-counts">TPS 有效请求 '+c.metrics.common_valid_tps_requests+' · 吞吐有效请求 '+c.metrics.common_valid_throughput_requests+'</div><details class="summary-details"><summary>统计样本</summary><div>本组有效 FCT 流 '+c.metrics.valid_fct_flows+'；共同有效 FCT 流 '+c.metrics.common_valid_fct_flows+'</div><div>共同有效完成请求 '+c.metrics.common_valid_completion_requests+'</div></details><div class="live-summary"><span>当前完成 <b id="complete-'+i+'">—</b> / '+c.totalTasks+'</span><span>进行中 <b id="running-'+i+'">—</b></span></div></article>';
+ }).join('');
+ $('#networks').innerHTML=meta.cases.map((c,i)=>'<article class="network-row" style="--case:'+COLORS[i%3]+'"><div class="case-side"><div><div class="case-name">'+esc(c.label)+'</div><div class="case-purpose">同一仿真时刻</div></div><div class="global-live"><div title="Leaf 间发送比特数 / 有效容量时间积分"><label>Fabric 利用率</label><b id="util-'+i+'">—</b></div><div><label>最大利用率</label><b id="max-'+i+'">—</b></div></div></div><div class="network-space"><canvas class="network" id="network-'+i+'" aria-label="'+esc(c.label)+' 链路热力拓扑"></canvas><span class="network-watermark">L＝Leaf　P0–P11＝Prefill　D12–D15＝Decode　S＝存储</span></div><div class="action-side"><div class="action-label" id="action-label-'+i+'"></div><div class="action-title" id="action-title-'+i+'"></div><div class="action-lines" id="action-lines-'+i+'"></div><div class="action-footer" id="action-footer-'+i+'"></div></div></article>').join('');
  $('#focus').innerHTML=meta.focusOptions.map(p=>'<option value="'+direction(p.src,p.dst)+'">L'+p.src+' → L'+p.dst+'</option>').join('');
  $('#focus').value=direction(S.focus.src,S.focus.dst);$('#focus').disabled=false;
  $('#focus').onchange=e=>{const [src,dst]=e.target.value.split('-').map(Number);cancelLoads(true);S.focus={src,dst};S.dirty=true;requestPath(S.time);prefetchAhead(S.time);loadHotspot().catch(fail);};
@@ -392,7 +407,6 @@ function action(c,frame,i){
 function draw(){
  meta.cases.forEach((c,i)=>{
   const frame=frameAt(c,S.time);S.frames[c.id]=frame;makeScene(c,frame,i);action(c,frame,i);
-  $('#throughput-'+i).textContent=number(frame.global?.storageThroughputGbps,2);
   $('#util-'+i).textContent=percent(frame.global?.fabricUtilization);
   $('#max-'+i).textContent=percent(frame.global?.maxUtilization);
  });
@@ -420,8 +434,7 @@ async function loadHotspot(force=false){
  ])},{notMerge:true});
 }
 async function loadGlobal(){
- const request=++S.globalRequest,data=await get('/api/global-trend?'+trendQuery(throughputChart));if(request!==S.globalRequest)return;
- throughputChart.setOption({...chartBase(),series:meta.cases.map((c,i)=>({...line(c.id+'-throughput',data.cases[c.id].map(p=>[p.time,p.storageThroughputGbps]),COLORS[i%3],false,c.label+' 存储双向 Gbps'),markLine:i===0?cursor():undefined}))},{notMerge:true});
+ const request=++S.globalRequest,data=await get('/api/global-trend?'+trendQuery(utilizationChart));if(request!==S.globalRequest)return;
  const metric=$('#utilMetric').value;
  utilizationChart.setOption({...chartBase(),series:meta.cases.map((c,i)=>({...line(c.id+'-util',data.cases[c.id].map(p=>[p.time,finite(p[metric])?p[metric]*100:null]),COLORS[i%3],false,c.label+' 利用率 %'),markLine:i===0?cursor():undefined}))},{notMerge:true});
  globalChart.setOption({...chartBase(),grid:{left:39,right:28,top:16,bottom:25},yAxis:[{...chartBase().yAxis,max:v=>Math.max(100,Math.ceil(v.max/20)*20)},{...chartBase().yAxis,position:'right',splitLine:{show:false}}],series:meta.cases.flatMap((c,i)=>[
@@ -429,7 +442,7 @@ async function loadGlobal(){
   {...line(c.id+'-hot',data.cases[c.id].map(p=>[p.time,p.hotLinks]),COLORS[i%3],true,c.label+' 热点方向数'),yAxisIndex:1}
  ])},{notMerge:true});
 }
-function charts(){return [completionChart,hotspotChart,globalChart,throughputChart,utilizationChart];}
+function charts(){return [completionChart,hotspotChart,globalChart,utilizationChart];}
 async function reloadTrends(){await Promise.all([loadCompletion(),loadHotspot(true),loadGlobal()]);$('#trendStatus').textContent=number(S.trendStart,3)+'–'+number(S.trendEnd,3)+' s · 聚合均值 / 热点峰值；滚轮可放大 / 缩小，点击可定位';}
 function trendControls(){
   const clamp=(value,min,max)=>Math.max(min,Math.min(max,value));
@@ -538,7 +551,7 @@ function updateText(){
  $('#playbackState').textContent=S.seeking?'正在定位':S.buffering?'缓冲中（等待 Frame）':S.time>=recording.end?'回放完成':S.playing?'播放中':'已暂停';
  $('#buffer').textContent=S.buffering?'加载播放帧中':S.pathPending.has(pathKey(S.time))?'路径详情后台加载中':'数据就绪';
  if(performance.now()-(S.lastCursor||0)<250)return;S.lastCursor=performance.now();
- for(const [chart,id] of [[completionChart,meta.cases[0].id],[hotspotChart,meta.cases[0].id+'-rate'],[globalChart,meta.cases[0].id+'-max'],[throughputChart,meta.cases[0].id+'-throughput'],[utilizationChart,meta.cases[0].id+'-util']])chart.setOption({series:[{id,markLine:cursor()}]});
+ for(const [chart,id] of [[completionChart,meta.cases[0].id],[hotspotChart,meta.cases[0].id+'-rate'],[globalChart,meta.cases[0].id+'-max'],[utilizationChart,meta.cases[0].id+'-util']])chart.setOption({series:[{id,markLine:cursor()}]});
 }
 function setPlaying(value){S.playing=value;if(!value)setBuffering(false);S.lastWall=performance.now();updateText();}
 async function stepFrame(delta){
@@ -639,9 +652,9 @@ async function init(){
  $('#sourceLabel').textContent=meta.synthetic?'SMOKE 合成数据 · 非实验结果':'实际实验日志';
  $('#sourceLabel').classList.toggle('warning',meta.synthetic);
  $('#topologyInfo').textContent=nodes.length+' 节点 · '+leaves.length+' Leaf · '+meta.topology.fabricCircuits+' OCS';
- $('#cohort').textContent=number(meta.windowSeconds*1000,0)+' ms 统计；最终 P50/P90/P99：共同完成 '+meta.commonTasks+' 个任务；未完成：'+meta.cases.map(c=>c.label+' '+(c.totalTasks-c.completedTasks)).join(' / ')+'。节点路径为源 Leaf 窗口发送量。';
+ $('#cohort').textContent=number(meta.windowSeconds*1000,0)+' ms 回放；FCT / TTFT 的 P50、P90、P99、P999 及平均 TPS、吞吐来自 '+meta.metricsSource+'，播放期间保持不变。TPS 按 CSV 生成脚本定义。';
  $('#completedLegend').innerHTML=meta.cases.map((c,i)=>'<span style="color:'+COLORS[i%3]+'">● '+esc(c.label)+'</span>').join('　');
- setup();completionChart=echarts.init($('#completionChart'));hotspotChart=echarts.init($('#hotspotChart'));globalChart=echarts.init($('#globalChart'));throughputChart=echarts.init($('#throughputChart'));utilizationChart=echarts.init($('#utilizationChart'));trendControls();
+ setup();completionChart=echarts.init($('#completionChart'));hotspotChart=echarts.init($('#hotspotChart'));globalChart=echarts.init($('#globalChart'));utilizationChart=echarts.init($('#utilizationChart'));trendControls();
  await Promise.all([ensure(S.time),reloadTrends()]);
  prefetchAhead(S.time);
  await new Promise(resolve=>requestAnimationFrame(resolve));

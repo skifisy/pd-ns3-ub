@@ -30,12 +30,59 @@ python server.py --manifest /data/experiment.json --cache /data/replay-cache/rep
 python server.py --manifest /data/experiment.json --cache /data/replay-cache/replay-v8.sqlite --use-cache --host 0.0.0.0 --port 8000
 ```
 
-`--use-cache` 仍需要 manifest（读取显示倍率等设置），但其中指向的原始数据文件可以不在本机。
+`--use-cache` 仍需要 manifest 和指标汇总 CSV，但其中指向的原始 trace、workload、task_statistics 文件可以不在本机。
 程序只读检查缓存表结构和摘要是否兼容；缓存不存在或不兼容时直接报错，不自动重建。
 该模式直接使用缓存内的实验数据，不比较 manifest 与缓存的数据身份，请指定对应的缓存。
 `--force` 强制重新导入，与 `--use-cache` 互斥。两项也支持环境变量
 `REPLAY_USE_CACHE=1` / `REPLAY_FORCE=1`，适用于直接启动 ASGI 应用。
 `prepare.py` 同样支持这两个互斥选项。
+
+## FCT、TTFT、平均 TPS 与吞吐
+
+顶部 ECMP / TE / TOE 卡片从外部汇总 CSV 直接展示：
+
+- FCT：P50、P90、P99、P999，单位 ms。
+- TTFT：P50、P90、P99、P999，单位 ms。
+- 平均 TPS、平均吞吐（Gbps）。P999 表示 99.9% 分位。
+
+页面保留三位小数，悬停显示 CSV 原始数值；汇总值在播放期间保持不变。
+相对 ECMP 的改善比例直接从汇总值计算，延迟越低越好、TPS / 吞吐越高越好；
+ECMP 基线为零或缺失时不计算比例。
+
+manifest 必须配置 `metrics_csv`，路径可为绝对路径或相对于 manifest。
+每组 `metrics_scheme` 对应 CSV 的 `scheme`，省略时使用该组 `id`，匹配时忽略大小写和两端空白。
+例如 `id=toe`、`mode=toe-only` 对应 `metrics_scheme=TOE`。
+
+```json
+{
+  "metrics_csv": "/data/metrics_summary.csv",
+  "metrics_tps_unit": "TPS"
+}
+```
+
+`metrics_tps_unit` 是 TPS 单位的显示标签，默认为 `TPS`；可按生成脚本的实际定义设置为
+`token/s` 等。Dashboard 不重新定义 TPS 的平均口径，也不重新计算分位数或平均值。
+
+也可用 `--metrics-csv /data/metrics_summary.csv` 覆盖 manifest 中的路径，
+或为直接启动 ASGI 应用设置 `REPLAY_METRICS_CSV`。命令行相对路径以当前工作目录为准；
+manifest 和环境变量中的相对路径以 manifest 所在目录为准。
+
+汇总 CSV 支持逗号、制表符分隔及 UTF-8 BOM，必须包含以下列：
+
+```text
+scheme,common_valid_ttft_requests,common_valid_tps_requests,common_valid_throughput_requests,common_valid_completion_requests,valid_fct_flows,common_valid_fct_flows,ttft_p50_ms,ttft_p90_ms,ttft_p99_ms,ttft_p999_ms,avg_tps,avg_throughput_gbps,fct_p50_ms,fct_p90_ms,fct_p99_ms,fct_p999_ms
+```
+
+所有指标直接使用 CSV 的单位，**不乘 `throughputScale`**。每项展示自身对应的共同有效
+请求数或流数；“统计样本”中另列本组有效 FCT 流数和共同有效完成请求数。
+指标空值 / NaN 或对应样本数为零时显示“—”，不回退到旧缓存或重新计算。
+缺少必需列（包括 FCT P999）、重复 scheme、匹配失败、负值或无限值会报错。
+旧 `statistics` 筛选配置不再用于 Dashboard；请在上游生成 CSV 时应用筛选并移除该配置。
+
+指标 CSV 在服务启动时独立读取，更新后重启服务即可生效，不会因为指标文件、指标路径、
+scheme 映射或单位标签的变化重新导入 trace。即使汇总 CSV 位于 case 目录内也如此。
+使用 `--use-cache` 可直接给旧 SQLite 叠加新汇总 CSV，旧缓存内的 FCT 和存储侧摘要被忽略。
+未使用 `--use-cache` 时，本次导入器版本变更会触发一次缓存重建。
 
 ## 10 ms 采集与旧日志
 
@@ -71,9 +118,9 @@ TE/TOE 发布和拓扑生效仍按精确时间拆分，实际窗口可以小于�
 - 每组 `id`：必须与采集时 case-id 一致。
 - 每组必须提供对应的 `output/task_statistics.csv`；可通过 `task_statistics` 显式指定文件路径。
 - `te_logs` / `toe_logs`：可指定搬移后的控制日志目录。
-- `recording.start_seconds/end_seconds`：限定播放范围，不缩减全程 FCT 统计。
+- `recording.start_seconds/end_seconds`：限定播放范围，不改变外部 CSV 的统计结果。
 
-**任务/FCT 数据唯一来源是每组的 `output/task_statistics.csv`。** 不读取 `.tr`，不读取 `replay_task_events.csv`，也不会在文件缺失时自动生成或回退到其他来源。
+**任务播放进度的数据来源是每组的 `output/task_statistics.csv`。** 不读取 `.tr`，不读取 `replay_task_events.csv`，也不会在文件缺失时自动生成或回退到其他来源。FCT / TTFT 等全程汇总仅来自上文的指标 CSV。
 
 CSV 必须包含以下列：
 
@@ -81,30 +128,23 @@ CSV 必须包含以下列：
 taskId,sourceNode,destNode,dataSize(Byte),opType,taskStartTime(us),taskCompletesTime(us)
 ```
 
-`taskStartTime(us)` 和 `taskCompletesTime(us)` 的单位是微秒，导入时直接换算；空值或 `NaN` 表示对应时间缺失。每组 CSV 至少要有一个开始、完成时间均有效且完成时间不早于开始时间的任务；各组还必须至少有一个共同完成的 taskId，否则准备过程报错。
+`taskStartTime(us)` 和 `taskCompletesTime(us)` 的单位是微秒，导入时直接换算；空值或 `NaN` 表示对应时间缺失。每组 CSV 至少要有一个开始、完成时间均有效且完成时间不早于开始时间的任务。不再在 Dashboard 内求共同完成流的交集或计算 FCT 分位数。
 
 如果未设置 `task_statistics`，程序会按 case 的 `path` 推导固定文件位置：当 `path` 以 `replay/` 结尾时读取其上一级目录下的 `output/task_statistics.csv`，否则读取 `path/output/task_statistics.csv`。显式路径也必须指向 `output/task_statistics.csv`，不会接受其他文件名或 `.gz` 文件。
 
-正常导入模式下，缺少 CSV、CSV 列不完整、时间戳无效、没有有效完成任务或各组没有共同完成任务时，程序会在终端报错并以非零退出码结束，不启动可继续使用的空 Dashboard。`--use-cache` 跳过原始 CSV 检查，直接使用已有统计。
+正常导入模式下，缺少任务 CSV、列不完整、时间戳无效或没有有效完成任务时，程序会在终端报错并以非零退出码结束。`--use-cache` 跳过原始任务 CSV 检查，使用已有任务播放进度，但仍要求可读的指标汇总 CSV。
 
-沿用 `traffic.csv` 的全局 `taskId` 校验任务身份。顶部 P50/P90/P99 使用所有实验组共同完成任务的原始 FCT 计算，页面以 ms 展示并保留两位小数；同时保留各组总数、完成数和未完成数。
-任务以最多 20000 条一批写入 SQLite；精确分位数使用磁盘排序。数据库缓存约 64 MiB，临时排序落盘。
+沿用 `traffic.csv` 的全局 `taskId` 校验任务身份，并保留各组当前完成数、进行中数量和累计完成曲线。
+任务以最多 20000 条一批写入 SQLite；不再建立 `cohort`、`fct_values` 表或执行 FCT 磁盘排序。数据库缓存约 64 MiB，其他临时排序落盘。
 该配置不是整个进程内存的硬上限，仍需为任务、索引、临时排序和旧/新缓存预留磁盘。
 ## 吞吐、容量和利用率
 
-顶部每组 ECMP / TE / TOE 卡片统一展示 **P50 / P90 / P99 FCT、全程存储侧双向利用率、全程存储侧双向平均吞吐**。
-存储侧统一包含全部 `storage-server → Leaf` 和 `Leaf → storage-server` 有向接入端口：
-双向利用率 = `SUM(双向 tx_wire_bytes × 8) / SUM(双向 capacity_bits)`，容量加权；
-双向平均吞吐 = `SUM(双向 tx_wire_bytes × 8) / 仿真总时长`。
-包含 READ/WRITE、协议头和重传；任一窗口缺少任一预期方向的端口采样则显示「—」，不将缺失值当零。
-这里的存储 RX 来自 Leaf 发送计数，表示向存储端发出，不代表应用层已可靠交付。
-
-中间每组网络左侧展示 **存储侧双向吞吐、Fabric 利用率、最大利用率**。
+顶部吞吐直接读取 `avg_throughput_gbps`，不会根据链路采样重新计算。
+页面已移除存储侧双向利用率、存储侧总吞吐、侧栏存储双向吞吐和存储吞吐趋势。
+中间每组网络左侧展示 **Fabric 利用率、最大利用率**。
 
 | 指标 | 口径 |
 |---|---|
-| 存储侧双向吞吐 | 存储节点发送 + Leaf 发往存储节点的 `tx_wire_bytes`，乘 8 再除以真实窗口秒数 |
-| 全程存储侧利用率 | 完整实验期间存储接入链路双向总发送比特 / 同口径双向链路的容量时间积分 |
 | Fabric 整体利用率 | Leaf 间所有有向链路发送比特数 / 容量时间积分总和 |
 | 最大利用率 | 当前窗口已采样 Leaf 间有向链路的最高利用率 |
 | 焦点链路发送 | 焦点 A→B 直连物理链路（含并行链路）的窗口平均发送速率 |
@@ -117,15 +157,11 @@ Leaf 对的流量、协议开销和重传，不能解释为当前焦点独占的
 路径动画根据源 Leaf 的发送归属展示载荷路径，不代表各跳同一时刻的实测速率，也不代表
 接收端去重后的交付速率。
 
-存储侧指标复用两个方向现有的 `tx_wire_bytes` 与 `capacity_bits`，不要求 `read_response_tx_wire_bytes` 字段；
-因此可以重处理已有的**完整双向接入采样** Replay 日志，不用重新编译或重新运行仿真。
-该指标是物理链路发送口径，包含控制流量、协议开销和重传，并非去重后的业务 Payload Goodput。
-
 不能累加所有 Fabric 链路当作端到端吞吐；中转可能重复计数同一份数据。
 存储节点识别与 `topology.py` 一致：非 SWITCH 节点中，64 个 UbPort 为计算端，其余为存储端；请检查实际实验的 node.csv 角色符合这一约定。
 
 `"throughputScale": 100000` 可将 4 Mbps 显示为 400 Gbps。显示速率、容量、路径速率和绘图速率尺度同步缩放。
-利用率、时间、FCT、任务数、原始载荷字节和队列大小保持原值。倍率必须为正有限数。
+利用率、时间、任务数、原始载荷字节和队列大小保持原值。CSV 的 FCT、TTFT、平均 TPS、平均吞吐均不受该倍率影响。倍率必须为正有限数。
 显示换算本身不证明缩小规模仿真与原网络性能等价。
 
 播放新增 0.05×、0.02×、0.01×。Frame 预取按倍率与请求延迟动态调整，默认保留
@@ -170,9 +206,9 @@ WCMP 策略路径与当前观测的载荷路径同时展示：
 不会因此触发重新导入。前端显示代码、服务查询代码的变化不使导入缓存失效。
 输入、处理代码内容或缓存版本变化时重新导入；`--use-cache` 跳过上述指纹比较。
 
-新增接入吞吐与整体利用率趋势，保留累计完成数、焦点发送/容量、全网热点趋势。
+展示整体利用率、累计完成数、焦点发送/容量及全网热点趋势；平均吞吐没有对应的时序曲线。
 默认每组趋势点数按图表宽度限制，最多 2000 个桶（完成趋势另含起点）。
-吞吐按发送总量/总时长聚合；利用率按总发送量/总容量积分聚合；热点保留区间峰值。
+链路发送速率按发送总量/总时长聚合；利用率按总发送量/总容量积分聚合；热点保留区间峰值。
 趋势区间以原始样本起点筛选，不推算窗口内部的瞬时状态。
 点击图表定位播放；“当前位置前后 1 秒”和滚轮放大会重新请求更细数据；“全程趋势”恢复。
 三组事件标记与播放游标同步；全程缩略曲线不替代原始 10 ms 窗口数据。
@@ -180,7 +216,8 @@ WCMP 策略路径与当前观测的载荷路径同时展示：
 API v8：`/api/frames` 含 cases 和 progress，帧及路径请求最多 2 秒。
 `/api/paths` 还返回当前块及块起点生效的 WCMP 策略 `policies`；不含该明细的旧缓存返回 null。
 `/api/completion`、`/api/trend`、`/api/global-trend` 接受 start/end/points，按需返回有限趋势点。
-`/api/bootstrap` 不再包含 completionBins；使用旧 API 的自定义前端需同步更新。
+`/api/bootstrap` 各 case 的 `metrics` 包含 CSV 列名对应的数值；顶层包含 `metricsSource`、`metricsTpsUnit`。
+不再返回旧 `quantiles`、`commonTasks`、存储侧全程摘要或 completionBins；帧和全局趋势 API 也不再返回存储侧吞吐字段。使用旧 API 的自定义前端需同步更新。
 
 ## 自行执行检查
 
@@ -191,7 +228,7 @@ python prepare.py --manifest smoke10ms/experiment.json --cache cache/smoke-v8.sq
 python server.py --smoke
 ```
 
-v8 检查覆盖 10 ms 窗口、事件拆分、精确 FCT、缺失接入采样、吞吐避免多跳重复、
-容量加权、显示倍率换算、拖动时任务进度种子及采样间隔不匹配。
+检查代码覆盖 10 ms 窗口、事件拆分、任务进度、容量加权、缓存复用、WCMP 策略、
+外部 CSV 的 P999 / 单位 / 映射 / 缺失值处理，以及指标更新不触发 trace 导入。
 网页还请手工检查开始/暂停/拖动、逐帧、热点开关、中转颜色和趋势缩放。
 以上命令本次均未执行，未进行真实 3000 万任务或 10 ms 全程日志的性能验证。

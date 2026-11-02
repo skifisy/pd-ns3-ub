@@ -1,0 +1,4 @@
+scheme,common_valid_ttft_requests,common_valid_tps_requests,common_valid_throughput_requests,common_valid_completion_requests,valid_fct_flows,common_valid_fct_flows,ttft_p50_ms,ttft_p90_ms,ttft_p99_ms,ttft_p999_ms,avg_tps,avg_throughput_gbps,fct_p50_ms,fct_p90_ms,fct_p99_ms,fct_p999_ms
+ECMP,5,5,5,5,6,5,100,180,220,250,2,0.006,130,300,400,450
+TE,5,5,5,5,6,5,90,160,200,230,2.1,0.0065,110,240,320,350
+TOE,5,5,5,5,5,5,95,170,210,240,2.2,0.007,100,200,260,290

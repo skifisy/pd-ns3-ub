@@ -7,7 +7,7 @@ import tempfile
 import unittest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from task_store import create_tables, import_workload, import_tasks, completion_buckets, common_quantiles
+from task_store import create_tables, import_workload, import_tasks, completion_buckets
 from topology import csv_rows
 
 
@@ -30,7 +30,7 @@ TASK_STATS_HEADER = [
 
 
 class DiskTaskChecks(unittest.TestCase):
-    def test_cohort_quantiles_and_completion_boundaries(self):
+    def test_completion_boundaries_without_fct_sorting(self):
         with tempfile.TemporaryDirectory() as name:
             root = Path(name)
             db = sqlite3.connect(root / 'tasks.sqlite')
@@ -65,10 +65,10 @@ class DiskTaskChecks(unittest.TestCase):
                         writer.writerow([task_id, task_id - 1, task_id + 15, size, op, start_us, end_us])
                 info = import_tasks(db, root, dict(id=cid, path=cid), reporter)
                 cases.append(dict(id=cid, mode='ecmp' if cid == 'ecmp' else cid, **info))
-            n, _ = common_quantiles(db, cases, {}, reporter)
-            self.assertEqual(n, 2)
-            self.assertAlmostEqual(cases[0]['quantiles']['p50']['seconds'], .8)
-            self.assertAlmostEqual(cases[1]['quantiles']['p99']['seconds'], .8935)
+            tables = {row[0] for row in db.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+            self.assertNotIn('cohort', tables)
+            self.assertNotIn('fct_values', tables)
+            self.assertTrue(all('quantiles' not in case for case in cases))
             bins = completion_buckets(db, 'ecmp', 500000000000, 1.25, reporter)
             self.assertEqual([b['time'] for b in bins], [0, .5, 1, 1.25])
             self.assertEqual([b['completed'] for b in bins], [0, 1, 1, 2])

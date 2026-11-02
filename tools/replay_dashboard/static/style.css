@@ -57,3 +57,16 @@ main{margin-bottom:65px}
 .heat-legend .policy{border-color:#7852bb;border-top-style:dashed}
 .action-lines{overflow:auto}
 .action-lines .policy-route{border-left:2px dashed;padding-left:4px;margin:2px 0}
+
+/* Precomputed experiment summary; values retain the CSV's ms / Gbps units. */
+.summary-row-heading{display:flex;justify-content:space-between;gap:8px;align-items:center;margin-top:9px;font-size:10px}
+.summary-row-heading span,.summary-counts,.summary-details{font-size:8px;color:var(--muted)}
+.summary-quantiles{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:6px;margin-top:4px}
+.summary-averages{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:10px;border-top:1px solid #edf1f4;padding-top:7px;margin-top:8px}
+.summary-metric .metric-value{font-size:clamp(11px,1.2vw,17px);white-space:nowrap}
+.summary-metric .metric-value small{font-size:8px;margin-left:2px}
+.summary-metric .metric-label,.summary-metric .gain{font-size:8px}
+.summary-counts{margin-top:6px;line-height:1.5}
+.summary-details{margin-top:4px;line-height:1.6}
+.summary-details summary{cursor:pointer}
+.performance-evidence{grid-template-columns:minmax(0,1fr)}
