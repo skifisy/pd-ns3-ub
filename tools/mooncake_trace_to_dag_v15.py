@@ -8,7 +8,8 @@ Decode timing and all Decode scheduling/traffic semantics remain the original
 v15/v14 formulas. Indexer Key Cache is assumed resident when FLOPs mode is used;
 its network traffic is not emitted. Expert and TP communication are not emitted.
 HBM capacity is not modelled. Network forecasts are estimates; execution ordering
-is also encoded as DAG edges. Use mooncake_dag_to_traffic_v15.py unchanged.
+is also encoded as DAG edges. The matching V15 converter emits explicit
+Prefill TIMER tasks and preserves the layer barriers.
 """
 
 import argparse
@@ -39,7 +40,7 @@ FIXED_P_DOMAIN_COUNT = 3
 FIXED_D_DOMAIN_COUNT = 1
 SCHEMA = "v14-domain-serial-batch-tp-logical"
 MAX_DEPENDENCY_FANIN = 512
-VERSION = "v15-prefill-glm51-flops-decode-unchanged-20261102"
+VERSION = "v15-prefill-glm51-flops-traffic-metadata-20261104-v2"
 
 # Public Ascend 950PR 32-AI-subsystem bin from Huawei's 2026 architecture
 # white paper: INT8 peak = 919 TOPS.  The 28-subsystem bin is 804 TOPS.
@@ -1134,6 +1135,7 @@ TRAFFIC_TASK_FIELDS = [
 LOGICAL_EXTRA_FIELDS = [
     "tp_members", "tp_degree", "tp_group_id", "batch_id", "layer_index",
     "block_index", "decode_token_index", "forecast_start_us", "forecast_finish_us",
+    "batch_type", "p_node",
 ]
 LOGICAL_TRAFFIC_FIELDS = TRAFFIC_TASK_FIELDS + LOGICAL_EXTRA_FIELDS
 LOGICAL_FULL_FIELDS = TASK_FIELDS + ["tp_members"]
@@ -1943,6 +1945,12 @@ class BatchBuilder:
         groups = {state["p_tp_group"] for state in states}
         gi = next(iter(groups)) if len(groups) == 1 else None
         base = self.base(states, domain, gi, "P", "")
+        # Batch-level TIMER tasks need a valid ns-3 execution context even
+        # when the batch spans more than one TP group (gi is then None).
+        if not base["p_node"]:
+            if not states or not states[0]["p_tp_endpoints"]:
+                raise RuntimeError("Prefill batch has no representative TP endpoint for TIMER tasks")
+            base["p_node"], base["p_port"] = states[0]["p_tp_endpoints"][0]
         previous = domain.last_compute_done
         begin = self.dag.add(base, "TIMER", "P_BATCH_BEGIN", [previous], release=now,
                              comment="Immediate dispatch; domain compute predecessor enforced.")

@@ -60,6 +60,7 @@ public:
     enum class RuntimeTaskOp : uint8_t
     {
         UNKNOWN,
+        TIMER,
         URMA_WRITE,
         URMA_READ,
         MEM_STORE,
@@ -211,6 +212,8 @@ public:
     bool ShouldRecordCanonicalEventLocked(const RuntimeTask& task) const;
 
     void StartTask(Ptr<UbApp> app, RuntimeTask task);
+
+    void StartTimer(RuntimeTask task);
 
     struct ReadyTaskBatch
     {

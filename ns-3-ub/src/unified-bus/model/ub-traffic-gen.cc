@@ -356,6 +356,9 @@ UbTrafficGen::ParseOpLocked(const std::string& opType)
 UbTrafficGen::RuntimeTaskOp
 UbTrafficGen::ParseOpLocked(std::string_view opType)
 {
+    if (opType == "TIMER") {
+        return RuntimeTaskOp::TIMER;
+    }
     if (opType == "URMA_WRITE") {
         return RuntimeTaskOp::URMA_WRITE;
     }
@@ -1185,7 +1188,7 @@ UbTrafficGen::GetInitialTaskStartOffsets(const ReadyTaskBatch& batch) const
     std::unordered_map<uint32_t, uint64_t> sourceSlots;
     for (const auto& task : batch.tasks)
     {
-        if (!task.hasPhaseDependencies)
+        if (!task.hasPhaseDependencies && task.op != RuntimeTaskOp::TIMER)
         {
             sourceSlots.try_emplace(task.sourceNode,
                                     GetInitialTaskSourceOffsetHash(task.sourceNode, offsetSeed) %
@@ -1204,7 +1207,7 @@ UbTrafficGen::GetInitialTaskStartOffsets(const ReadyTaskBatch& batch) const
     for (size_t index = 0; index < batch.tasks.size(); ++index)
     {
         const auto& task = batch.tasks[index];
-        if (!task.hasPhaseDependencies)
+        if (!task.hasPhaseDependencies && task.op != RuntimeTaskOp::TIMER)
         {
             offsets[index] = TimeStep(static_cast<int64_t>(sourceSlots.at(task.sourceNode)));
         }
@@ -1264,6 +1267,17 @@ void UbTrafficGen::ScheduleTasks(const ReadyTaskBatch& batch)
             NS_LOG_WARN("It is strongly recommended not to set the task priority to 0. " <<
                         "Priority level 0 is reserved for control frames.");
         }
+        if (task.op == RuntimeTaskOp::TIMER) {
+            NS_ABORT_MSG_IF(task.dataSize != 0, "TIMER tasks must have dataSize=0");
+            Ptr<Node> sourceNode = NodeList::GetNode(task.sourceNode);
+            Simulator::ScheduleWithContext(sourceNode->GetId(),
+                                           Time(0),
+                                           &UbTrafficGen::StartTimer,
+                                           this,
+                                           task);
+            NS_LOG_DEBUG("Scheduled TIMER task " << task.taskId);
+            continue;
+        }
         Ptr<UbApp> app = index < batch.sourceApps.size() ? batch.sourceApps[index] : nullptr;
         if (app == nullptr) {
             app = DynamicCast<UbApp>(NodeList::GetNode(task.sourceNode)->GetApplication(0));
@@ -1285,6 +1299,16 @@ UbTrafficGen::StartTask(Ptr<UbApp> app, RuntimeTask task)
 {
     RecordCanonicalEvent("START", task);
     app->SendTraffic(task);
+}
+
+void
+UbTrafficGen::StartTimer(RuntimeTask task)
+{
+    RecordCanonicalEvent("START", task);
+    Simulator::Schedule(task.delay,
+                        &UbTrafficGen::OnTaskCompleted,
+                        this,
+                        task.taskId);
 }
 
 void UbTrafficGen::OnTaskCompleted(uint32_t taskId)
