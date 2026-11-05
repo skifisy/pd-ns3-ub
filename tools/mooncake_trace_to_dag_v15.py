@@ -1,15 +1,18 @@
 #!/usr/bin/env python3
 """v15 Trace -> logical TP batch DAG: batch limits apply PER Attention DP engine.
 
-Open-loop event scheduling. Prefill optionally uses a GLM-5.1 MLA + DSA + MoE
-FLOPs model (per-DP TP attention, shared EP routed-expert pool); legacy linear
-Prefill timing remains available when compute_model.mode is absent/"legacy".
-Decode timing and all Decode scheduling/traffic semantics remain the original
-v15/v14 formulas. Indexer Key Cache is assumed resident when FLOPs mode is used;
+Open-loop event scheduling. Prefill and Decode optionally use a GLM-5.1
+MLA + DSA + MoE FLOPs model (per-DP TP attention, shared EP routed experts);
+legacy timing remains available when compute_model.mode is absent/"legacy".
+Decode counts one new query per request plus its current KV context. Every
+batch uses one whole-step Compute TIMER after all required input KV is read.
+New requests may read all layers after their own Prefill completes, while the
+preceding Decode step is still computing. Indexer Key Cache is assumed resident
+when FLOPs mode is used;
 its network traffic is not emitted. Expert and TP communication are not emitted.
 HBM capacity is not modelled. Network forecasts are estimates; execution ordering
 is also encoded as DAG edges. The matching V15 converter emits explicit
-Prefill TIMER tasks and preserves the layer barriers.
+Prefill layer and Decode whole-step TIMER tasks with exact dependencies.
 """
 
 import argparse
@@ -40,7 +43,17 @@ FIXED_P_DOMAIN_COUNT = 3
 FIXED_D_DOMAIN_COUNT = 1
 SCHEMA = "v14-domain-serial-batch-tp-logical"
 MAX_DEPENDENCY_FANIN = 512
-VERSION = "v15-prefill-glm51-flops-traffic-metadata-20261104-v2"
+VERSION = "v15-decode-request-final-write-20261105-v9"
+
+FLOP_METRIC_FIELDS = (
+    "mla_projection_flops", "indexer_projection_flops", "indexer_score_flops",
+    "sparse_attention_flops", "attention_flops", "dense_ffn_flops", "router_flops",
+    "routed_expert_flops", "shared_expert_flops",
+)
+TIME_METRIC_FIELDS = (
+    "attention_time_us", "dense_ffn_time_us", "router_time_us",
+    "routed_expert_time_us", "shared_expert_time_us",
+)
 
 # Public Ascend 950PR 32-AI-subsystem bin from Huawei's 2026 architecture
 # white paper: INT8 peak = 919 TOPS.  The 28-subsystem bin is 804 TOPS.
@@ -246,6 +259,10 @@ class Model:
         )
         scheduling = cfg.get("scheduling", {})
         self.ignored_config_settings = []
+        if self.storage_to_d_streaming:
+            self.ignored_config_settings.append(
+                "kv_delivery.layer_pipeline.storage_to_d_streaming ignored; Decode reads all layers before Compute")
+        self.storage_to_d_streaming = False
         for key in ("tp_degree", "p_tp_degree", "d_tp_degree"):
             if key in scheduling:
                 self.ignored_config_settings.append(f"scheduling.{key} ignored; use parallel.*")
@@ -441,6 +458,7 @@ class Model:
         self.p_dp_degree = self.ep_degree // self.p_tp_degree
         self.d_dp_degree = self.ep_degree // self.d_tp_degree
         self._configure_prefill_compute_model(cfg.get("compute_model", {}))
+        self._configure_decode_compute_model(cfg.get("compute_model", {}))
         self.p_domain_slot_bound = self.p_dp_degree * self.p_max_num_seqs
         self.d_domain_slot_bound = self.d_dp_degree * self.d_max_num_seqs
         for name, value in (("prefill_us_per_token", self.prefill_us_per_token),
@@ -661,6 +679,114 @@ class Model:
             ),
         }
 
+    def _configure_decode_compute_model(self, settings):
+        self.decode_compute_mode = self.prefill_compute_mode
+        self.decode_compute_model_name = (
+            "glm51-mla-dsa-moe-decode-flops-v1" if self.decode_compute_mode == "glm51_flops"
+            else "max-member-step-baseline")
+        self.decode_efficiency = dict(self.prefill_efficiency)
+        self.decode_shared_expert_tp_degree = self.d_tp_degree
+        self.decode_layer_classes = ()
+        if self.decode_compute_mode == "legacy":
+            return
+        raw = settings.get("decode_efficiency", {})
+        if isinstance(raw, (int, float)) and not isinstance(raw, bool):
+            raw = {name: raw for name in self.prefill_efficiency}
+        if not isinstance(raw, dict):
+            raise ValueError("compute_model.decode_efficiency must be a number or JSON object")
+        for name, fallback in self.prefill_efficiency.items():
+            value = float(raw.get(name, raw.get("default", fallback)))
+            if not math.isfinite(value) or not 0 < value <= 1:
+                raise ValueError(f"compute_model.decode_efficiency.{name} must be in (0, 1]")
+            self.decode_efficiency[name] = value
+        self.decode_shared_expert_tp_degree = strict_positive_int(
+            settings.get("decode_shared_expert_tp_degree",
+                         settings.get("shared_expert_tp_degree", self.d_tp_degree)),
+            "compute_model.decode_shared_expert_tp_degree")
+        if self.ep_degree % self.decode_shared_expert_tp_degree:
+            raise ValueError("decode_shared_expert_tp_degree must divide EP degree")
+        self.decode_layer_classes = tuple(
+            (layer < self.glm51_arch["first_k_dense_replace"], layer in self.indexer_layers)
+            for layer in range(self.num_layers))
+        self.ignored_config_settings.extend([
+            "timing.decode_us_per_token ignored in glm51_flops mode",
+            "timing.first_decode_step_us ignored in glm51_flops mode"])
+
+    def decode_compute(self, states, include_layers=False):
+        """One new query per member, using H=input_length+completed_steps cached keys.
+
+        Incremental attention/Indexer sees H+1 keys, including the current
+        query's own key. History is not projected or run through FFN again.
+        The current expanded-KV path and Prefill arithmetic coefficients are
+        shared; TP degree and efficiency are Decode-specific.
+        """
+        if not states:
+            raise ValueError("cannot compute an empty Decode batch")
+        contexts = [int(s["req"]["input_length"]) + int(s["token"]) for s in states]
+        result = {
+            "compute_model": self.decode_compute_model_name,
+            "request_count": len(states), "new_tokens": len(states),
+            "new_request_count": sum(s["token"] == 0 for s in states),
+            "cached_context_tokens": sum(contexts),
+            "visible_context_tokens": sum(contexts) + len(states),
+            "min_cached_context_tokens": min(contexts), "max_cached_context_tokens": max(contexts),
+            "layer_count": self.num_layers,
+            "attention_tp_degree": self.d_tp_degree,
+            "routed_expert_parallel_degree": self.ep_degree,
+            "shared_expert_tp_degree": self.decode_shared_expert_tp_degree,
+            "expert_load_imbalance_factor": self.expert_load_imbalance_factor,
+        }
+        if self.decode_compute_mode == "legacy":
+            duration = max(self.first_decode_step_us if s["token"] == 0
+                           else self.decode_duration_us(1) for s in states)
+            result.update(compute_time_us=float(duration), compute_us=duration)
+            return result, split_duration(duration, self.num_layers) if include_layers else [], []
+        stats = defaultdict(lambda: Counter(request_count=0, miss_tokens=0, cached_tokens=0,
+                                            indexer_pairs=0, sparse_pairs=0))
+        for state, context in zip(states, contexts):
+            group = state.get("d_tp_group_id", state.get("d_tp_group"))
+            if group is None:
+                raise ValueError("Decode FLOPs model needs a pinned TP group")
+            indexer_pairs, sparse_pairs = self._dsa_pair_counts(1, context, self.glm51_arch["index_topk"])
+            values = stats[group]
+            values["request_count"] += 1
+            values["miss_tokens"] += 1
+            values["cached_tokens"] += context
+            values["indexer_pairs"] += indexer_pairs
+            values["sparse_pairs"] += sparse_pairs
+        result.update(
+            local_group_token_counts=json.dumps({str(k): v["miss_tokens"] for k, v in sorted(stats.items())}, separators=(",", ":")),
+            local_group_cached_context_tokens=json.dumps({str(k): v["cached_tokens"] for k, v in sorted(stats.items())}, separators=(",", ":")),
+            indexer_pairs_per_indexed_layer=sum(v["indexer_pairs"] for v in stats.values()),
+            sparse_pairs_per_layer=sum(v["sparse_pairs"] for v in stats.values()))
+        # Only up to four (Dense/MoE, Indexer on/off) metric sets are needed
+        # per batch. Resident steps never build 78 repeated metric dicts.
+        cache, layer_metrics = {}, []
+        for layer, key in enumerate(self.decode_layer_classes):
+            if key not in cache:
+                cache[key] = self._layer_metrics(stats, layer, self.d_tp_degree,
+                                                 self.decode_efficiency, self.decode_shared_expert_tp_degree)
+            layer_metrics.append(cache[key])
+        classes = Counter(self.decode_layer_classes)
+        for field in FLOP_METRIC_FIELDS:
+            result[field] = sum(count * cache[key][field] for key, count in classes.items())
+        for field in TIME_METRIC_FIELDS:
+            result[field] = math.fsum(count * cache[key][field] for key, count in classes.items())
+        total = math.fsum(row["layer_compute_time_us"] for row in layer_metrics)
+        duration = max(1, int(math.floor(total + 0.5))) if total > 0 else 0
+        result.update(compute_time_us=total, compute_us=duration)
+        durations, rows = [], []
+        if include_layers:
+            cumulative, previous = 0.0, 0
+            for layer, metrics in enumerate(layer_metrics):
+                cumulative += metrics["layer_compute_time_us"]
+                rounded = duration if layer == self.num_layers - 1 else int(math.floor(cumulative + 0.5))
+                durations.append(rounded - previous)
+                previous = rounded
+                rows.append(dict(layer_index=layer, **metrics,
+                                 layer_compute_us=durations[-1]))
+        return result, durations, rows
+
     @staticmethod
     def _dsa_pair_counts(miss_tokens, cached_tokens, topk):
         """Return (all indexer score pairs, selected sparse-attention pairs).
@@ -681,7 +807,11 @@ class Model:
         return all_pairs, selected_pairs
 
     def _prefill_layer_metrics(self, group_stats, layer):
-        """Compute per-layer GLM-5.1 FLOPs and stage times for one EP wave."""
+        return self._layer_metrics(group_stats, layer, self.p_tp_degree,
+                                   self.prefill_efficiency, self.shared_expert_tp_degree)
+
+    def _layer_metrics(self, group_stats, layer, tp_degree, efficiency, shared_tp_degree):
+        """Shared arithmetic model; group miss_tokens counts newly computed queries."""
         a = self.glm51_arch
         c = self.glm51_flops
         is_dense = layer < a["first_k_dense_replace"]
@@ -728,17 +858,16 @@ class Model:
             return times[critical], str(critical)
 
         attention_time, attention_critical = max_group_time(
-            "attention_flops", self.p_tp_degree, self.prefill_efficiency["attention"]
+            "attention_flops", tp_degree, efficiency["attention"]
         )
         dense_time, _ = max_group_time(
-            "dense_ffn_flops", self.p_tp_degree, self.prefill_efficiency["dense_ffn"]
+            "dense_ffn_flops", tp_degree, efficiency["dense_ffn"]
         )
         router_time, _ = max_group_time(
-            "router_flops", self.p_tp_degree, self.prefill_efficiency["router"]
+            "router_flops", tp_degree, efficiency["router"]
         )
         shared_time, _ = max_group_time(
-            "shared_expert_flops", self.shared_expert_tp_degree,
-            self.prefill_efficiency["shared_expert"]
+            "shared_expert_flops", shared_tp_degree, efficiency["shared_expert"]
         )
 
         routed_expert_flops = (
@@ -746,7 +875,7 @@ class Model:
         )
         routed_expert_time = (
             routed_expert_flops
-            / (self.ep_degree * self.npu_peak_flops * self.prefill_efficiency["routed_expert"])
+            / (self.ep_degree * self.npu_peak_flops * efficiency["routed_expert"])
             * 1e6 * self.expert_load_imbalance_factor
         ) if routed_expert_flops else 0.0
 
@@ -880,6 +1009,8 @@ class Model:
             raise ValueError("optional throughput setting must be > 0")
         return parsed
     def _resolve_group_tps(self, role):
+        if role == "D" and self.decode_compute_mode == "glm51_flops":
+            return None, "context-dependent-decode-flops"
         if role == "P":
             explicit = self.p_group_tps_config
             per_npu = self.p_tps_per_npu
@@ -1110,6 +1241,21 @@ PREFILL_LAYER_COMPUTE_FIELDS = [
     "attention_critical_tp_group", "attention_tp_degree", "routed_expert_parallel_degree",
     "shared_expert_tp_degree", "expert_load_imbalance_factor", "indexer_key_cache_resident",
 ]
+DECODE_COMPUTE_FIELDS = [
+    "batch_id", "batch_step_index", "service_domain", "request_ids", "compute_granularity",
+    "compute_model", "request_count", "new_request_count", "new_tokens", "layer_count",
+    "cached_context_tokens", "visible_context_tokens", "min_cached_context_tokens", "max_cached_context_tokens",
+    "local_group_token_counts", "local_group_cached_context_tokens",
+    "indexer_pairs_per_indexed_layer", "sparse_pairs_per_layer",
+    *FLOP_METRIC_FIELDS, *TIME_METRIC_FIELDS, "compute_time_us", "compute_us",
+    "attention_tp_degree", "routed_expert_parallel_degree", "shared_expert_tp_degree",
+    "expert_load_imbalance_factor",
+]
+DECODE_LAYER_COMPUTE_FIELDS = [
+    "batch_id", "batch_step_index", "service_domain", "layer_index", "layer_type",
+    "new_tokens", "cached_context_tokens", *FLOP_METRIC_FIELDS, *TIME_METRIC_FIELDS,
+    "layer_compute_time_us", "layer_compute_us", "attention_critical_tp_group",
+]
 
 
 def split_exact(total, parts, index):
@@ -1135,7 +1281,7 @@ TRAFFIC_TASK_FIELDS = [
 LOGICAL_EXTRA_FIELDS = [
     "tp_members", "tp_degree", "tp_group_id", "batch_id", "layer_index",
     "block_index", "decode_token_index", "forecast_start_us", "forecast_finish_us",
-    "batch_type", "p_node",
+    "batch_type", "p_node", "d_node",
 ]
 LOGICAL_TRAFFIC_FIELDS = TRAFFIC_TASK_FIELDS + LOGICAL_EXTRA_FIELDS
 LOGICAL_FULL_FIELDS = TASK_FIELDS + ["tp_members"]
@@ -1801,11 +1947,17 @@ class Placement:
 
 
 class BatchBuilder:
-    def __init__(self, model, dag, writer, prefill_layer_writer=None):
+    def __init__(self, model, dag, writer, prefill_layer_writer=None,
+                 decode_writer=None, decode_layer_writer=None):
         self.model, self.dag, self.writer = model, dag, writer
         self.prefill_layer_writer = prefill_layer_writer
         self.prefill_layer_compute_rows = 0
         self.prefill_compute_totals = Counter()
+        self.decode_writer, self.decode_layer_writer = decode_writer, decode_layer_writer
+        self.decode_compute_totals = Counter()
+        self.decode_layer_compute_rows = 0
+        self.decode_merged_steps, self.decode_layered_steps = 0, 0
+        self.decode_input_read_steps = 0
         self.batch_id = 0
         self.sizes = {"P": [], "D": []}
         self.token_shards = {}
@@ -1869,37 +2021,32 @@ class BatchBuilder:
             members.append([rank, src[0], src[1], dst[0], dst[1], nbytes])
         return self.dag.add_group(self.owned(base, state), "NETWORK", stage, deps, common, members)
 
-    def decode_token_write(self, base, state, domain, gi, compute_done):
-        """One whole-token transfer per nonempty TP rank, after all layers.
+    def decode_request_write(self, base, state, domain, gi, compute_done):
+        """Gather all output-token KV once, after the request's last Compute.
 
-        Preserve the old layer-wise integer shard partition: a rank's bytes
-        are the SUM of its layer shards, not a new division of the token total.
-        The transfer is a gather of canonical layer ranges, not one contiguous
-        range in a single layer. Explicit range metadata avoids that ambiguity.
+        Preserve the per-token layer/rank integer partition before multiplying
+        by output length. Repartitioning the aggregate could move rounding
+        bytes between ranks. Input KV is already stored and is not written again.
+        The request's complete output is one storage object, shared by its ranks.
         """
+        tokens = state["req"]["output_length"]
+        if state["token"] != tokens or tokens <= 0:
+            raise RuntimeError("Decode output write requires all output tokens computed")
         degree = domain.degree
         if degree not in self.token_shards:
-            shards = []
-            for rank in range(degree):
-                ranges = []
-                for layer in range(self.model.num_layers):
-                    layer_bytes = self.model.layer_bytes(self.model.kv_bytes_per_token, layer)
-                    offset, nbytes = split_exact(layer_bytes, degree, rank)
-                    if nbytes:
-                        ranges.append([layer, offset, nbytes])
-                shards.append((sum(item[2] for item in ranges),
-                               json.dumps(ranges, separators=(",", ":"))))
-            self.token_shards[degree] = shards
-        token = state["token"]
-        output_block = token // self.model.block_tokens
-        key = f"decode:{state['req']['request_id']}:block:{output_block}"
+            self.token_shards[degree] = [sum(
+                split_exact(self.model.layer_bytes(self.model.kv_bytes_per_token, layer), degree, rank)[1]
+                for layer in range(self.model.num_layers)) for rank in range(degree)]
+        key = f"decode:{state['req']['request_id']}:output"
         storage = self.model.choose_storage_endpoint(key)
         common = dict(dst_node=storage[0], dst_port=storage[1], storage_read_latency_us=0,
-            layer_index=-1, block_index=output_block, decode_token_index=token,
+            layer_index=-1, block_index=-1, decode_token_index=tokens - 1,
+            storage_key=key, kv_extent_kind="all_output_tokens_all_layers",
+            kv_token_offset=0, kv_token_bytes=self.model.kv_bytes_per_token,
             network_wave=f"D:{base['batch_id']}:{self.model.num_layers}")
         members = []
         for rank, worker in enumerate(domain.groups[gi]):
-            nbytes, ranges = self.token_shards[degree][rank]
+            nbytes = self.token_shards[degree][rank] * tokens
             if nbytes:
                 members.append([rank, worker[0], worker[1], storage[0], storage[1], nbytes])
         return self.dag.add_group(self.owned(base, state), "NETWORK", "DECODE_WRITE",
@@ -2041,33 +2188,55 @@ class BatchBuilder:
         groups = {s["d_tp_group"] for s in states}
         gi = next(iter(groups)) if len(groups) == 1 else None
         base = self.base(states, domain, gi, "D", domain.step)
+        # A batch-wide compute TIMER needs an execution context even when
+        # the EP wave contains several local TP groups.
+        if not base["d_node"]:
+            if not states or not states[0]["d_tp_endpoints"]:
+                raise RuntimeError("Decode batch has no representative TP endpoint for TIMER tasks")
+            base["d_node"], base["d_port"] = states[0]["d_tp_endpoints"][0]
         previous = domain.last_compute_done
         deps = [previous] + [s["p_done"] if s["token"] == 0 else s["last_step"] for s in states]
         begin = self.dag.add(base, "TIMER", "D_BATCH_BEGIN", deps, release=now)
-        current_reads = []
-
-        def reads(layer, gate):
-            result = []
-            for state in states:
-                if state["token"] == 0:
+        all_resident = all(s["token"] > 0 for s in states)
+        metrics, _, layer_rows = self.model.decode_compute(
+            states, include_layers=self.decode_layer_writer is not None)
+        duration = metrics["compute_us"]
+        common = dict(batch_id=self.batch_id, batch_step_index=domain.step, service_domain=domain.id)
+        if self.decode_writer is not None:
+            self.decode_writer.writerow(dict(common, request_ids=base["request_ids"],
+                                             compute_granularity="step", **metrics))
+        if self.decode_layer_writer is not None:
+            for row in layer_rows:
+                self.decode_layer_writer.writerow(dict(
+                    common, layer_index=row["layer_index"], layer_type=row["layer_type"],
+                    new_tokens=row["miss_tokens"], cached_context_tokens=row["cached_tokens"],
+                    **{key: row[key] for key in (*FLOP_METRIC_FIELDS, *TIME_METRIC_FIELDS,
+                       "layer_compute_time_us", "layer_compute_us", "attention_critical_tp_group")}))
+                self.decode_layer_compute_rows += 1
+        for key in (*FLOP_METRIC_FIELDS, *TIME_METRIC_FIELDS, "compute_us"):
+            self.decode_compute_totals[key] += metrics.get(key, 0)
+        input_reads = []
+        if not all_resident:
+            # All physical block/layer/TP flows remain distinct, but none
+            # waits for Decode computation or for another layer's Read.
+            for layer in range(self.model.num_layers):
+                for state in states:
+                    if state["token"] != 0:
+                        continue
                     for block in state["blocks"]:
-                        result.extend(self.network(base, state, domain, state["d_tp_group"], "STORAGE_TO_D", block,
-                            layer, [gate], f"D:{self.batch_id}:{layer}", token=0))
-            return result
-
-        current_reads = reads(0, begin)
-        duration = max(self.model.first_decode_step_us if s["token"] == 0
-                       else self.model.decode_duration_us(1) for s in states)
-        durations = split_duration(duration, self.model.num_layers)
-        ready, first_start = begin, None
-        for layer in range(self.model.num_layers):
-            start, ready = self.compute_layer(base, domain, gi, "D", layer, [ready] + current_reads, durations[layer])
-            if first_start is None:
-                first_start = start
-            current_reads = reads(layer + 1, start) if layer + 1 < self.model.num_layers else []
+                        input_reads.extend(self.network(
+                            base, state, domain, state["d_tp_group"], "STORAGE_TO_D", block,
+                            layer, [state["p_done"]], f"D:{self.batch_id}:{layer}", token=0))
+            self.decode_input_read_steps += bool(input_reads)
+        first_start = (self.dag.add(base, "TIMER", "D_STEP_START", [begin] + input_reads,
+                                    layer_index=-1,
+                                    comment="All input KV ready and preceding Decode Compute finished.")
+                       if input_reads else begin)
+        ready = self.dag.add(base, "COMPUTE", "DECODE_STEP_COMPUTE", [first_start],
+                             duration=duration, layer_index=-1,
+                             comment="One whole-model Decode step after all input KV Reads.")
+        self.decode_merged_steps += 1
         free = self.dag.add(base, "TIMER", "D_COMPUTE_DONE", [ready])
-        for state in states:
-            state["d_writes"].extend(self.decode_token_write(base, state, domain, state["d_tp_group"], free))
         self.record(base, states, domain, gi, "D", now, duration, begin, free, previous, first_start)
         domain.step += 1
         for state in states:
@@ -2084,14 +2253,12 @@ class BatchBuilder:
             debug["decode_step_count"] += 1
             debug["d_compute_finish_us"] = self.dag.finish[free]
             if state["token"] == state["req"]["output_length"]:
-                # Consolidate outstanding writes per step to bound memory.
-                done = self.dag.add(self.owned(base, state), "TIMER", "D_DONE", [free] + state["d_writes"])
+                writes = self.decode_request_write(base, state, domain, state["d_tp_group"], free)
+                # Compute resources are already free; request completion alone
+                # waits for all output TP ranks (and converter uint32 chunks).
+                done = self.dag.add(self.owned(base, state), "TIMER", "D_DONE", writes)
                 state["d_done"] = done
                 debug.update(d_done_task_id=done, d_forecast_done_us=self.dag.finish[done])
-                state["d_writes"] = []
-            else:
-                flushed = self.dag.add(self.owned(base, state), "TIMER", "D_WRITES_DONE", state["d_writes"])
-                state["d_writes"] = [flushed]
         domain.residents = [s for s in domain.residents if s["token"] < s["req"]["output_length"]]
         for engine in domain.engines:
             engine.residents = [s for s in engine.residents
@@ -2100,9 +2267,11 @@ class BatchBuilder:
 
 
 def _generate(reqs, model, out_dir, warmup=0, prewarm_ratio=0, rounding="ceil", progress=None,
-              csv_writer_process=False, dag_detail="traffic"):
+              csv_writer_process=False, dag_detail="traffic", decode_compute_detail="none"):
     if dag_detail not in {"full", "traffic"}:
         raise ValueError("dag_detail must be full or traffic")
+    if decode_compute_detail not in {"none", "layer"}:
+        raise ValueError("decode_compute_detail must be none or layer")
     if not 0 <= warmup < len(reqs):
         raise ValueError("warmup requests must be nonnegative and smaller than the trace")
     if not math.isfinite(prewarm_ratio) or not 0 <= prewarm_ratio <= 1:
@@ -2130,14 +2299,17 @@ def _generate(reqs, model, out_dir, warmup=0, prewarm_ratio=0, rounding="ceil", 
         event(ts, "ARRIVAL", by_ts[ts])
     totals = Counter(requests=len(reqs))
     paths = ["task_dag.csv", "requests_debug.csv", "scheduler_candidates.csv", "batches_debug.csv",
-             "prefill_layer_compute.csv"]
+             "prefill_layer_compute.csv", "decode_compute.csv"]
     from contextlib import ExitStack
     with ExitStack() as stack:
         writers = []
         field_sets = [
             LOGICAL_FULL_FIELDS if dag_detail == "full" else LOGICAL_TRAFFIC_FIELDS,
-            DEBUG_FIELDS, CANDIDATE_FIELDS, BATCH_FIELDS, PREFILL_LAYER_COMPUTE_FIELDS,
+            DEBUG_FIELDS, CANDIDATE_FIELDS, BATCH_FIELDS, PREFILL_LAYER_COMPUTE_FIELDS, DECODE_COMPUTE_FIELDS,
         ]
+        if decode_compute_detail == "layer":
+            paths.append("decode_layer_compute.csv")
+            field_sets.append(DECODE_LAYER_COMPUTE_FIELDS)
         for index, (name, names) in enumerate(zip(paths, field_sets)):
             if index == 0 and csv_writer_process:
                 writers.append(stack.enter_context(ProcessCsvWriter(out_dir / name, names)))
@@ -2147,10 +2319,10 @@ def _generate(reqs, model, out_dir, warmup=0, prewarm_ratio=0, rounding="ceil", 
                 writers.append(csv.DictWriter(stream, names))
         for writer in writers:
             writer.writeheader()
-        tw, dw, cw, bw, pw = writers
+        tw, dw, cw, bw, pw, dcw, *detail_writers = writers
         dag = DagWriter(model, tw)
         placement = Placement(model, dag, cw)
-        builder = BatchBuilder(model, dag, bw, pw)
+        builder = BatchBuilder(model, dag, bw, pw, dcw, detail_writers[0] if detail_writers else None)
 
         def heartbeat(stage="", batch_id="", batch_size="", force=False):
             if progress is not None:
@@ -2213,7 +2385,7 @@ def _generate(reqs, model, out_dir, warmup=0, prewarm_ratio=0, rounding="ceil", 
                     debug["miss_tokens"], debug["cached_tokens"]
                 )
                 state = dict(req=req, blocks=blocks, produced=produced, debug=debug, p_dispatched=False,
-                             p_done=None, d_done=None, token=0, last_step=None, d_writes=[], reported=False)
+                             p_done=None, d_done=None, token=0, last_step=None, reported=False)
                 states[rid] = state
                 waiting_p.append(state)
                 totals["formal_requests"] += 1
@@ -2240,7 +2412,6 @@ def _generate(reqs, model, out_dir, warmup=0, prewarm_ratio=0, rounding="ceil", 
             for state in states.values():
                 if not state["reported"]:
                     ids.update([state["p_done"], state["last_step"], state["d_done"]])
-                    ids.update(state["d_writes"])
             return ids - {None}
 
         while events:
@@ -2333,7 +2504,7 @@ def _generate(reqs, model, out_dir, warmup=0, prewarm_ratio=0, rounding="ceil", 
             capacity_limitations="slot upper bounds only; actual occupancy is trace/schedule-dependent; HBM capacity, memory admission and expert capacity are not modelled",
             residency_definition="generator-scheduled local compute/admission slots; excludes ingress waiting queues and final-write-only draining requests; not ns-3 measured concurrency or HBM occupancy",
             dp_compute_model=(
-                "Prefill: per-DP-engine TP attention + shared EP routed experts (GLM-5.1 FLOPs); Decode: unchanged v15 max-member-step formula"
+                "Prefill and Decode: per-DP-engine TP attention + shared EP routed experts (GLM-5.1 FLOPs)"
                 if model.prefill_compute_mode == "glm51_flops" else
                 "Prefill: unchanged v14.7 global linear duration; Decode: unchanged max-member-step formula"
             ),
@@ -2343,7 +2514,24 @@ def _generate(reqs, model, out_dir, warmup=0, prewarm_ratio=0, rounding="ceil", 
             avg_prefill_batch=sum(builder.sizes["P"]) / len(builder.sizes["P"]) if builder.sizes["P"] else 0,
             avg_decode_batch=sum(builder.sizes["D"]) / len(builder.sizes["D"]) if builder.sizes["D"] else 0,
             prefill_compute_model=model.prefill_compute_model_name,
-            decode_compute_model="max-member-step-baseline",
+            decode_compute_model=model.decode_compute_model_name,
+            decode_compute_rows=len(builder.sizes["D"]),
+            decode_layer_compute_rows=builder.decode_layer_compute_rows,
+            decode_compute_detail=decode_compute_detail,
+            decode_merged_steps=builder.decode_merged_steps,
+            decode_layered_steps=builder.decode_layered_steps,
+            decode_input_read_steps=builder.decode_input_read_steps,
+            decode_input_read_policy="all layers read after own Prefill; whole-step Compute waits all batch input Reads and preceding Compute",
+            decode_output_write_policy="once per request after its final Decode Compute; all output tokens and layers; TP-sharded",
+            decode_output_write_bytes_scope="output_length * kv_bytes_per_token; excludes input KV; unscaled bytes",
+            decode_output_storage_layout="one request output object keyed decode:<request_id>:output; block_index=-1",
+            decode_compute_totals=dict(builder.decode_compute_totals),
+            decode_compute_efficiency=model.decode_efficiency,
+            decode_shared_expert_tp_degree=model.decode_shared_expert_tp_degree,
+            decode_context_convention="H=input_length+completed_decode_steps cached keys; L=H+1 including current query key",
+            decode_compute_time_interpretation=(
+                "idealized arithmetic throughput only; excludes HBM traffic and TP/EP communication"
+                if model.decode_compute_mode == "glm51_flops" else "legacy max-member-step duration"),
             prefill_layer_compute_rows=builder.prefill_layer_compute_rows,
             prefill_compute_flops_totals=dict(builder.prefill_compute_totals),
             prefill_npu_peak_flops=model.npu_peak_flops,
@@ -2397,16 +2585,19 @@ def _generate(reqs, model, out_dir, warmup=0, prewarm_ratio=0, rounding="ceil", 
 
 
 def generate(reqs, model, out_dir, warmup=0, prewarm_ratio=0, rounding="ceil", progress_every=1000,
-             show_progress=True, progress_interval=0.5, csv_writer_process=False, dag_detail="traffic"):
+             show_progress=True, progress_interval=0.5, csv_writer_process=False, dag_detail="traffic",
+             decode_compute_detail="none"):
     destination = Path(out_dir).resolve()
     destination.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(prefix=".v15-build-", dir=destination) as temporary:
         with Progress("DAG build", len(reqs), enabled=show_progress and progress_every != 0,
                       interval=progress_interval) as progress:
             summary = _generate(reqs, model, temporary, warmup, prewarm_ratio, rounding, progress,
-                                csv_writer_process=csv_writer_process, dag_detail=dag_detail)
+                                csv_writer_process=csv_writer_process, dag_detail=dag_detail,
+                                decode_compute_detail=decode_compute_detail)
         effective = copy.deepcopy(model.config)
         effective.pop("v14_effective", None)
+        effective.setdefault("kv_delivery", {}).setdefault("layer_pipeline", {})["storage_to_d_streaming"] = False
         for phase, limit in (("prefill", model.p_max_num_seqs), ("decode", model.d_max_num_seqs)):
             settings = effective.setdefault("scheduler", {}).setdefault(phase, {})
             settings["max_batch_size"] = limit
@@ -2422,13 +2613,15 @@ def generate(reqs, model, out_dir, warmup=0, prewarm_ratio=0, rounding="ceil", p
             "prefill_npu_peak_source", "prefill_npu_peak_is_public_default",
             "prefill_compute_time_interpretation", "prefill_efficiency_assumption",
             "prefill_compute_efficiency",
+            "decode_compute_efficiency", "decode_shared_expert_tp_degree", "decode_context_convention",
+            "decode_input_read_policy",
             "indexer_key_cache_resident")}
         (Path(temporary) / "effective_config.json").write_text(
             json.dumps(effective, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-        for name in ("task_dag.csv", "requests_debug.csv", "scheduler_candidates.csv",
-                     "batches_debug.csv", "prefill_layer_compute.csv", "summary.json",
-                     "effective_config.json"):
+        for name in summary["outputs"]:
             os.replace(Path(temporary) / name, destination / name)
+        if decode_compute_detail != "layer":
+            (destination / "decode_layer_compute.csv").unlink(missing_ok=True)
     print(f"Wrote {destination / 'task_dag.csv'}: {summary['dag_rows']} tasks, "
           f"{summary['prefill_batches']} P batches, {summary['decode_batches']} D steps")
     return summary
@@ -2449,7 +2642,9 @@ def main():
     parser.add_argument("--decode-scheduler", choices=("round-robin", "random", "least-load", "first-token-aware"))
     parser.add_argument("--random-seed", type=int)
     parser.add_argument("--prefill-ms-per-token", type=float)
-    parser.add_argument("--decode-ms-per-token", type=float)
+    parser.add_argument("--decode-ms-per-token", type=float, help="legacy Decode duration override; unavailable in glm51_flops mode")
+    parser.add_argument("--decode-compute-detail", choices=("none", "layer"), default="none",
+                        help="always write one decode_compute.csv row per batch; layer additionally writes per-layer FLOPs detail")
     parser.add_argument("--prefill-max-batch", type=int, help="Local BS per Prefill DP engine")
     parser.add_argument("--decode-max-batch", type=int, help="Local resident BS per Decode DP engine")
     parser.add_argument("--progress-every", type=int, default=1000, help="0 disables progress; updates per scheduling event")
@@ -2473,6 +2668,8 @@ def main():
         if args.prefill_ms_per_token is not None:
             cfg["timing"]["prefill_us_per_token"] = args.prefill_ms_per_token * 1000
         if args.decode_ms_per_token is not None:
+            if str(cfg.get("compute_model", {}).get("mode", "legacy")).lower() == "glm51_flops":
+                raise ValueError("--decode-ms-per-token conflicts with compute_model.mode=glm51_flops")
             cfg["timing"]["decode_us_per_token"] = args.decode_ms_per_token * 1000
             cfg["timing"]["first_decode_step_us"] = args.decode_ms_per_token * 1000
         if args.max_requests is not None and args.max_requests <= 0:
@@ -2489,7 +2686,7 @@ def main():
             args.progress_every, show, args.progress_interval,
             csv_writer_process=(args.csv_writer_process == "on" or
                 args.csv_writer_process == "auto" and multiple_cpus_available()),
-            dag_detail=args.dag_detail)
+            dag_detail=args.dag_detail, decode_compute_detail=args.decode_compute_detail)
     except (ValueError, KeyError, TypeError, OSError, csv.Error, ArithmeticError, RuntimeError) as exc:
         print(f"Generation failed: {exc}", file=sys.stderr)
         return 1

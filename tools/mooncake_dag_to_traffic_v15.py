@@ -4,10 +4,12 @@ Prefill emits zero-byte TIMER records for batch-start gates and layer Compute.
 Read and Write each use a separate Batch+Layer phase.
 Prefill preserves all required predecessor phases
 (AND semantics). Decode keeps offline batches and request-wave/per-rank
-grouping. Its batch-start forecast timestamps are not replay constraints:
-first-layer Reads wait on the final phase of each batch-start predecessor
-(the last-layer Write for a Prefill request with writes). Decode Read delay
-is storage latency only; any folded computation wait uses a separate TIMER.
+grouping for writes. Every input Read waits only for its own Prefill final phase.
+All initial Reads of a Decode batch share one completion phase, across requests,
+layers, blocks and TP ranks. One DECODE_STEP_COMPUTE TIMER waits for that entire
+Read phase and the preceding Decode Compute, using exact AND dependencies.
+Decode Read delay
+is storage latency only; batch-start forecasts are not replay constraints.
 
 Logical TP rows expand using tp_members; all physical rank flows are retained.
 The nine-column traffic.csv format is unchanged. TIMER is local control work
@@ -37,12 +39,16 @@ UINT32_MAX = (1 << 32) - 1
 SCHEMA = "v12-revised-stable-worker-unlimited"
 V14_SCHEMA = "v14-domain-serial-batch-tp-sharded"
 LOGICAL_SCHEMA = "v14-domain-serial-batch-tp-logical"
-VERSION = "v15-prefill-batch-layer-write-traffic-debug-decode-read-latency-20261104-v4"
+VERSION = "v15-prefill-traffic-debug-decode-read-all-20261105-v8"
 
 PREFILL_TASK_TYPES = frozenset({
     "P_BATCH_BEGIN", "P_LAYER_START", "PREFILL_LAYER", "P_LAYER_READY",
     "PREFIX_READ", "PREFIX_STORE_WRITE", "P_COMPUTE_DONE", "P_DONE",
     "INPUT_BLOCK_READY",
+})
+DECODE_TASK_TYPES = frozenset({
+    "D_BATCH_BEGIN", "D_LAYER_START", "DECODE_LAYER", "D_LAYER_READY",
+    "STORAGE_TO_D", "DECODE_WRITE", "D_COMPUTE_DONE", "D_WRITES_DONE", "DECODE_STEP_COMPUTE", "D_STEP_START",
 })
 
 
@@ -72,6 +78,27 @@ def validate_prefill_metadata(row):
             integer(node, "Prefill TIMER sourceNode (src_node/p_node)")
     except ValueError as exc:
         raise ValueError(f"{location}: {exc}; regenerate task_dag.csv") from None
+
+
+def validate_decode_metadata(row):
+    stage = row.get("task_type", "").strip()
+    batch_type = (row.get("batch_type") or "").strip().upper()
+    location = f"physical line {row['_line']}, task {row.get('task_id')} ({stage})"
+    if stage in DECODE_TASK_TYPES and batch_type != "DECODE":
+        raise ValueError(f"{location}: expected batch_type=DECODE; regenerate task_dag.csv")
+    if batch_type != "DECODE":
+        return
+    try:
+        integer(row.get("batch_id"), "Decode batch_id")
+        if stage in {"DECODE_LAYER", "STORAGE_TO_D"}:
+            integer(row.get("layer_index"), "Decode layer_index")
+        if stage in {"DECODE_LAYER", "DECODE_STEP_COMPUTE"}:
+            integer(row.get("src_node") or row.get("d_node"), "Decode TIMER sourceNode (src_node/d_node)")
+        if stage == "DECODE_STEP_COMPUTE" and str(row.get("layer_index")) != "-1":
+            raise ValueError("whole-step Decode Compute must have layer_index=-1")
+    except ValueError as exc:
+        raise ValueError(f"{location}: {exc}; regenerate task_dag.csv with the v8 generator") from None
+
 
 class Progress:
     """Throttled standard-library progress bar; status goes only to stderr."""
@@ -350,13 +377,13 @@ class Compiler:
         self.shared_groups = OrderedDict()
         self.shared_groups_weight = 0
         self.sealed_phases = bytearray()
-        self.decode_wait_cache = OrderedDict()
-        self.decode_wait_cache_weight = 0
+        self.prefill_ready_cache = OrderedDict()
         db.executescript(
             "CREATE TABLE tasks(id INTEGER PRIMARY KEY, form TEXT NOT NULL);"
             "CREATE TABLE phases(id INTEGER PRIMARY KEY, parents TEXT NOT NULL,"
             " delay INTEGER NOT NULL, floor INTEGER NOT NULL);"
             "CREATE TABLE requests(id INTEGER PRIMARY KEY);"
+            "CREATE TABLE prefill_ready(request INTEGER PRIMARY KEY, task INTEGER NOT NULL);"
             "CREATE TABLE parent_gates(id INTEGER PRIMARY KEY, parents TEXT NOT NULL);"
             "CREATE TABLE shared_groups(owner TEXT, wave TEXT, parents TEXT, form TEXT NOT NULL,"
             " PRIMARY KEY(owner, wave, parents)) WITHOUT ROWID;"
@@ -400,7 +427,7 @@ class Compiler:
         return group
 
     def prefill_shared_group(self, key):
-        """Return an open Prefill group; never silently split a sealed group."""
+        """Return an open exact-AND group; never silently split a sealed group."""
         group = self.shared_group(key)
         if group is not None:
             return group
@@ -410,7 +437,7 @@ class Compiler:
                       (key[0], key[1], json.dumps(key[2]))).fetchone() is not None)
         if exists:
             raise ValueError(
-                "Prefill phase group received another member after a dependent task "
+                "Shared phase group received another member after a dependent task "
                 "consumed the phase; check DAG row ordering"
             )
         return None
@@ -647,6 +674,18 @@ class Compiler:
         deps = row.get("depends_on", "").strip()
         missing = []
         values = list(filter(None, re.split(r"[;,\s]+", deps)))
+        if (row.get("task_type") == "STORAGE_TO_D" and
+                row.get("batch_type", "").strip().upper() == "DECODE"):
+            request = integer(row.get("request_id"), "Decode request_id")
+            expected = self.prefill_ready_cache.get(request)
+            if expected is None:
+                found = self.db.execute("SELECT task FROM prefill_ready WHERE request=?", (request,)).fetchone()
+                expected = found[0] if found is not None else None
+            else:
+                self.prefill_ready_cache.move_to_end(request)
+            if expected is None or [integer(value, "depends_on") for value in values] != [expected]:
+                raise ValueError("Every Decode input Read must depend directly on its own P_DONE; "
+                                 "regenerate task_dag.csv with the v8 generator")
         if row.get("_immutable_phase_graph") is True and len(values) == 1:
             tid = integer(values[0], "depends_on")
             found = self.task_form(tid)
@@ -688,58 +727,33 @@ class Compiler:
         # the identical traversal here as well only doubled the work.
         return root, terms
 
-    def decode_read_gate(self, row, request, terms, writer, mapping):
-        """Storage-only Read delay, with real folded computation kept in TIMERs."""
+    def decode_gate(self, row, terms, local_delay=0):
+        """Exact Decode gate; every input Read selects its own Prefill frontier."""
+        if row.get("task_type") == "STORAGE_TO_D":
+            # Every layer Read points directly at its request's P_DONE.
+            # Its last phase is the final-layer
+            # Write (or final Compute if the request has no new KV to write).
+            if terms:
+                selected = max(terms)
+                terms = {selected: terms[selected]}
+        else:
+            terms = self.prune(terms)
+        if any(terms.values()):
+            raise ValueError("Decode needs explicit Compute TIMERs; regenerate task_dag.csv")
+        parents = tuple(sorted(terms))
+        if not parents:
+            raise ValueError("Decode task needs a completion dependency; regenerate task_dag.csv")
+        floor = max(self.phase_floor(pid) for pid in parents) + local_delay
+        return parents, local_delay, floor, False
+
+    def decode_read_gate(self, row, terms):
+        """Storage-only Read delay; computation is represented by separate phases."""
         configured = (row.get("storage_read_latency_us", "150")
                       if self.args.storage_read_latency_us is None
                       else self.args.storage_read_latency_us)
         read_ns = time_ns(configured, "storage read latency")
-        first_layer = integer(row.get("layer_index"), "Decode layer_index") == 0
-        if not first_layer:
-            if terms and self.args.timing_policy == "max-phase":
-                selected = max(terms)
-                terms = {selected: terms[selected]}
-            elif self.args.timing_policy != "max-phase":
-                terms = self.prune(terms)
-        if not terms:
-            raise ValueError("Decode READ needs a completion dependency; regenerate task_dag.csv")
-        node = ub_endpoints(row, "STORAGE_TO_D")[0]
-        by_lag = {}
-        for pid, lag in sorted(terms.items()):
-            by_lag.setdefault(lag, []).append(pid)
-        parents = list(by_lag.pop(0, ()))
-        for lag, ids in sorted(by_lag.items()):
-            ids = tuple(ids)
-            # A representative reader runs this local gate; all TP ranks of
-            # the request share its completion phase and the same Read gate.
-            key = (request, lag, ids)
-            pid = self.decode_wait_cache.get(key)
-            if pid is None:
-                pid = self.next_phase
-                if pid > UINT32_MAX:
-                    raise ValueError("phase ID exceeds uint32")
-                floor = max(self.phase_floor(parent) for parent in ids) + lag
-                parent_ref = self.register_phase(pid, ids, lag, floor)
-                self.db.execute("INSERT INTO phases VALUES (?, ?, ?, ?)",
-                                (pid, parent_ref, lag, floor))
-                self.next_phase += 1
-                timer_row = dict(row, src_node=str(node), task_type="DECODE_READ_COMPUTE_WAIT")
-                self.write_timer_record(timer_row, request, row["task_id"], pid,
-                                        ids, lag, writer, mapping)
-                self.counts["decode_read_compute_wait_phases"] += 1
-                self.decode_wait_cache[key] = pid
-                self.decode_wait_cache_weight += len(ids)
-                while (len(self.decode_wait_cache) > 128 or
-                       self.decode_wait_cache_weight > 131072 and len(self.decode_wait_cache) > 1):
-                    old, _ = self.decode_wait_cache.popitem(last=False)
-                    self.decode_wait_cache_weight -= len(old[2])
-            else:
-                self.decode_wait_cache.move_to_end(key)
-            parents.append(pid)
-        parents = tuple(sorted(parents))
-        floor = max(self.phase_floor(pid) for pid in parents) + read_ns
         self.counts["decode_storage_only_read_tasks"] += 1
-        return parents, read_ns, floor, False
+        return self.decode_gate(row, terms, read_ns)
 
     def normalize(self, root, terms, already_pruned=False):
         if self.eager_max_phase:
@@ -895,6 +909,7 @@ class Compiler:
                     raise ValueError("this converter needs the matching revised DAG; regenerate with the matching trace generator")
                 kind, stage = row["task_class"].strip().upper(), row["task_type"].strip()
                 is_prefill = row.get("batch_type", "").strip().upper() == "PREFILL"
+                is_decode = row.get("batch_type", "").strip().upper() == "DECODE"
                 is_decode_read = schema == V14_SCHEMA and stage == "STORAGE_TO_D"
                 ephemeral = kind == "NETWORK" and row.get("_ephemeral_task") is True
                 for key, allowed in (("dependency_mode", {"", "ALL"}),
@@ -920,7 +935,10 @@ class Compiler:
                         if current_wave is not None:
                             closed_waves.add(current_wave)
                         current_wave = wave
-                    prefill_group_key = self.prefill_network_group_key(row, request, stage) if is_prefill else None
+                    explicit_group_key = self.prefill_network_group_key(row, request, stage) if is_prefill else None
+                    if is_decode_read:
+                        batch = integer(row.get("batch_id"), "Decode batch_id")
+                        explicit_group_key = ("decode", f"batch:{batch}:input-read-all", ())
                     if is_prefill:
                         if TYPE_TO_OP[stage] == "URMA_READ":
                             configured = (row.get("storage_read_latency_us", "150")
@@ -935,8 +953,10 @@ class Compiler:
                         approximate = False
                     elif is_decode_read:
                         parents, delay, floor, approximate = self.decode_read_gate(
-                            row, request, terms, writer, mapping
+                            row, terms
                         )
+                    elif is_decode:
+                        parents, delay, floor, approximate = self.decode_gate(row, terms)
                     else:
                         if prepared is None and TYPE_TO_OP[stage] == "URMA_READ":
                             configured = (row.get("storage_read_latency_us", "150")
@@ -948,12 +968,12 @@ class Compiler:
                         if prepared is None:
                             root, terms = self.normalize(root, terms, row.get("_incoming_pruned") is True)
                         parents, delay, floor, approximate = self.native_gate(root, terms, row)
-                    streaming_shared = (prefill_group_key is not None or
+                    streaming_shared = (explicit_group_key is not None or
                                         schema == V14_SCHEMA and self.share_phases)
                     signature = (wave, tuple(parents))
                     shared_key = None
-                    if prefill_group_key is not None:
-                        shared_key = prefill_group_key
+                    if explicit_group_key is not None:
+                        shared_key = explicit_group_key
                         group = self.prefill_shared_group(shared_key)
                     elif streaming_shared:
                         owner = (f"request:{request}" if request != "" else
@@ -968,7 +988,7 @@ class Compiler:
                         pid = self.next_phase
                         if pid > UINT32_MAX:
                             raise ValueError("phase ID exceeds uint32")
-                        phase_delay = 0 if prefill_group_key is not None else delay
+                        phase_delay = 0 if explicit_group_key is not None else delay
                         parent_ref = self.register_phase(pid, parents, phase_delay, floor)
                         if not ephemeral:
                             self.db.execute("INSERT INTO phases VALUES (?, ?, ?, ?)",
@@ -977,7 +997,7 @@ class Compiler:
                         group = dict(pid=pid, parents=tuple(parents), max_delay=delay,
                                      phase_delay=phase_delay, floor=floor,
                                      delays={delay}, types={stage}, approximate=approximate)
-                        if prefill_group_key is not None:
+                        if explicit_group_key is not None:
                             group["_parent_set"] = set(parents)
                             self.cache_shared_group(shared_key, group)
                         elif streaming_shared:
@@ -986,11 +1006,13 @@ class Compiler:
                             groups[signature] = group
                         wave_phases[pid] = wave
                         self.counts["network_phases"] += 1
+                        if is_decode_read:
+                            self.counts["decode_input_read_phases"] += 1
                         self.counts["conservative_phases"] += approximate
                     pid = group["pid"]
                     if parents and parents[-1] >= pid:
                         raise ValueError("phase dependencies must precede their completion phase")
-                    if prefill_group_key is not None:
+                    if explicit_group_key is not None:
                         self.update_prefill_shared_group(
                             shared_key, group, parents, delay, floor, stage
                         )
@@ -1018,7 +1040,7 @@ class Compiler:
                     source, dest, src_port, dst_port = ub_endpoints(row, stage)
                     # Native ns-3-ub tokenizes this CSV field on whitespace.
                     # Empty means no dependency; signed -1 is INVALID.
-                    dep_text = (row["_dependency_text"] if prepared is not None and not is_decode_read
+                    dep_text = (row["_dependency_text"] if prepared is not None and not is_decode
                                 else " ".join(map(str, parents)))
                     chunk_count = (size + UINT32_MAX - 1) // UINT32_MAX
                     divisor, emitted_bytes = self.data_size_divisor, 0
@@ -1058,15 +1080,19 @@ class Compiler:
                 elif kind in {"COMPUTE", "TIMER", "GATE"}:
                     if size:
                         raise ValueError("non-network task must have bytes=0")
-                    if is_prefill and (
+                    prefill_timer = is_prefill and (
                         (kind == "COMPUTE" and stage == "PREFILL_LAYER") or
-                        (kind == "TIMER" and stage == "P_BATCH_BEGIN")
-                    ):
-                        parents, timer_delay, floor = self.prefill_gate(root, terms, duration)
+                        (kind == "TIMER" and stage == "P_BATCH_BEGIN"))
+                    decode_timer = is_decode and kind == "COMPUTE" and stage in {"DECODE_LAYER", "DECODE_STEP_COMPUTE"}
+                    if prefill_timer or decode_timer:
+                        if decode_timer:
+                            parents, timer_delay, floor, _ = self.decode_gate(row, terms, duration)
+                        else:
+                            parents, timer_delay, floor = self.prefill_gate(root, terms, duration)
                         pid = self.next_phase
                         if pid > UINT32_MAX:
                             raise ValueError("phase ID exceeds uint32")
-                        phase_delay = duration if stage == "PREFILL_LAYER" else 0
+                        phase_delay = duration if kind == "COMPUTE" else 0
                         parent_ref = self.register_phase(pid, parents, phase_delay, floor)
                         if not ephemeral:
                             self.db.execute("INSERT INTO phases VALUES (?, ?, ?, ?)",
@@ -1076,7 +1102,11 @@ class Compiler:
                             row, request, tid, pid, parents, timer_delay, writer, mapping
                         )
                         out_form = [0, [[pid, 0]]]
-                        if stage == "PREFILL_LAYER":
+                        if decode_timer:
+                            self.counts["decode_compute_phases"] += 1
+                            self.counts["decode_step_compute_phases" if stage == "DECODE_STEP_COMPUTE"
+                                        else "decode_layer_compute_phases"] += 1
+                        elif stage == "PREFILL_LAYER":
                             self.counts["prefill_compute_phases"] += 1
                         else:
                             self.counts["prefill_control_phases"] += 1
@@ -1085,6 +1115,8 @@ class Compiler:
                         terms = {p: lag + duration for p, lag in terms.items()}
                         if stage == "D_BATCH_BEGIN":
                             self.counts["decode_batch_forecast_releases_ignored"] += 1
+                        elif is_decode:
+                            terms = self.prune(terms)
                         elif not is_prefill:
                             root, terms = self.normalize(
                                 root, terms, row.get("_incoming_pruned") is True
@@ -1094,6 +1126,12 @@ class Compiler:
                 else:
                     raise ValueError(f"unsupported task_class: {kind}")
                 self.last_out_form = out_form
+                if is_prefill and stage == "P_DONE":
+                    self.db.execute("INSERT OR REPLACE INTO prefill_ready VALUES (?, ?)", (request, tid))
+                    self.prefill_ready_cache[request] = tid
+                    self.prefill_ready_cache.move_to_end(request)
+                    while len(self.prefill_ready_cache) > 8192:
+                        self.prefill_ready_cache.popitem(last=False)
                 if not ephemeral:
                     self.db.execute("INSERT INTO tasks VALUES (?, ?)", (tid, json.dumps(out_form)))
                     self.remember_task(tid, out_form)
@@ -1186,9 +1224,9 @@ class LogicalTpExpander:
                               else self.compiler.args.storage_read_latency_us)
                 read_ns = time_ns(configured, "storage read latency")
             is_prefill = row.get("batch_type", "").strip().upper() == "PREFILL"
-            is_decode_read = row["task_type"] == "STORAGE_TO_D"
+            is_decode = row.get("batch_type", "").strip().upper() == "DECODE"
             key = (expanded_deps, time_ns(row["release_time_us"], "release_time_us"),
-                   read_ns, is_prefill, is_decode_read)
+                   read_ns, is_prefill, is_decode)
             cached = self.prepare_cache.get(key)
             if cached is not None:
                 self.prepare_cache.move_to_end(key)
@@ -1196,7 +1234,7 @@ class LogicalTpExpander:
             else:
                 incoming_row = dict(row, depends_on=expanded_deps)
                 root, terms = self.compiler.incoming(incoming_row)
-                if is_prefill or is_decode_read:
+                if is_prefill or is_decode:
                     parents = tuple(sorted(terms))
                     prepared_terms = (root, terms)
                     dependency_text = " ".join(map(str, parents))
@@ -1333,6 +1371,7 @@ def convert(args):
                             row["_line"] = reader.line_num
                             row["_processed_bytes"] = counted_lines.processed_bytes
                             validate_prefill_metadata(row)
+                            validate_decode_metadata(row)
                             request = row["request_id"].strip()
                             if request:
                                 request = integer(request, "request_id")
@@ -1376,16 +1415,19 @@ def convert(args):
                         "Write=Batch+Layer (all requests, blocks, TP ranks and chunks)"
                     ),
                     "decode_phase_grouping_policy": (
-                        "request-wave" if compiler.share_phases else "per-rank"
+                        "Read=Batch+all input layers/requests/blocks/TP ranks; Write="
+                        + ("request-wave" if compiler.share_phases else "per-rank")
                     ),
                     "prefill_dependency_policy": (
                         "all required predecessor phases (AND); no max-phase pruning"
                     ),
                     "decode_dependency_policy": (
-                        "first Read layer ANDs the final phase of each batch-start predecessor; "
-                        "later layers retain timing-policy phase selection"
+                        "every Read waits only for its request's Prefill final phase; "
+                        "one whole-step Compute waits for previous-batch Compute and ALL input Reads; "
+                        "exact AND dependencies without max-phase pruning"
                     ),
-                    "decode_read_delay_policy": "storage latency only; folded computation waits use TIMERs",
+                    "decode_read_delay_policy": "storage latency only; no inter-layer Read/Compute gating",
+                    "decode_prefetch_policy": "read all input KV after own Prefill, before whole-step Compute",
                     "decode_batch_release_policy": "ignore offline D_BATCH_BEGIN release forecasts; keep completion dependencies",
                     "max_phase_form_compaction": compiler.eager_max_phase,
                     "data_size_divisor": divisor,
@@ -1393,10 +1435,8 @@ def convert(args):
                     "traffic_bytes": compiler.counts["traffic_bytes"],
                     "network_bytes": compiler.counts["network_bytes"],
                     "dependency_policy": (
-                        "Prefill: all predecessor phases (AND); Decode first Read: "
-                        "all batch-start predecessor frontiers (AND); other Decode tasks: "
-                        + ("largest phaseId only" if args.timing_policy == "max-phase"
-                           else "all predecessor phases")
+                        "Prefill and Decode: exact AND phase dependencies; "
+                        "every Decode Read uses its request's final Prefill phase"
                     ),
                     "storage_read_latency": ("from DAG rows" if args.storage_read_latency_us is None
                                              else delay_text(time_ns(args.storage_read_latency_us, "storage latency"))),
@@ -1404,14 +1444,14 @@ def convert(args):
                     "max_phase_examples": compiler.max_phase_examples,
                     "phase_grouping": (
                         "Prefill: Read=Batch+Layer, Compute=Batch+Layer TIMER, "
-                        "Write=Batch+Layer; Decode: "
+                        "Write=Batch+Layer; Decode Read=Batch+all input; Decode Write="
                         + ("request-wave" if compiler.share_phases else "per-rank")
                     ),
                     "group_completion": "all traffic/control rows in a phase must finish",
                     "approximation": (
                         "Prefill keeps explicit AND dependency sets; absolute release-floor padding is conservative; "
-                        "Decode batch-start forecast releases are ignored and Read delay is storage latency only; "
-                        "later Decode phase selection retains the timing-policy approximation"
+                        "Decode batch-start forecast releases are ignored; Read delay is storage latency only; "
+                        "Decode reads all input before one whole-step Compute TIMER"
                     ),
                 })
                 if summary_path:
@@ -1430,7 +1470,8 @@ def convert(args):
           f"{summary.get('timer_rows', 0)} TIMER rows, "
           f"{summary.get('network_phases', 0)} network phases, "
           f"{summary.get('prefill_compute_phases', 0) + summary.get('prefill_control_phases', 0)} "
-          f"Prefill TIMER phases, {summary.get('requests', 0)} requests")
+          f"Prefill TIMER phases, {summary.get('decode_compute_phases', 0)} "
+          f"Decode Compute TIMER phases, {summary.get('requests', 0)} requests")
     print(f"Wrote {debug_path}: same rows plus request_id (empty for batch-owned TIMERs)")
     if divisor != 1:
         print(f"Data sizes: ceil(each original traffic row / {divisor}), minimum 1 byte; "
@@ -1476,14 +1517,14 @@ def main():
     parser.add_argument("--storage-read-latency-us", "--storage-latency-us", default=None,
                         help="override each ASU read's DAG latency; default uses the DAG configuration")
     parser.add_argument("--phase-grouping", choices=("request-wave", "per-rank"), default="request-wave",
-                        help="Decode grouping: request-wave (default) or per-rank; "
-                             "Prefill always uses separate Batch+Layer Read and Write phases")
+                        help="Decode Write grouping: request-wave (default) or per-rank; "
+                             "Decode input Reads always share a Batch completion phase; "
+                             "Prefill uses separate Batch+Layer Read and Write phases")
     parser.add_argument("--timing-policy", type=lambda value: value.replace("_", "-"),
                         choices=("max-phase", "conservative", "error"), default="max-phase",
-                        help="Decode timing policy: max-phase, conservative, or error; "
-                             "Decode Read delay is always storage latency only, and first-layer Read keeps "
-                             "all batch-start predecessor frontiers; Prefill always retains all required "
-                             "predecessor phases and uses explicit TIMER Compute tasks")
+                        help="legacy DAG timing policy: max-phase, conservative, or error; "
+                             "V15 Prefill and Decode preserve exact AND dependencies and use explicit "
+                             "Compute TIMERs; Decode reads all input before whole-step Compute")
     parser.add_argument("--no-progress", action="store_true", help="disable progress display")
     parser.add_argument("--progress-interval", type=float, default=0.5,
                         help="terminal progress refresh interval in seconds (default 0.5)")

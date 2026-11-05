@@ -175,7 +175,7 @@
       "enabled": true,
       "split_prefix_read_by_layer": true,
       "split_prefix_store_write_by_layer": true,
-      "storage_to_d_streaming": true
+      "storage_to_d_streaming": false
     }
   },
   "pd_analysis": {},
@@ -196,6 +196,7 @@
     "efficiency_assumption": "1.0 means ideal peak throughput; theoretical lower-bound compute time, not measured sustained utilization",
     "expert_load_imbalance_factor": 1.0,
     "shared_expert_tp_degree": 8,
+    "decode_shared_expert_tp_degree": 2,
     "indexer_key_cache_resident": true,
     "architecture": {
       "hidden_size": 6144,

@@ -141,7 +141,9 @@ class PrefillTrafficTest(unittest.TestCase):
 
         summary = json.loads((output / "summary.json").read_text())
         self.assertEqual(summary["prefill_batches"], 1)
-        self.assertEqual(summary["timer_rows"], 79)
+        self.assertEqual(summary["prefill_control_phases"] + summary["prefill_compute_phases"], 79)
+        self.assertEqual(summary["decode_compute_phases"], 1)
+        self.assertEqual(summary["timer_rows"], 80)
         self.assertEqual(summary["total_rows"], len(traffic))
         self.assertIn("traffic-debug", summary["converter_version"])
         self.assertIn("Write=Batch+Layer", summary["prefill_phase_grouping_policy"])
@@ -165,7 +167,7 @@ class PrefillTrafficTest(unittest.TestCase):
                 for native, detail, origin in zip(traffic, debug, mapping):
                     self.assertEqual({k: detail[k] for k in native}, native)
                     self.assertEqual(detail["request_id"], origin["request_id"])
-                    if native["opType"] == "TIMER" and origin["task_type"] != "DECODE_READ_COMPUTE_WAIT":
+                    if native["opType"] == "TIMER":
                         self.assertEqual(detail["request_id"], "")
                     else:
                         self.assertIn(detail["request_id"], {"1", "2"})
@@ -187,6 +189,137 @@ class PrefillTrafficTest(unittest.TestCase):
         self.assertEqual(summary["decode_storage_only_read_tasks"], len(reads))
         self.assertTrue(all(row["task_type"] != "STORAGE_TO_D"
                             for row in summary["conservative_examples"]))
+
+    def test_generated_decode_first_reads_bypass_batch_compute_gate(self):
+        dag = read_csv(self.outputs["traffic-off"] / "task_dag.csv")
+        by_id = {row["task_id"]: row for row in dag}
+        reads = [row for row in dag if row["task_type"] == "STORAGE_TO_D"]
+        self.assertTrue(reads)
+        for row in reads:
+            deps = row["depends_on"].split(";")
+            self.assertEqual(len(deps), 1)
+            parent = by_id[deps[0]]
+            self.assertEqual(parent["task_type"], "P_DONE")
+            self.assertEqual(parent["request_id"], row["request_id"])
+        for row in dag:
+            if row["task_type"] == "DECODE_STEP_COMPUTE":
+                self.assertNotEqual(row["d_node"], "")
+
+    def test_large_decode_batch_keeps_read_dependencies_short(self):
+        rows = []
+        count = 241
+
+        def add(batch, request="", **values):
+            row = dict(task_id=len(rows), request_id=request, task_class="TIMER", task_type="P_BATCH_BEGIN",
+                       depends_on="", release_time_us="", duration_us=0, src_node="", dst_node="", bytes=0,
+                       execution_schema="v14-domain-serial-batch-tp-logical", network_wave="",
+                       storage_read_latency_us=150, tp_members="", tp_degree=2, batch_id=batch,
+                       batch_type="PREFILL" if batch <= count else "DECODE",
+                       p_node=0 if batch <= count else "", d_node=0, layer_index=0, block_index=0)
+            row.update(values)
+            rows.append(row)
+            return row["task_id"]
+
+        done = []
+        for request in range(count + 1):
+            begin = add(request, release_time_us=1000 + request)
+            compute = add(request, task_class="COMPUTE", task_type="PREFILL_LAYER", depends_on=str(begin), duration_us=1)
+            write = add(request, request, task_class="NETWORK", task_type="PREFIX_STORE_WRITE", depends_on=str(compute),
+                        bytes=2, network_wave=f"P:{request}", tp_members="[[0,0,0,1,0,1],[1,2,0,1,0,1]]")
+            done.append(add(request, request, task_type="P_DONE", depends_on=str(write)))
+        old = add(count + 1, task_class="COMPUTE", task_type="DECODE_STEP_COMPUTE", layer_index=-1,
+                  depends_on=str(done[0]), duration_us=1000)
+        begin = add(count + 2, task_type="D_BATCH_BEGIN", depends_on=" ".join(map(str, [old] + done[1:])))
+        reads = []
+        for layer in range(2):
+            for request in range(1, count + 1):
+                reads.append(add(count + 2, request, task_class="NETWORK", task_type="STORAGE_TO_D",
+                                 layer_index=layer, depends_on=str(done[request]), bytes=2,
+                                 network_wave=f"D:all:{layer}", tp_members="[[0,1,0,0,0,1],[1,1,0,2,0,1]]"))
+        add(count + 2, task_class="COMPUTE", task_type="DECODE_STEP_COMPUTE", layer_index=-1,
+            depends_on=" ".join(map(str, [begin] + reads)), duration_us=10)
+        source = self.root / "large-read-all.csv"
+        write_csv(source, rows)
+        output = self.root / "large-read-all"
+        self.convert(source, output)
+        mapping = read_csv(output / "mapping.csv")
+        read_rows = [row for row in mapping if row["task_type"] == "STORAGE_TO_D"]
+        self.assertEqual(len(read_rows), count * 2 * 2)
+        self.assertEqual(len({row["phaseId"] for row in read_rows}), 1)
+        self.assertTrue(all(len(phases(row)) == 1 for row in read_rows))
+        pref_writes = {row["request_id"]: row["phaseId"] for row in mapping if row["task_type"] == "PREFIX_STORE_WRITE"}
+        self.assertTrue(all(phases(row) == {pref_writes[row["request_id"]]} for row in read_rows))
+        computes = [row for row in mapping if row["task_type"] == "DECODE_STEP_COMPUTE"]
+        self.assertEqual(phases(computes[-1]), {computes[0]["phaseId"], read_rows[0]["phaseId"]})
+
+    def test_old_decode_batch_read_gate_is_rejected(self):
+        rows = read_csv(self.outputs["traffic-off"] / "task_dag.csv")
+        begins = {row["batch_id"]: row["task_id"] for row in rows if row["task_type"] == "D_BATCH_BEGIN"}
+        for row in rows:
+            if row["task_type"] == "STORAGE_TO_D":
+                row["depends_on"] = begins[row["batch_id"]]
+        source = self.root / "old-decode-read-gate.csv"
+        write_csv(source, rows)
+        output = self.root / "old-decode-read-gate"
+        result = self.convert(source, output, expected=1)
+        self.assertIn("regenerate task_dag.csv with the v8 generator", result.stderr)
+        self.assertFalse((output / "traffic.csv").exists())
+
+    def test_generated_decode_compute_waits_all_layers_once(self):
+        output = self.outputs["traffic-off"]
+        mapping = read_csv(output / "mapping.csv")
+        dag = {row["task_id"]: row for row in read_csv(output / "task_dag.csv")}
+        reads = [row for row in mapping if row["task_type"] == "STORAGE_TO_D"]
+        computes = [row for row in mapping if row["task_type"] == "DECODE_STEP_COMPUTE"]
+        self.assertEqual(len(computes), 1)
+        self.assertFalse(any(row["task_type"] == "DECODE_LAYER" for row in mapping))
+        compute = computes[0]
+        read_phases = {row["phaseId"] for row in reads}
+        self.assertEqual(len(read_phases), 1)
+        self.assertEqual(phases(compute), read_phases)
+        self.assertEqual({int(row["layer_index"]) for row in reads}, set(range(78)))
+        self.assertTrue(all(len(phases(row)) == 1 for row in reads))
+        self.assertEqual(compute["request_id"], "")
+        self.assertEqual(compute["delay"], f"{dag[compute['dag_task_id']]['duration_us']}us")
+        cfg = json.loads(CONFIG.read_text())
+        trace = {str(row["request_id"]): row for row in map(json.loads, self.trace.read_text().splitlines())}
+        dag_reads = [row for row in dag.values() if row["task_type"] == "STORAGE_TO_D"]
+        requests = {row["request_id"] for row in dag_reads}
+        self.assertEqual(sum(int(row["bytes"]) for row in dag_reads),
+                         sum(trace[request]["input_length"] for request in requests) * cfg["model"]["kv_bytes_per_token"])
+        self.assertEqual(len(reads), sum(len(json.loads(row["tp_members"])) for row in dag_reads))
+        for row in mapping:
+            if row["task_type"] == "DECODE_WRITE":
+                self.assertEqual(row["delay"], "0us")
+                self.assertEqual(phases(row), {compute["phaseId"]})
+
+    def test_resident_request_next_token_waits_for_compute_not_write(self):
+        requests = [json.loads(line) for line in self.trace.read_text().splitlines()]
+        requests[1]["output_length"] = 2
+        source = self.root / "two-token-trace.jsonl"
+        source.write_text("".join(json.dumps(row) + "\n" for row in requests))
+        output = self.root / "two-token"
+        self.run_command([GENERATOR, source, "--config", CONFIG, "--warmup-requests", "1",
+                          "--dag-detail", "traffic", "--out-dir", output, "--no-progress"])
+        self.convert(output / "task_dag.csv", output)
+        mapping = read_csv(output / "mapping.csv")
+        reads = [row for row in mapping if row["task_type"] == "STORAGE_TO_D"]
+        self.assertTrue(reads)
+        self.assertEqual({row["decode_token_index"] for row in reads}, {"0"})
+        computes = [row for row in mapping if row["task_type"] in {"DECODE_LAYER", "DECODE_STEP_COMPUTE"}]
+        batches = sorted({row["batch_id"] for row in computes}, key=int)
+        self.assertEqual(len(batches), 2)
+        first_last = next(row for row in computes if row["batch_id"] == batches[0])
+        second_first = next(row for row in computes if row["batch_id"] == batches[1] and row["task_type"] == "DECODE_STEP_COMPUTE")
+        self.assertEqual(len(computes), 2)
+        self.assertEqual(second_first["layer_index"], "-1")
+        self.assertEqual(second_first["request_id"], "")
+        self.assertEqual(phases(second_first), {first_last["phaseId"]})
+        write_phases = {row["phaseId"] for row in mapping if row["task_type"] == "DECODE_WRITE"}
+        self.assertTrue(phases(second_first).isdisjoint(write_phases))
+        detail = read_csv(output / "decode_compute.csv")
+        self.assertEqual([row["compute_granularity"] for row in detail], ["step", "step"])
+        self.assertEqual(second_first["delay"], detail[-1]["compute_us"] + "us")
 
     def test_decode_forecasts_do_not_change_traffic_but_prefill_arrivals_do(self):
         source = self.outputs["traffic-off"] / "task_dag.csv"
@@ -233,7 +366,7 @@ class PrefillTrafficTest(unittest.TestCase):
                 self.assertTrue(reads)
                 self.assertEqual({row["delay"] for row in reads}, {expected})
 
-    def test_decode_batch_keeps_prefill_write_and_prior_decode_compute(self):
+    def test_decode_reads_overlap_previous_compute_but_whole_step_waits_all(self):
         rows = []
 
         def add(batch, **values):
@@ -243,42 +376,41 @@ class PrefillTrafficTest(unittest.TestCase):
                        execution_schema="v14-domain-serial-batch-tp-logical",
                        network_wave="", storage_read_latency_us=150,
                        tp_members="", tp_degree=2, batch_id=batch,
-                       batch_type="PREFILL" if batch < 2 else "DECODE",
-                       p_node=0, layer_index=0, block_index="")
+                       batch_type="PREFILL" if batch < 3 else "DECODE",
+                       p_node=0 if batch < 3 else "", d_node=0,
+                       layer_index=0, block_index="")
             row.update(values)
             rows.append(row)
             return row["task_id"]
 
-        done = []
-        for batch in range(2):
-            begin = add(batch, release_time_us=1000)
-            compute = add(batch, task_class="COMPUTE", task_type="PREFILL_LAYER",
+        def network(batch, request, stage, deps, layer, block=0):
+            members = ([[0, 1, 0, 0, 0, 32], [1, 1, 0, 2, 0, 32]]
+                       if stage == "STORAGE_TO_D" else
+                       [[0, 0, 0, 1, 0, 32], [1, 2, 0, 1, 0, 32]])
+            return add(batch, request_id=request, task_class="NETWORK", task_type=stage,
+                       depends_on=" ".join(map(str, deps)), layer_index=layer, block_index=block,
+                       bytes=64, network_wave=f"{batch}:{stage}:{layer}", tp_members=json.dumps(members))
+
+        done = {}
+        for request in range(3):
+            begin = add(request, release_time_us=1000 + request * 10)
+            compute = add(request, task_class="COMPUTE", task_type="PREFILL_LAYER",
                           depends_on=str(begin), duration_us=10)
-            first_write = add(batch, request_id=batch, task_class="NETWORK",
-                              task_type="PREFIX_STORE_WRITE", depends_on=str(compute),
-                              block_index=0, bytes=64, network_wave=f"P:{batch}:1",
-                              tp_members=json.dumps([[0, 0, 0, 1, 0, 32], [1, 2, 0, 1, 0, 32]]))
-            compute = add(batch, task_class="COMPUTE", task_type="PREFILL_LAYER",
-                          depends_on=str(compute), duration_us=11, layer_index=1)
-            last_write = add(batch, request_id=batch, task_class="NETWORK",
-                             task_type="PREFIX_STORE_WRITE", depends_on=str(compute),
-                             layer_index=1, block_index=0, bytes=64, network_wave=f"P:{batch}:2",
-                             tp_members=json.dumps([[0, 0, 0, 1, 0, 32], [1, 2, 0, 1, 0, 32]]))
-            done.append(add(batch, request_id=batch, task_type="P_DONE",
-                            depends_on=f"{first_write} {last_write} {compute}"))
-        begin = add(2, task_type="D_BATCH_BEGIN", depends_on=str(done[0]), release_time_us=900000)
-        read = add(2, request_id=0, task_class="NETWORK", task_type="STORAGE_TO_D",
-                   depends_on=str(begin), block_index=0, bytes=64, network_wave="D:2:0",
-                   tp_members=json.dumps([[0, 1, 0, 0, 0, 32], [1, 1, 0, 2, 0, 32]]))
-        compute = add(2, task_class="COMPUTE", task_type="DECODE_LAYER",
-                      depends_on=str(read), duration_us=20)
-        free = add(2, task_type="D_COMPUTE_DONE", depends_on=str(compute))
-        begin = add(3, task_type="D_BATCH_BEGIN", depends_on=f"{free} {done[1]}",
+            write = network(request, request, "PREFIX_STORE_WRITE", [compute], 0)
+            done[request] = add(request, request_id=request, task_type="P_DONE", depends_on=str(write))
+        begin = add(3, task_type="D_BATCH_BEGIN", depends_on=str(done[0]), release_time_us=900000)
+        old_reads = [network(3, 0, "STORAGE_TO_D", [done[0]], layer) for layer in range(2)]
+        old_compute = add(3, task_class="COMPUTE", task_type="DECODE_STEP_COMPUTE", layer_index=-1,
+                          depends_on=" ".join(map(str, [begin] + old_reads)), duration_us=1000)
+        network(3, 0, "DECODE_WRITE", [old_compute], -1)
+        begin = add(4, task_type="D_BATCH_BEGIN", depends_on=f"{old_compute} {done[1]} {done[2]}",
                     release_time_us=999999999)
-        for block in (0, 1):
-            add(3, request_id=1, task_class="NETWORK", task_type="STORAGE_TO_D",
-                depends_on=str(begin), block_index=block, bytes=64, network_wave="D:3:0",
-                tp_members=json.dumps([[0, 1, 0, 0, 0, 32], [1, 1, 0, 2, 0, 32]]))
+        new_reads = [network(4, request, "STORAGE_TO_D", [done[request]], layer, block)
+                     for layer in range(2) for request in (1, 2) for block in (0, 1)]
+        new_compute = add(4, task_class="COMPUTE", task_type="DECODE_STEP_COMPUTE", layer_index=-1,
+                          depends_on=" ".join(map(str, [begin] + new_reads)), duration_us=300)
+        for request in (0, 1, 2):
+            network(4, request, "DECODE_WRITE", [new_compute], -1)
 
         def physical_rows():
             expanded, aliases = [], {}
@@ -290,40 +422,74 @@ class PrefillTrafficTest(unittest.TestCase):
                     item = dict(row, task_id=len(expanded), depends_on=" ".join(map(str, deps)),
                                 execution_schema="v14-domain-serial-batch-tp-sharded", tp_members="")
                     if member is not None:
-                        rank, src, sp, dst, dp, size = member
+                        _, src, sp, dst, dp, size = member
                         item.update(src_node=src, src_port=sp, dst_node=dst, dst_port=dp, bytes=size)
                     aliases[row["task_id"]].append(item["task_id"])
                     expanded.append(item)
             return expanded
 
-        for schema, input_rows in (("logical", rows), ("physical", physical_rows())):
+        for schema, input_rows, options in (
+                ("logical", rows, ()), ("physical", physical_rows(), ()),
+                ("per-rank", rows, ("--phase-grouping", "per-rank", "--timing-policy", "error"))):
             with self.subTest(schema=schema):
-                source = self.root / f"decode-compute-wait-{schema}.csv"
+                source = self.root / f"decode-read-all-{schema}.csv"
                 write_csv(source, input_rows)
-                output = self.root / f"decode-compute-wait-{schema}"
-                self.convert(source, output)
+                output = self.root / f"decode-read-all-{schema}"
+                self.convert(source, output, extra=options)
                 mapping = read_csv(output / "mapping.csv")
-                read_rows = [row for row in mapping if row["task_type"] == "STORAGE_TO_D"]
-                self.assertEqual({row["delay"] for row in read_rows}, {"150us"})
-                final_write = {row["batch_id"]: row["phaseId"] for row in mapping
-                               if row["task_type"] == "PREFIX_STORE_WRITE" and row["layer_index"] == "1"}
-                old_reads = [row for row in read_rows if row["batch_id"] == "2"]
-                new_reads = [row for row in read_rows if row["batch_id"] == "3"]
-                self.assertTrue(all(phases(row) == {final_write["0"]} for row in old_reads))
-                waits = [row for row in mapping if row["task_type"] == "DECODE_READ_COMPUTE_WAIT"]
-                self.assertEqual(len(waits), 1)
-                self.assertEqual(waits[0]["delay"], "20us")
-                self.assertEqual(phases(waits[0]), {row["phaseId"] for row in old_reads})
-                expected = {final_write["1"], waits[0]["phaseId"]}
-                self.assertTrue(all(phases(row) == expected for row in new_reads))
-                self.assertEqual(len({row["phaseId"] for row in new_reads}), 1)
                 native = read_csv(output / "traffic.csv")
+                computes = [row for row in mapping if row["task_type"] == "DECODE_STEP_COMPUTE"]
+                self.assertEqual(len(computes), 2)
+                old, new = computes
+                reads = [row for row in mapping if row["task_type"] == "STORAGE_TO_D" and row["batch_id"] == "4"]
+                read_phases = {row["phaseId"] for row in reads}
+                self.assertEqual(len(read_phases), 1)
+                writes = {row["request_id"]: row["phaseId"] for row in mapping if row["task_type"] == "PREFIX_STORE_WRITE"}
+                self.assertNotEqual(writes["1"], writes["2"])
+                for row in reads:
+                    self.assertEqual(phases(row), {writes[row["request_id"]]})
+                    self.assertEqual(row["delay"], "150us")
+                self.assertEqual(phases(new), {old["phaseId"]} | read_phases)
+                for row in mapping:
+                    if row["task_type"] == "DECODE_WRITE" and row["batch_id"] == "4":
+                        self.assertEqual(phases(row), {new["phaseId"]})
+                        self.assertEqual(row["delay"], "0us")
+
+                # Controlled network durations test the phase barrier itself:
+                # a slow last-layer Read must hold Compute despite faster peers.
+                for slow_read in (False, True):
+                    phase_done, task_start = {}, {}
+                    groups = defaultdict(list)
+                    origins = {row["taskId"]: row for row in mapping}
+                    for row in native:
+                        groups[int(row["phaseId"])].append(row)
+                    for phase in sorted(groups):
+                        finishes = []
+                        for row in groups[phase]:
+                            ready = max((phase_done[int(pid)] for pid in phases(row)), default=0)
+                            delay = row["delay"]
+                            delay_us = (float(delay[:-2]) if delay.endswith("us") else float(delay[:-2]) / 1000)
+                            origin = origins[row["taskId"]]
+                            if row["opType"] == "TIMER":
+                                task_start[row["taskId"]] = ready
+                                finishes.append(ready + delay_us)
+                            else:
+                                task_start[row["taskId"]] = ready + delay_us
+                                duration = 10
+                                if origin["task_type"] == "DECODE_WRITE" and origin["batch_id"] == "3":
+                                    duration = 100000
+                                if slow_read and origin in reads and origin["request_id"] == "1" and origin["layer_index"] == "1":
+                                    duration = 2000
+                                finishes.append(ready + delay_us + duration)
+                        phase_done[phase] = max(finishes)
+                    old_done = phase_done[int(old["phaseId"])]
+                    self.assertTrue(all(task_start[row["taskId"]] < old_done for row in reads))
+                    expected = max(old_done, *(phase_done[int(pid)] for pid in read_phases))
+                    self.assertEqual(task_start[new["taskId"]], expected)
+                    self.assertEqual(expected > old_done, slow_read)
                 debug = read_csv(output / "traffic_debug.csv")
                 self.assertEqual(len(native), len(debug))
-                for detail, origin in zip(debug, mapping):
-                    self.assertEqual(detail["request_id"], origin["request_id"])
-                timer = next(row for row in native if row["phaseId"] == waits[0]["phaseId"])
-                self.assertEqual(timer["opType"], "TIMER")
+                self.assertTrue(all(row["request_id"] == origin["request_id"] for row, origin in zip(debug, mapping)))
 
     def test_write_barriers_separate_batches_and_preserve_chunk_request_ids(self):
         # Two batches, each with two requests and two blocks. One TP member
@@ -406,7 +572,7 @@ class PrefillTrafficTest(unittest.TestCase):
 
     def test_bad_metadata_cannot_silently_publish_legacy_traffic(self):
         good = read_csv(self.outputs["traffic-off"] / "task_dag.csv")
-        for mutation in ("missing-column", "empty-value", "wrong-value", "missing-node"):
+        for mutation in ("missing-column", "empty-value", "wrong-value", "missing-node", "decode-type", "decode-node"):
             with self.subTest(mutation=mutation):
                 rows = [dict(row) for row in good]
                 fields = list(rows[0])
@@ -418,8 +584,12 @@ class PrefillTrafficTest(unittest.TestCase):
                     next(row for row in rows if row["task_type"] == "PREFIX_READ")["batch_type"] = ""
                 elif mutation == "wrong-value":
                     next(row for row in rows if row["task_type"] == "PREFILL_LAYER")["batch_type"] = "DECODE"
-                else:
+                elif mutation == "missing-node":
                     rows[0]["p_node"] = ""
+                elif mutation == "decode-type":
+                    next(row for row in rows if row["task_type"] == "DECODE_STEP_COMPUTE")["batch_type"] = "PREFILL"
+                else:
+                    next(row for row in rows if row["task_type"] == "DECODE_STEP_COMPUTE")["d_node"] = ""
                 source = self.root / f"{mutation}.csv"
                 with source.open("w", newline="") as stream:
                     writer = csv.DictWriter(stream, fields)
