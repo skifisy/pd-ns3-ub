@@ -32,6 +32,31 @@ Do not hardcode switch names in experiment specs or agent logic.
 - `UB_CONGESTION_CONTROL_TRACE_ENABLE` gates algorithm-emitted congestion-control trace files such as `DcqcnMarkTrace_*`, `DcqcnCnpTrace_*`, `DcqcnSenderTrace_*`, `CaqmAckTrace_*`, and `CaqmSenderTrace_*`.
 - These category gates default to `false`, so experiments must opt in explicitly when these files are needed.
 
+## Optional ECMP Selection Trace
+
+- Set both `UB_TRACE_ENABLE=true` and `UB_ECMP_TRACE_ENABLE=true` in
+  `network_attribute.txt`. The ECMP category defaults to false and is independent
+  of `UB_RECORD_PKT_TRACE`, `UB_PACKET_TRACE_ENABLE`, and task/port trace gates.
+- `runlog/EcmpSelectionTrace_node_<switch_id>.tr` records the first ordinary
+  hash-routing selection for each `(switch_id, traffic taskId)`. Its legacy
+  `flowId` field is the traffic taskId, not a transport connection or request ID.
+- Each row reports the existing hash, candidate width, selected index and output
+  port. `hashIncludesTransportPorts` is true for packet spray or the optional
+  per-flow port-inclusive hash mode. Enabling this trace does not change the hash,
+  candidate ordering or selected route.
+- Only tagged URMA packets passing through `UbRoutingProcess::SelectOutPort`
+  produce rows. Unavailable routes and untagged packets produce none. TE/ToE
+  controller-selected hops are outside this trace. Ordinary adaptive routing
+  with a tagged packet aborts when this category is enabled, rather than being
+  reported as a hash selection.
+- A mutex protects sparse bitmap pages (one bit per task/switch, 4096 tasks per
+  page); existing per-file locks protect output. Local MTP, including 8 threads,
+  keeps its configured thread count. Task bits remain until `UbUtils::Destroy`,
+  which clears them and flushes files after workers stop.
+- This is a first-selection diagnostic, not a full packet-path history: later
+  packets, retries, reverse-direction packets or reroutes for the same
+  task/switch do not add rows. See `../../../../tools/NS3_ECMP_TRACE_RESTORE_V1.md`.
+
 ## Optional Replay Telemetry
 
 - Add `--replay` to existing ub-quick-example commands. Mode and case_id are

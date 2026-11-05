@@ -10198,6 +10198,100 @@ class UbQueueSamplerEventRetentionTest : public TestCase
     }
 };
 
+class UbEcmpSelectionTraceTest : public TestCase
+{
+  public:
+    UbEcmpSelectionTraceTest()
+        : TestCase("UnifiedBus - ECMP trace gates, sparse task bits and concurrent dedup")
+    {
+    }
+
+    void DoRun() override
+    {
+        namespace fs = std::filesystem;
+        UbUtils::Get()->Destroy();
+        BooleanValue oldMaster, oldEcmp, oldRecord;
+        GlobalValue::GetValueByName("UB_TRACE_ENABLE", oldMaster);
+        GlobalValue::GetValueByName("UB_ECMP_TRACE_ENABLE", oldEcmp);
+        GlobalValue::GetValueByName("UB_RECORD_PKT_TRACE", oldRecord);
+        NS_TEST_ASSERT_MSG_EQ(oldEcmp.Get(), false, "ECMP trace must default off");
+        const fs::path folder = fs::temp_directory_path() /
+            ("ub-ecmp-trace-" + std::to_string(
+                std::chrono::steady_clock::now().time_since_epoch().count()));
+        UbUtils::SetTracePathForTest(folder.string());
+        GlobalValue::Bind("UB_TRACE_ENABLE", BooleanValue(true));
+        GlobalValue::Bind("UB_RECORD_PKT_TRACE", BooleanValue(false));
+        const auto record = []() {
+            UbUtils::RecordEcmpSelection(3, 0, NodeIdToIp(1).Get(), NodeIdToIp(2).Get(),
+                                         7, 123, 4, 3, 9, true);
+        };
+        record();
+        NS_TEST_ASSERT_MSG_EQ(UbUtils::ecmp_trace_pages.empty(), true,
+                              "Disabled category must not allocate or consume task bits");
+        GlobalValue::Bind("UB_ECMP_TRACE_ENABLE", BooleanValue(true));
+        GlobalValue::Bind("UB_TRACE_ENABLE", BooleanValue(false));
+        record();
+        NS_TEST_ASSERT_MSG_EQ(UbUtils::ecmp_trace_pages.empty(), true,
+                              "Master gate must disable category logging");
+        GlobalValue::Bind("UB_TRACE_ENABLE", BooleanValue(true));
+        record();
+        record();
+        UbUtils::Get()->Destroy();
+        std::ifstream input(folder / "runlog/EcmpSelectionTrace_node_3.tr");
+        std::string line;
+        NS_TEST_ASSERT_MSG_EQ(static_cast<bool>(std::getline(input, line)), true,
+                              "Logging must work with full packet recording off");
+        NS_TEST_ASSERT_MSG_NE(line.find("ECMP Selection, flowId: 0, sip: "), std::string::npos,
+                              "Original analysis prefix and task zero must be preserved");
+        NS_TEST_ASSERT_MSG_NE(line.find(
+                                  ", priority: 7, hash: 123, ecmpWidth: 4, selectedIndex: 3, "
+                                  "selectedOutPort: 9, hashIncludesTransportPorts: 1"),
+                              std::string::npos, "Log the actual selection fields");
+        NS_TEST_ASSERT_MSG_EQ(static_cast<bool>(std::getline(input, line)), false,
+                              "Repeated packets for one task/switch must produce one row");
+        input.close();
+        NS_TEST_ASSERT_MSG_EQ(UbUtils::ecmp_trace_pages.empty(), true,
+                              "Destroy must release dedup state");
+        record(); // Same task/switch is recordable in a later run.
+        UbUtils::Get()->Destroy();
+        std::ifstream again(folder / "runlog/EcmpSelectionTrace_node_3.tr");
+        uint32_t lines = 0;
+        while (std::getline(again, line)) { ++lines; }
+        NS_TEST_ASSERT_MSG_EQ(lines, 2u, "Destroy must reset run-local task bits");
+        again.close();
+
+        const std::array<uint32_t, 5> ids = {0u, 63u, 4095u, 4096u, UINT32_MAX};
+        std::atomic<uint32_t> winners{0};
+        std::vector<std::thread> threads;
+        for (uint32_t thread = 0; thread < 8; ++thread)
+        {
+            threads.emplace_back([&]() {
+                for (uint32_t repeat = 0; repeat < 64; ++repeat)
+                {
+                    for (uint32_t id : ids)
+                    {
+                        if (UbUtils::FirstEcmpSelectionForTask(3, id)) { ++winners; }
+                    }
+                }
+            });
+        }
+        for (auto& thread : threads) { thread.join(); }
+        NS_TEST_ASSERT_MSG_EQ(winners.load(), ids.size(),
+                              "Eight concurrent writers must mark each task exactly once");
+        NS_TEST_ASSERT_MSG_EQ(UbUtils::ecmp_trace_pages.at(3).size(), 3u,
+                              "Sparse uint32 task IDs must allocate only touched pages");
+        NS_TEST_ASSERT_MSG_EQ(UbUtils::FirstEcmpSelectionForTask(4, 0), true,
+                              "Different switches must have independent task bits");
+        UbUtils::Get()->Destroy();
+        UbUtils::SetTracePathForTest("");
+        GlobalValue::Bind("UB_TRACE_ENABLE", oldMaster);
+        GlobalValue::Bind("UB_ECMP_TRACE_ENABLE", oldEcmp);
+        GlobalValue::Bind("UB_RECORD_PKT_TRACE", oldRecord);
+        std::error_code ec;
+        fs::remove_all(folder, ec);
+    }
+};
+
 class UbTraceFileConcurrencyTest : public TestCase
 {
   public:
@@ -10551,6 +10645,91 @@ class UbBusyPortArrivalPrefetchesNextPacketTest : public TestCase
 
         Simulator::Destroy();
         Config::Reset();
+    }
+};
+
+class UbEcmpSelectionRoutingTraceTest : public TestCase
+{
+  public:
+    UbEcmpSelectionRoutingTraceTest()
+        : TestCase("UnifiedBus - ECMP logs actual hash/index/port without changing selection")
+    {
+    }
+
+    void DoRun() override
+    {
+        namespace fs = std::filesystem;
+        utils::UbUtils::Get()->Destroy();
+        BooleanValue oldMaster, oldEcmp;
+        GlobalValue::GetValueByName("UB_TRACE_ENABLE", oldMaster);
+        GlobalValue::GetValueByName("UB_ECMP_TRACE_ENABLE", oldEcmp);
+        const fs::path folder = fs::temp_directory_path() /
+            ("ub-ecmp-routing-" + std::to_string(
+                std::chrono::steady_clock::now().time_since_epoch().count()));
+        utils::UbUtils::SetTracePathForTest(folder.string());
+        GlobalValue::Bind("UB_TRACE_ENABLE", BooleanValue(true));
+        Ptr<UbRoutingProcess> routing = CreateObject<UbRoutingProcess>();
+        routing->SetNodeId(3);
+        const std::vector<uint16_t> shortest = {10, 11};
+        const std::vector<uint16_t> other = {21};
+        RoutingKey key{};
+        key.sip = NodeIdToIp(1).Get();
+        key.dip = NodeIdToIp(2).Get();
+        key.sport = 17;
+        key.dport = 29;
+        key.priority = 7;
+        key.hasTaskId = true;
+        for (uint32_t mode = 0; mode < 3; ++mode)
+        {
+            key.taskId = mode;
+            key.usePacketSpray = mode == 2;
+            key.hashIncludesTransportPorts = mode == 1;
+            GlobalValue::Bind("UB_ECMP_TRACE_ENABLE", BooleanValue(false));
+            bool expectedShortest = false;
+            const int expected = routing->SelectOutPort(key, shortest, other, expectedShortest);
+            GlobalValue::Bind("UB_ECMP_TRACE_ENABLE", BooleanValue(true));
+            bool actualShortest = false;
+            const int actual = routing->SelectOutPort(key, shortest, other, actualShortest);
+            NS_TEST_ASSERT_MSG_EQ(actual, expected, "Trace must not alter output port");
+            NS_TEST_ASSERT_MSG_EQ(actualShortest, expectedShortest,
+                                  "Trace must not alter shortest-path annotation");
+            routing->SelectOutPort(key, shortest, other, actualShortest);
+        }
+        key.hasTaskId = false;
+        bool selectedShortest = false;
+        routing->SelectOutPort(key, shortest, other, selectedShortest);
+        utils::UbUtils::Get()->Destroy();
+        std::ifstream input(folder / "runlog/EcmpSelectionTrace_node_3.tr");
+        const std::regex fields(
+            "flowId: ([0-9]+).*hash: ([0-9]+), ecmpWidth: ([0-9]+), "
+            "selectedIndex: ([0-9]+), selectedOutPort: ([0-9]+), "
+            "hashIncludesTransportPorts: ([01])");
+        std::string line;
+        uint32_t lines = 0;
+        while (std::getline(input, line))
+        {
+            std::smatch match;
+            const bool valid = std::regex_search(line, match, fields);
+            NS_TEST_ASSERT_MSG_EQ(valid, true, "Selection row must have all original fields");
+            if (!valid) { continue; }
+            const uint64_t hash = std::stoull(match[2].str());
+            const uint64_t index = std::stoull(match[4].str());
+            NS_TEST_ASSERT_MSG_EQ(std::stoull(match[3].str()), 3u, "Log actual candidate width");
+            NS_TEST_ASSERT_MSG_EQ(index, hash % 3, "Log actual hash modulo candidate width");
+            const uint32_t port = index < shortest.size()
+                ? shortest[index] : other[index - shortest.size()];
+            NS_TEST_ASSERT_MSG_EQ(std::stoul(match[5].str()), port, "Log actual candidate port");
+            NS_TEST_ASSERT_MSG_EQ(match[6].str(), lines == 0 ? "0" : "1",
+                                  "Port-input flag must cover both optional ports and spray mode");
+            ++lines;
+        }
+        NS_TEST_ASSERT_MSG_EQ(lines, 3u, "One row per tagged task; no duplicate or untagged rows");
+        input.close();
+        utils::UbUtils::SetTracePathForTest("");
+        GlobalValue::Bind("UB_TRACE_ENABLE", oldMaster);
+        GlobalValue::Bind("UB_ECMP_TRACE_ENABLE", oldEcmp);
+        std::error_code ec;
+        fs::remove_all(folder, ec);
     }
 };
 
@@ -13192,6 +13371,8 @@ UbTestSuite::UbTestSuite()
     AddTestCase(new UbCtpPacketTraceConnectsLazyServiceTest(), TestCase::Duration::QUICK);
     AddTestCase(new utils::UbQueueSamplerEventRetentionTest(), TestCase::Duration::QUICK);
     AddTestCase(new utils::UbTraceFileConcurrencyTest(), TestCase::Duration::QUICK);
+    AddTestCase(new utils::UbEcmpSelectionTraceTest(), TestCase::Duration::QUICK);
+    AddTestCase(new UbEcmpSelectionRoutingTraceTest(), TestCase::Duration::QUICK);
     AddTestCase(new UbMpiRankExtractionHelperTest(), TestCase::Duration::QUICK);
     AddTestCase(new UbSameMpiRankHelperTest(), TestCase::Duration::QUICK);
     AddTestCase(new UbSystemOwnedByRankHelperTest(), TestCase::Duration::QUICK);
@@ -13497,6 +13678,8 @@ UbRuntimeToolsTestSuite::UbRuntimeToolsTestSuite()
     AddTestCase(new UbCtpPacketTraceConnectsLazyServiceTest(), TestCase::Duration::QUICK);
     AddTestCase(new utils::UbQueueSamplerEventRetentionTest(), TestCase::Duration::QUICK);
     AddTestCase(new utils::UbTraceFileConcurrencyTest(), TestCase::Duration::QUICK);
+    AddTestCase(new utils::UbEcmpSelectionTraceTest(), TestCase::Duration::QUICK);
+    AddTestCase(new UbEcmpSelectionRoutingTraceTest(), TestCase::Duration::QUICK);
     AddTestCase(new UbMpiRankExtractionHelperTest(), TestCase::Duration::QUICK);
     AddTestCase(new UbSameMpiRankHelperTest(), TestCase::Duration::QUICK);
     AddTestCase(new UbSystemOwnedByRankHelperTest(), TestCase::Duration::QUICK);

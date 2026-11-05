@@ -9,6 +9,7 @@
 #include "ns3/ub-routing-process.h"
 #include "ns3/ub-te-controller.h"
 #include "ns3/ub-toe-controller.h"
+#include "ns3/ub-utils.h"
 #include "ns3/udp-header.h"
 #include "ns3/ipv4-header.h"
 using namespace utils;
@@ -467,6 +468,17 @@ int UbRoutingProcess::SelectOutPort(RoutingKey &rtKey, const std::vector<uint16_
     }
     
     size_t idx = hash64 % totalSize;
+
+    // UbSwitch already obtains taskId from UbFlowTag independently of full
+    // packet recording. Observe the existing decision without rehashing it.
+    if (rtKey.hasTaskId)
+    {
+        const uint32_t outPort = idx < shortestPorts.size()
+            ? shortestPorts[idx] : nonShortestPorts[idx - shortestPorts.size()];
+        utils::UbUtils::RecordEcmpSelection(
+            m_nodeId, rtKey.taskId, sip, dip, priority, hash64, totalSize, idx,
+            outPort, usePacketSpray || hashIncludesTransportPorts);
+    }
     
     // 通过索引判断是否选中最短路径，并直接返回对应集合中的端口
     if (idx < shortestPorts.size()) {
@@ -626,6 +638,12 @@ int UbRoutingProcess::GetOutPort(RoutingKey &rtKey, bool &selectedShortestPath, 
 
     // 若找不到出端口，报ASSERT
     NS_ASSERT_MSG(outPortId != -1, "No available output port found");
+
+    NS_ABORT_MSG_IF(rtKey.hasTaskId && outPortId >= 0 &&
+                        utils::UbUtils::IsEcmpSelectionTraceEnabled() &&
+                        m_routingAlgorithm != UbRoutingAlgorithm::HASH,
+                    "ECMP selection tracing supports hash routing only; "
+                    "an adaptive selector was used");
     
     return outPortId;
 }

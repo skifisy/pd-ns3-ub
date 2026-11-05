@@ -685,6 +685,54 @@ UbUtils::IsTraceEnabled()
 }
 
 bool
+UbUtils::IsEcmpSelectionTraceEnabled()
+{
+    BooleanValue enabled(false);
+    return IsTraceEnabled() &&
+           GlobalValue::GetValueByNameFailSafe("UB_ECMP_TRACE_ENABLE", enabled) && enabled.Get();
+}
+
+bool
+UbUtils::FirstEcmpSelectionForTask(uint32_t nodeId, uint32_t taskId)
+{
+    std::lock_guard<std::mutex> guard(ecmp_trace_mutex);
+    auto& words = ecmp_trace_pages[nodeId][taskId >> 12];
+    const uint32_t word = (taskId & 4095u) >> 6;
+    const uint64_t mask = uint64_t{1} << (taskId & 63u);
+    if ((words[word] & mask) != 0)
+    {
+        return false;
+    }
+    words[word] |= mask;
+    return true;
+}
+
+void
+UbUtils::RecordEcmpSelection(uint32_t nodeId, uint32_t taskId,
+                            uint32_t sip, uint32_t dip, uint32_t priority,
+                            uint64_t hash, uint64_t width, uint64_t index,
+                            uint32_t outPort, bool includesTransportPorts)
+{
+    if (trace_path.empty() || !IsEcmpSelectionTraceEnabled() ||
+        !FirstEcmpSelectionForTask(nodeId, taskId))
+    {
+        return;
+    }
+    std::ostringstream info;
+    // Keep the original analysis format: flowId is the traffic taskId.
+    info << "ECMP Selection, flowId: " << taskId
+         << ", sip: " << ns3::Ipv4Address(sip)
+         << ", dip: " << ns3::Ipv4Address(dip)
+         << ", priority: " << priority << ", hash: " << hash
+         << ", ecmpWidth: " << width << ", selectedIndex: " << index
+         << ", selectedOutPort: " << outPort
+         << ", hashIncludesTransportPorts: " << (includesTransportPorts ? 1 : 0);
+    // Existing per-file locks/buffers own output and Destroy() flushes it.
+    PrintTraceInfo(trace_path + "runlog/EcmpSelectionTrace_node_" +
+                       std::to_string(nodeId) + ".tr", info.str());
+}
+
+bool
 UbUtils::IsFlowControlTraceEnabled()
 {
     if (!IsTraceEnabled())
@@ -832,6 +880,11 @@ void UbUtils::ParseTrace(bool isTest)
 
 void UbUtils::Destroy()
 {
+    // Workers must have joined, as for the existing trace-file cleanup.
+    {
+        std::lock_guard<std::mutex> guard(ecmp_trace_mutex);
+        ecmp_trace_pages.clear();
+    }
     for (auto& event : queue_sampler_events)
     {
         event.second.Cancel();

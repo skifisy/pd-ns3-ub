@@ -2,6 +2,7 @@
 #ifndef UTILS_H
 #define UTILS_H
 
+#include <array>
 #include <iostream>
 #include <sstream>
 #include <chrono>
@@ -40,6 +41,7 @@ class UbLinkDelayOffsetTest;
 namespace utils {
 class UbTraceFileConcurrencyTest;
 class UbQueueSamplerEventRetentionTest;
+class UbEcmpSelectionTraceTest;
 /**
  *  @brief UbUtils单例类
  */
@@ -201,6 +203,14 @@ public:
 
     static bool IsTraceEnabled();
 
+    static bool IsEcmpSelectionTraceEnabled();
+
+    // First actual hash selection per task/switch; independent of packet traces.
+    static void RecordEcmpSelection(uint32_t nodeId, uint32_t taskId,
+                                    uint32_t sip, uint32_t dip, uint32_t priority,
+                                    uint64_t hash, uint64_t width, uint64_t index,
+                                    uint32_t outPort, bool includesTransportPorts);
+
     static bool IsFlowControlTraceEnabled();
 
     static bool IsCongestionControlTraceEnabled();
@@ -243,6 +253,7 @@ public:
 private:
     friend class ::utils::UbTraceFileConcurrencyTest;
     friend class ::utils::UbQueueSamplerEventRetentionTest;
+    friend class ::utils::UbEcmpSelectionTraceTest;
     friend class ::UbLinkDelayOffsetTest;
 
     static ns3::Time ResolveLinkDelayWithOffset(ns3::Time baseDelay,
@@ -267,6 +278,12 @@ private:
 
     inline static std::map<std::string, TraceFileState> files;  // Per-file path, buffer and lock.
     inline static std::mutex files_mutex;
+    // Allocate 512-byte bitmap pages only for touched groups of 4096 task IDs.
+    // Keep completed task bits until Destroy() to suppress retransmit/ACK rows.
+    inline static std::mutex ecmp_trace_mutex;
+    inline static std::map<uint32_t, std::map<uint32_t, std::array<uint64_t, 64>>>
+        ecmp_trace_pages;
+    static bool FirstEcmpSelectionForTask(uint32_t nodeId, uint32_t taskId);
     inline static std::mutex runtime_drop_mutex;
     inline static uint64_t runtime_packet_drop_count = 0;
     inline static std::string runtime_packet_drop_reason;
@@ -323,6 +340,12 @@ private:
                                                             "Enable task and WQE level traces",
                                                             ns3::BooleanValue(true),
                                                             ns3::MakeBooleanChecker());
+
+    ns3::GlobalValue g_ecmp_selection_trace_enable =
+    ns3::GlobalValue("UB_ECMP_TRACE_ENABLE",
+                     "Record the first hash-routing selection per task and switch.",
+                     ns3::BooleanValue(false),
+                     ns3::MakeBooleanChecker());
 
     ns3::GlobalValue g_packet_trace_enable = ns3::GlobalValue("UB_PACKET_TRACE_ENABLE",
                                                               "Enable packet send/ack/receive traces",
