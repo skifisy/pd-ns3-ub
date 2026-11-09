@@ -15,6 +15,7 @@ from generate_ocs_topology import (generate_compute_links, generate_ids,
                                    generate_topology_csv)
 from generate_ocs_routing_table import generate_routing_table
 from analyze_jupiter_te import read_topology, summarize
+from jupiter_te_solver import solve as solve_te
 
 
 def candidates(src, dst, capacities):
@@ -59,6 +60,45 @@ class JupiterTeTest(unittest.TestCase):
     @classmethod
     def tearDownClass(cls):
         cls.tmp.cleanup()
+
+    def test_transit_cap_disabled_by_default(self):
+        demands = {(37, 53): 0.8e12}
+        default = solve_te(self.capacity, demands)
+        explicit = solve_te(self.capacity, demands, max_transit_ratio=-1)
+        self.assertEqual(default, explicit)
+        unrestricted = solve_te(self.capacity, demands, max_transit_ratio=1)
+        self.assertAlmostEqual(default[1], unrestricted[1], places=6)
+
+    def test_zero_transit_cap_excludes_mandatory_transit(self):
+        demands = {(37, 53): 0.8e12, (37, 38): 0.2e12}
+        weights, _ = solve_te(self.capacity, demands, max_transit_ratio=0)
+        self.assertAlmostEqual(weights[37, 53, -1], 1, places=7)
+        mandatory = sum(w for (src, dst, mid), w in weights.items()
+                        if (src, dst) == (37, 38) and mid >= 0)
+        self.assertAlmostEqual(mandatory, 1, places=7)
+        only_mandatory, _ = solve_te(self.capacity, {(37, 38): 0.2e12},
+                                     max_transit_ratio=0)
+        self.assertAlmostEqual(sum(only_mandatory.values()), 1, places=7)
+
+    def test_transit_cap_is_global_demand_weighted(self):
+        capacities = {(37, 53): 10e9, (38, 54): 10e9,
+                      (37, 45): 100e9, (45, 53): 100e9,
+                      (38, 45): 100e9, (45, 54): 100e9}
+        demands = {(37, 53): 10e9, (38, 54): 90e9}
+        weights, _ = solve_te(capacities, demands, max_transit_ratio=0.10)
+        transit = sum(demands[src, dst] * w for (src, dst, mid), w in weights.items()
+                      if mid >= 0)
+        self.assertLessEqual(transit / sum(demands.values()), 0.10 + 1e-7)
+        self.assertAlmostEqual(transit / sum(demands.values()), 0.10, delta=1e-6)
+        # A global budget can put more than ten percent of one OD on transit.
+        self.assertGreater(weights[38, 54, 45], 0.10)
+
+    def test_transit_cap_validation_and_share_conflict(self):
+        for invalid in (-2, -0.1, 1.1, float('nan'), float('inf')):
+            with self.subTest(ratio=invalid), self.assertRaises(ValueError):
+                solve_te(self.capacity, {(37, 53): 0.8e12}, max_transit_ratio=invalid)
+        with self.assertRaises(RuntimeError):
+            solve_te(self.capacity, {(37, 53): 0.8e12}, s=1, max_transit_ratio=0)
 
     def test_parallel_links_are_one_logical_edge_and_paths_have_at_most_two_hops(self):
         self.assertEqual(len(self.ports[37, 53]), 4)

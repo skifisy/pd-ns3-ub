@@ -29,3 +29,23 @@ task destination→source。
 源 leaf 对路径按已有 `CalcHash` 的逐流哈希键做 WCMP，并在固定流的生命周期内保留已选路径。每个 leaf 的 routing process 缓存首次 WCMP 物理端口，也缓存目的 leaf 的“非 TE 跳”判定，后续包不会重复进入全局控制器。选到单中转后，包头的 `RoutingPolicy` 在源 leaf 被置为 shortest；中转 leaf 只允许直达目标 leaf，末端 leaf 按准确的目的 host 端口交付。四条并行物理链路仍按该流哈希做 ECMP。一个 TPN 使用 packet spray 时 TE 会拒绝该流；TE 当前只支持单 MPI rank，MTP 可通过线程锁保护矩阵和策略发布。实验控制只配置一路历史预测 TE，不做 oracle 重放。
 
 脚本回归测试：`python3 -m unittest tools/test_jupiter_te.py -v`；两阶段 LP 的数值测试位于 unified-bus C++ test suite。还需跑含实际 `traffic.csv` 的场景，验证在线策略发布和最终业务完成率。
+
+## 可选中转比例上限
+
+`--te-max-transit-ratio=0.10` 表示：对拓扑上同时具有直达和单中转候选的 OD，分配到中转路径的预测需求合计不超过这些 OD 预测需求合计的 10%。按预测速率加权，不按路径条数或 flow 数计数；这是全局上限，不是每个 OD 的上限，也不是要求达到 10%。
+
+令 O_choice 为上述可分流 OD，D_o 为预测需求，x_o,p 为路径份额，则两阶段 LP 都增加约束：
+
+    sum(o in O_choice, p in transit) D_o * x_o,p <= R * sum(o in O_choice) D_o
+
+默认 `-1` 关闭，省略参数保持原 TE 行为；有效值为 `-1` 或 `[0,1]`，`0` 禁止可选中转，`1` 不额外限制。无直达路径的必经中转 OD 不进入预算，但仍参与链路负载约束。没有可分流 OD 时不增加这一约束。启用 TE 的拓扑变化后重新求解也沿用同一个比例参数。
+
+运行示例（在 `ns-3-ub` 目录）：
+
+```bash
+./ns3 run 'scratch/ub-quick-example --case-path=scratch/mooncake_fix_wcmp_opt --jupiter-te=1 --debug-te=1 --te-max-transit-ratio=0.10 --te-recompute-seconds=30 --te-history-windows=120 --te-s=0 --progress-interval=1000ms --mtp-threads=8'
+```
+
+限制作用于 LP 预测流量分配，实测字节比例会受到预测误差、flow 大小和已有转发行为影响，不能将该值当作实测流量的硬上限。初始化调试日志记录 `max_transit_ratio`，replay 元数据记录 `te_max_transit_ratio`。参数不会自动开启 TE；需使用现有 TE 启用方式。
+
+建议与 `--te-s=0` 配合：较大的 `te-s` 会限制直达份额，与较小中转预算组合时可能不可行，求解器会报错，不会悄悄取消上限。离线参考求解器使用 `--max-transit-ratio=0.10`，默认也为 `-1`。

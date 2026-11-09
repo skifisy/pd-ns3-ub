@@ -63,6 +63,7 @@ struct QuickExampleOptions
     double teRecomputeSeconds = 30.0;
     uint32_t teHistoryWindows = 120;
     double teS = 0.0;
+    double teMaxTransitRatio = -1.0; // Disabled unless explicitly configured.
     std::string teOutput;
     std::string toeMode = "off";
     std::string toeReconfiguration = "auto";
@@ -511,7 +512,8 @@ BuildScenarioFromConfig(const QuickExampleOptions& options, const RuntimeSelecti
                         "Jupiter TE requires a single MPI rank for a globally observed matrix");
         UbTeController::Get().Configure(configPath, options.teRecomputeSeconds,
                                         options.teHistoryWindows, options.teS,
-                                        options.teOutput, options.debugTe);
+                                        options.teOutput, options.debugTe,
+                                        options.teMaxTransitRatio);
     }
     if (options.toeMode == "only" || options.toeMode == "te") {
         const auto toeAppDefaults = CreateObject<UbApp>();
@@ -579,6 +581,7 @@ BuildScenarioFromConfig(const QuickExampleOptions& options, const RuntimeSelecti
         replay.Metadata("te_recompute_seconds", precise(options.teRecomputeSeconds));
         replay.Metadata("te_history_windows", std::to_string(options.teHistoryWindows));
         replay.Metadata("te_s", precise(options.teS));
+        replay.Metadata("te_max_transit_ratio", precise(options.teMaxTransitRatio));
         replay.Metadata("toe_recompute_seconds", precise(options.toeRecomputeSeconds));
         replay.Metadata("toe_history_windows", std::to_string(options.toeHistoryWindows));
         replay.Metadata("toe_mlu_slack", precise(options.toeMluSlack));
@@ -890,6 +893,9 @@ QuickExampleOptions ParseOptions(int argc, char* argv[])
     cmd.AddValue("te-history-windows", "Max lookback in 30s windows (default 120)",
                  options.teHistoryWindows);
     cmd.AddValue("te-s", "Jupiter hedge parameter S in [0,1] (default 0)", options.teS);
+    cmd.AddValue("te-max-transit-ratio",
+                 "Aggregate optional-transit demand ratio in [0,1] (-1 disables; default -1)",
+                 options.teMaxTransitRatio);
     cmd.AddValue("te-output", "Debug directory for TE audit logs and CSV files",
                  options.teOutput);
     cmd.AddValue("toe-mode", "Dynamic topology mode: off, only (ECMP), or te (ToE + Jupiter TE)",

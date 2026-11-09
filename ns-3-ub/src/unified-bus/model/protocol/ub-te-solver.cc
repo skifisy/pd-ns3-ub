@@ -146,7 +146,8 @@ SparseModel
 BuildModel(const std::map<Od, double>& capacitiesBps,
            const std::vector<CandidatePath>& paths,
            bool minimizeTransit,
-           double utilizationUpperBound)
+           double utilizationUpperBound,
+           double maxTransitRatio)
 {
     std::map<Od, HighsInt> odRows;
     for (const auto& path : paths)
@@ -160,9 +161,35 @@ BuildModel(const std::map<Od, double>& capacitiesBps,
         edgeRows.emplace(edge, static_cast<HighsInt>(odRows.size() + edgeRows.size()));
     }
 
+    // Count each eligible OD's demand once. Normalizing the row by total
+    // eligible demand keeps coefficients meaningful even for tiny demands.
+    std::set<Od> directOds, transitOds;
+    std::map<Od, double> eligibleDemands;
+    if (maxTransitRatio >= 0.0)
+    {
+        for (const auto& path : paths)
+        {
+            (path.transit < 0 ? directOds : transitOds).insert(path.od);
+        }
+        for (const auto& path : paths)
+        {
+            if (directOds.count(path.od) && transitOds.count(path.od))
+            {
+                eligibleDemands[path.od] = path.demandGbps;
+            }
+        }
+    }
+    double eligibleTotal = 0.0;
+    for (const auto& [od, demand] : eligibleDemands)
+    {
+        (void)od;
+        eligibleTotal += demand;
+    }
+    const bool capTransit = eligibleTotal > 0.0;
+    const HighsInt transitRow = static_cast<HighsInt>(odRows.size() + edgeRows.size());
     const HighsInt pathCount = static_cast<HighsInt>(paths.size());
     const HighsInt columnCount = pathCount + 1; // Last column is U.
-    const HighsInt rowCount = static_cast<HighsInt>(odRows.size() + edgeRows.size());
+    const HighsInt rowCount = transitRow + (capTransit ? 1 : 0);
     std::vector<std::vector<std::pair<HighsInt, double>>> rows(rowCount);
 
     SparseModel model;
@@ -178,12 +205,20 @@ BuildModel(const std::map<Od, double>& capacitiesBps,
         model.rowLower[row] = 1.0;
         model.rowUpper[row] = 1.0;
     }
+    if (capTransit)
+    {
+        model.rowUpper[transitRow] = maxTransitRatio;
+    }
     for (HighsInt column = 0; column < pathCount; ++column)
     {
         const auto& path = paths[column];
         model.colUpper[column] = path.upperBound;
         model.cost[column] = minimizeTransit && path.transit >= 0 ? path.demandGbps : 0.0;
         rows[odRows.at(path.od)].push_back({column, 1.0});
+        if (capTransit && path.transit >= 0 && eligibleDemands.count(path.od))
+        {
+            rows[transitRow].push_back({column, path.demandGbps / eligibleTotal});
+        }
         for (uint8_t edgeIndex = 0; edgeIndex < path.edgeCount; ++edgeIndex)
         {
             rows[edgeRows.at(path.edges[edgeIndex])].push_back({column, path.demandGbps});
@@ -289,12 +324,14 @@ UbTeSolver::IsAvailable()
 UbTeSolver::Result
 UbTeSolver::Solve(const std::map<Od, double>& capacitiesBps,
                   const std::map<Od, double>& demandsBps,
-                  double s)
+                  double s,
+                  double maxTransitRatio)
 {
 #ifndef NS3_UB_HAVE_HIGHS
     (void)capacitiesBps;
     (void)demandsBps;
     (void)s;
+    (void)maxTransitRatio;
     throw std::runtime_error(
         "Jupiter TE requires the HiGHS C++ library; reconfigure ns-3 with highs_DIR");
 #else
@@ -302,13 +339,18 @@ UbTeSolver::Solve(const std::map<Od, double>& capacitiesBps,
     {
         throw std::invalid_argument("Jupiter S must be in [0,1]");
     }
+    if (!std::isfinite(maxTransitRatio) ||
+        (maxTransitRatio != -1.0 && (maxTransitRatio < 0.0 || maxTransitRatio > 1.0)))
+    {
+        throw std::invalid_argument("maxTransitRatio must be -1 (disabled) or in [0,1]");
+    }
     const std::vector<CandidatePath> paths = BuildCandidates(capacitiesBps, demandsBps, s);
     if (paths.empty())
     {
         return {};
     }
 
-    const SparseModel firstModel = BuildModel(capacitiesBps, paths, false, kInfinity);
+    const SparseModel firstModel = BuildModel(capacitiesBps, paths, false, kInfinity, maxTransitRatio);
     const std::vector<double> first = SolveModel(firstModel, "min-utilization stage");
     const double minimumUtilization = first.back();
     if (!std::isfinite(minimumUtilization) || minimumUtilization < 0.0)
@@ -317,7 +359,8 @@ UbTeSolver::Solve(const std::map<Od, double>& capacitiesBps,
     }
     const double utilizationCap =
         minimumUtilization + std::max(1e-9, minimumUtilization * 1e-6);
-    const SparseModel secondModel = BuildModel(capacitiesBps, paths, true, utilizationCap);
+    const SparseModel secondModel =
+        BuildModel(capacitiesBps, paths, true, utilizationCap, maxTransitRatio);
     const std::vector<double> second = SolveModel(secondModel, "minimum-transit stage");
 
     Result result;

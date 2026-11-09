@@ -8,6 +8,7 @@ measurement window by ub-case-runner, not given future traffic.csv values.
 
 import argparse
 import csv
+import math
 from collections import defaultdict
 
 
@@ -50,10 +51,13 @@ def candidates(src, dst, capacities):
     return paths
 
 
-def solve(capacities, demands, s=0.0):
+def solve(capacities, demands, s=0.0, max_transit_ratio=-1.0):
     """Minimize max directed edge utilization, then minimize transit traffic."""
     if not 0 <= s <= 1:
         raise ValueError("S must be in [0, 1]")
+    if not math.isfinite(max_transit_ratio) or (
+            max_transit_ratio != -1.0 and not 0 <= max_transit_ratio <= 1):
+        raise ValueError("max_transit_ratio must be -1 (disabled) or in [0, 1]")
     from scipy.optimize import linprog
     from scipy.sparse import lil_matrix, vstack
 
@@ -94,6 +98,18 @@ def solve(capacities, demands, s=0.0):
     target = [0.0] * len(od_rows)
     for od, i in od_rows.items():
         target[i] = demands[od] / 1e9
+    if max_transit_ratio >= 0:
+        direct_ods = {(src, dst) for src, dst, mid, _ in paths if mid == -1}
+        transit_ods = {(src, dst) for src, dst, mid, _ in paths if mid != -1}
+        eligible = direct_ods & transit_ods
+        total_gbps = sum(demands[od] / 1e9 for od in eligible)
+        if total_gbps > 0:
+            cap = lil_matrix((1, n + 1))
+            for i, (src, dst, transit, _) in enumerate(paths):
+                if (src, dst) in eligible and transit != -1:
+                    cap[0, i] = 1.0 / total_gbps
+            ub = vstack((ub.tocsr(), cap.tocsr()))
+            rhs.append(max_transit_ratio)
     bounds = limits + [(0, None)]
     first_objective = [0.0] * n + [1.0]
     first = linprog(first_objective, A_ub=ub.tocsr(), b_ub=rhs,
@@ -121,6 +137,8 @@ def main():
     parser.add_argument("--matrix", required=True)
     parser.add_argument("--output", required=True)
     parser.add_argument("--s", type=float, default=0.0)
+    parser.add_argument("--max-transit-ratio", type=float, default=-1.0,
+                        help="aggregate optional-transit demand cap in [0,1]; -1 disables")
     args = parser.parse_args()
     _, capacities, _ = read_topology(args.topology)
     demands = {}
@@ -128,7 +146,7 @@ def main():
         for row in csv.DictReader(stream):
             src, dst = int(row["src_leaf"]), int(row["dst_leaf"])
             demands[src, dst] = float(row["bps"])
-    weights, max_util = solve(capacities, demands, args.s)
+    weights, max_util = solve(capacities, demands, args.s, args.max_transit_ratio)
     with open(args.output, "w", newline="") as stream:
         writer = csv.writer(stream)
         writer.writerow(("src_leaf", "dst_leaf", "transit_leaf", "weight"))

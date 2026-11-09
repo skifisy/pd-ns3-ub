@@ -35,10 +35,14 @@ class UbTeSolver
      * Capacities and demands are expressed in bits per second.  Path
      * variables are per-OD fractions, which keeps every conservation row
      * normalized to one even for very small demands.
+     * maxTransitRatio=-1 disables the optional aggregate transit-demand cap.
+     * Otherwise [0,1] limits transit demand only for ODs with both direct and
+     * single-transit candidates. Mandatory transit is excluded.
      */
     static Result Solve(const std::map<Od, double>& capacitiesBps,
                         const std::map<Od, double>& demandsBps,
-                        double s);
+                        double s,
+                        double maxTransitRatio = -1.0);
 };
 
 } // namespace ns3

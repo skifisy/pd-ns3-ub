@@ -388,10 +388,14 @@ void UbTeController::ResumeAfterAbortedTopologyChange()
 
 void UbTeController::Configure(const std::string& casePath, double recomputeSeconds,
                                uint32_t historyWindows, double s, const std::string& outputDir,
-                               bool debug)
+                               bool debug, double maxTransitRatio)
 {
-    NS_ABORT_MSG_IF(recomputeSeconds <= 0 || historyWindows == 0 || s < 0 || s > 1,
-                    "TE requires positive interval, history and S in [0,1]");
+    NS_ABORT_MSG_IF(recomputeSeconds <= 0 || historyWindows == 0 || s < 0 || s > 1 ||
+                        !std::isfinite(maxTransitRatio) ||
+                        (maxTransitRatio != -1.0 &&
+                         (maxTransitRatio < 0.0 || maxTransitRatio > 1.0)),
+                    "TE requires positive interval/history, S in [0,1], and "
+                    "--te-max-transit-ratio in [0,1] or -1 (disabled)");
     NS_ABORT_MSG_IF(!UbTeSolver::IsAvailable(),
                     "Jupiter TE requires the in-process HiGHS C++ backend; install HiGHS and "
                     "reconfigure ns-3 with -Dhighs_DIR=<path-to-highs-cmake>");
@@ -453,6 +457,7 @@ void UbTeController::Configure(const std::string& casePath, double recomputeSeco
     m_intervalSeconds = recomputeSeconds;
     m_historyWindows = historyWindows;
     m_s = s;
+    m_maxTransitRatio = maxTransitRatio;
     m_debug.store(debug, std::memory_order_relaxed);
     if (m_debug.load(std::memory_order_relaxed))
     {
@@ -526,6 +531,7 @@ void UbTeController::Configure(const std::string& casePath, double recomputeSeco
         message << "[INIT] case=" << m_casePath << " solver=in-process-highs"
                 << " interval_seconds=" << m_intervalSeconds
                 << " history_windows=" << m_historyWindows << " s=" << m_s
+                << " max_transit_ratio=" << m_maxTransitRatio
                 << " host_ports=" << m_hostPortToLeaf.size() << " leaves=" << leaves.size()
                 << " directed_logical_edges=" << m_leafPorts.size()
                 << " directed_circuits=" << circuitCount;
@@ -1055,7 +1061,8 @@ void UbTeController::Recompute()
         UbTeSolver::Result result;
         try
         {
-            result = UbTeSolver::Solve(m_edgeCapacityBps, predictedDemands, m_s);
+            result = UbTeSolver::Solve(m_edgeCapacityBps, predictedDemands, m_s,
+                                       m_maxTransitRatio);
         }
         catch (const std::exception& error)
         {

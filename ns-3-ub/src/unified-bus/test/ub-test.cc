@@ -13006,6 +13006,39 @@ class UbTeSolverTwoStageLpTest : public TestCase
         }
         NS_TEST_ASSERT_MSG_EQ_TOL(tinyTotal, 1.0, 1e-12, "tiny OD policy must stay normalized");
         NS_TEST_ASSERT_MSG_GT(tiny.minMaxUtilization, 0.0, "tiny demand must remain nonzero");
+
+        const auto zeroCap = UbTeSolver::Solve(
+            capacities, {{{37, 53}, 0.8e12}, {{37, 38}, 0.2e12}}, 0.0, 0.0);
+        NS_TEST_ASSERT_MSG_EQ_TOL(zeroCap.policy.at({37, 53}).at(-1), 1.0, 1e-7,
+                                  "zero cap keeps eligible traffic direct");
+        double mandatory = 0.0;
+        for (const auto& [mid, weight] : zeroCap.policy.at({37, 38}))
+        {
+            NS_TEST_ASSERT_MSG_GT_OR_EQ(mid, 0, "mandatory transit stays feasible");
+            mandatory += weight;
+        }
+        NS_TEST_ASSERT_MSG_EQ_TOL(mandatory, 1.0, 1e-7,
+                                  "mandatory transit is outside the budget");
+        const std::map<Od, double> capEdges{
+            {{37, 53}, 10e9}, {{38, 54}, 10e9}, {{37, 45}, 100e9},
+            {{45, 53}, 100e9}, {{38, 45}, 100e9}, {{45, 54}, 100e9}};
+        const std::map<Od, double> capDemands{{{37, 53}, 10e9}, {{38, 54}, 90e9}};
+        const auto capped = UbTeSolver::Solve(capEdges, capDemands, 0.0, 0.10);
+        double transitDemand = 0.0;
+        for (const auto& [od, weights] : capped.policy)
+        {
+            for (const auto& [mid, weight] : weights)
+            {
+                if (mid >= 0)
+                {
+                    transitDemand += capDemands.at(od) * weight;
+                }
+            }
+        }
+        NS_TEST_ASSERT_MSG_LT_OR_EQ(transitDemand / 100e9, 0.10 + 1e-7,
+                                    "the budget is demand weighted across eligible ODs");
+        NS_TEST_ASSERT_MSG_GT(capped.policy.at({38, 54}).at(45), 0.10,
+                              "aggregate cap is not a per-OD cap");
     }
 };
 
