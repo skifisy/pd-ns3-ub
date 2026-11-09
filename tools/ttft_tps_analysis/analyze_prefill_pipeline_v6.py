@@ -16,7 +16,7 @@ compute durations and observed completed per-layer reads. Forecast compute time
 from batches_debug.csv is the initial anchor, NOT an observed GPU event.
 
 Examples:
- python3 analyze_prefill_pipeline_v4.py --case DAG_OUTPUT_DIR \
+ python3 analyze_prefill_pipeline_v6.py --case DAG_OUTPUT_DIR \
   --ecmp-dir ECMP --te-dir TE --toe-dir TOE --eps2-dir EPS2 \
   --mapping DAG_OUTPUT_DIR/mapping.csv --out-dir pipeline_analysis
 
@@ -27,10 +27,10 @@ physical taskId slot; network rows are strictly verified (provide --data-size-di
 Outputs: pipeline_report.html (self-contained interactive viewer),
  pipeline_batch_summary.csv, pipeline_layer_detail.csv, pipeline_request_detail.csv.
 
-Only selected Prefill batches are retained in RAM. Default: first 6 batches.
-Select explicit batches with repeated --batch-id; more can be chosen on re-run.
-The selected batches' detailed Requests are limited by --detail-requests, but
-batch/layer totals contain every Request in the batch.
+By default, ALL Prefill batches in batches_debug.csv are included in the report.
+Use repeated --batch-id to select a subset, or --max-batches N to limit to the first N.
+The selected batches' detailed Requests are limited by --detail-requests PER BATCH,
+but batch/layer totals contain every Request in each included batch.
 No simulation is performed, only existing traces are analyzed.
 """
 import argparse
@@ -46,7 +46,7 @@ import struct
 import sys
 import tempfile
 
-VERSION = 'v15-prefill-batch-pipeline-v5-flush-index-tail-20261105'
+VERSION = 'v15-prefill-batch-pipeline-v6-all-prefill-batches-20261106'
 UPSTREAM_REVISION = '7a41f3456c0f65c8831c68f070cfbb7aa57cd682'
 # Limit HTML chart primitives per stage. Exact overlap statistics still use
 # the full global network-activity union, including stages beyond this cap.
@@ -95,7 +95,7 @@ def csv_header(path):
             raise ValueError(f'empty CSV: {path}') from None
 
 
-def select_batches(path, ids, nmax):
+def select_batches(path, ids, nmax=None):
     out = {}
     fields = ('batch_id','batch_type','request_ids','service_domain','compute_duration_us',
               'forecast_compute_start_us','batch_size','tp_degree')
@@ -115,7 +115,7 @@ def select_batches(path, ids, nmax):
                     'compute_duration_us':number(compute,'batch compute duration'),
                     'forecast_compute_start_us':number(forecast,'forecast compute start'),
                     'batch_size':number(size,'batch size'),'tp_degree':number(degree,'TP degree')}
-        if not ids and len(out) >= nmax:
+        if not ids and nmax is not None and len(out) >= nmax:
             break
     if ids and wanted-set(out):
         raise ValueError(f'unknown Prefill batches: {sorted(wanted-set(out))}')
@@ -128,20 +128,20 @@ def load_requests(path, batches, detail_limit, pinned):
     selected = set(rid for b in batches.values() for rid in b['requests'])
     details = {bid:set(b['requests'][:detail_limit]) | (set(b['requests']) & pinned)
                for bid,b in batches.items()}
-    found = {}
-    for raw,phase,arrival,output,miss,hit in rows(path,
-              ('request_id','phase','timestamp_us','output_length','miss_tokens','cached_tokens')):
+    # The pipeline viewer only needs formal-request membership and the bounded
+    # per-batch detail subset. Avoid retaining every request's debug metadata
+    # in RAM or duplicating it into the HTML payload when all batches are used.
+    found = set()
+    for raw,phase in rows(path,('request_id','phase')):
         rid = number(raw,'request_id')
         if rid in selected and phase == 'FORMAL':
             if rid in found:
-                raise ValueError(f'duplicate request {rid}')
-            found[rid] = {'id':rid,'arrival_us':number(arrival,'arrival time'),
-                          'output_tokens':number(output,'output tokens'),
-                          'miss_tokens':number(miss,'miss tokens'),
-                          'cached_tokens':number(hit,'cached tokens')}
-    if selected - set(found):
-        raise ValueError(f'missing formal request metadata, e.g. {sorted(selected-set(found))[:5]}')
-    return found,details
+                raise ValueError(f'duplicate formal request {rid}')
+            found.add(rid)
+    missing = selected - found
+    if missing:
+        raise ValueError(f'missing formal request metadata, e.g. {sorted(missing)[:5]}')
+    return details
 
 
 def load_dag_layers(path, batches):
@@ -650,14 +650,14 @@ def load_report_template():
     # Fully self-contained HTML; no external CDN or HTTP server.
     return r'''<!DOCTYPE html>
 <html lang="zh-CN"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Prefill Batch Pipeline v3 · ECMP / TE / TOE / EPS-2L</title>
+<title>Prefill Batch Pipeline v6 · ECMP / TE / TOE / EPS-2L</title>
 <style>
 :root{color-scheme:light;--bg:#f7f8fa;--ink:#182335;--mut:#68748a;--line:#d9e0e8;--panel:#fff;--read:#1c95b5;--comp:#517bbd;--write:#25957c;--overlap:#9566b2}
 *{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--ink);font:14px/1.5 -apple-system,BlinkMacSystemFont,'Segoe UI','Microsoft YaHei',sans-serif}
 header{background:#fff;border-bottom:1px solid var(--line);padding:18px 28px}h1{font-size:23px;margin:0 0 5px}.sub{color:var(--mut);font-size:12px}
 main{margin:auto;max-width:1520px;padding:18px 25px 35px}.bar{display:flex;flex-wrap:wrap;gap:13px;align-items:end;margin-bottom:12px}
 label{font-size:12px;color:var(--mut);display:flex;gap:5px;flex-direction:column}select,input{border:1px solid #cfd7e1;border-radius:6px;padding:7px 9px;background:white;min-width:130px;color:var(--ink)}input[type=number]{min-width:80px;max-width:125px}
-.panel{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:15px;margin-bottom:14px;overflow:hidden}h2{font-size:16px;margin:0 0 9px}.scroll{overflow:auto;width:100%;touch-action:none;cursor:grab}.scroll:active{cursor:grabbing}#overview{touch-action:none;cursor:crosshair}
+.panel{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:15px;margin-bottom:14px;overflow:hidden}h2{font-size:16px;margin:0 0 9px}.scroll{overflow:auto;width:100%;touch-action:none;cursor:grab}.batch-table-wrap{overflow:auto;width:100%;max-height:390px}.batch-table-wrap table{min-width:1120px}.batch-table-wrap tbody tr[data-bid]{cursor:pointer}.batch-table-wrap tbody tr[data-bid]:hover{background:#eef4fb}.batch-table-wrap tbody tr.selected{background:#e5eefb;font-weight:600}.batch-filter{margin:0 0 9px;display:flex;align-items:center;gap:8px}.batch-filter input{min-width:180px}.scroll:active{cursor:grabbing}#overview{touch-action:none;cursor:crosshair}
 .cards{display:grid;grid-template-columns:repeat(5,minmax(120px,1fr));gap:10px}.metric{background:#f5f7fa;border-radius:8px;padding:10px}.metric strong{display:block;font-size:19px}.metric span{font-size:11px;color:var(--mut)}
 svg{display:block;max-width:none}svg rect:hover{filter:brightness(1.07)}.legend{display:flex;gap:16px;flex-wrap:wrap;font-size:12px;color:var(--mut);margin:7px 0}.dot{display:inline-block;width:10px;height:10px;margin-right:5px;border-radius:2px;vertical-align:middle}.read{background:var(--read)}.comp{background:var(--comp)}.write{background:var(--write)}.overlap{background:var(--overlap)}
 .badge{border-radius:4px;padding:2px 5px;background:#f5d9aa;font-size:11px}.note{font-size:12px;color:#6c6770;margin:9px 0 0}table{border-collapse:collapse;width:100%;min-width:900px}th,td{border-bottom:1px solid #e5e9ef;text-align:right;padding:7px 8px;font-size:12px}td:first-child,th:first-child{text-align:left}th{background:#f6f7fa;position:sticky;top:0}
@@ -667,12 +667,13 @@ button{border:1px solid #cbd6e3;background:white;border-radius:6px;padding:7px 1
 <header><h1>Prefill Batch · Read / Compute / Write Pipeline</h1><div class="sub">当前仓库 V15 DAG + ns-3 实测 KV 网络流 · Compute 基于 DAG 与 Read 完成时间推算 · 四方案局部同轴 · 逐段虚线边界</div></header>
 <main>
 <section class="panel"><div class="bar">
-<label>Prefill Batch<select id="batch"></select></label>
+<label>Prefill Batch（全部批次可选）<select id="batch"></select></label>
 <label>当前方案<select id="scheme"><option value="ecmp">ECMP</option><option value="te">TE</option><option value="toe">TOE</option><option value="eps2">EPS-2L</option></select></label>
 <label>起始 Layer<input id="start" type="number" min="0" value="0"></label>
 <label>显示 Layer 数<input id="count" type="number" min="1" max="78" value="12"></label>
 <label>Request 分片<select id="req"></select></label>
 </div><div id="batchline" class="sub"></div></section>
+<section class="panel"><h2>Prefill Batch 总览 · 点击一行查看对应流水线</h2><div class="batch-filter"><label for="batchFilter">筛选 Batch ID / Domain</label><input id="batchFilter" type="search" placeholder="输入 Batch ID 或 Domain"><span id="batchOverviewCount" class="foot"></span></div><div id="batchOverview" class="batch-table-wrap"></div><p class="foot">总览包含本次分析纳入的全部 Prefill Batch。点击任意行即可切换下方详细流水线；默认纳入全部批次，可用 --batch-id 或 --max-batches 指定子集。</p></section>
 <section class="panel"><h2>Batch 全局概览 · 拖拽选择局部时间窗口</h2><div id="overview" class="scroll"></div><p id="overviewNote" class="foot"></p>
 <div class="legend"><span><i class="dot read"></i>Read</span><span><i class="dot comp"></i>Compute（估）</span><span><i class="dot write"></i>Write</span><span>蓝色虚线框：当前时间窗口</span></div></section>
 <section class="panel"><h2>局部时间轴控制</h2>
@@ -692,7 +693,7 @@ button{border:1px solid #cbd6e3;background:white;border-radius:6px;padding:7px 1
 <section class="panel"><h2>完整 Batch 流水线统计</h2><div id="metrics" class="cards"></div><p id="warning" class="note"></p></section>
 <section class="panel"><h2>所选 Request 的逐层传输</h2><p class="foot">本区域独立展示当前 Request 的逐层 Read / Write；Batch Compute 是共享计算区间，不属于单个 Request 独占的计算任务。</p><div id="requestinfo" class="sub"></div><div id="requestgraph" class="scroll"></div></section>
 <section class="panel"><h2>逐层详细数据</h2><div id="layersTable" class="scroll"></div><p class="foot">与计算相关的统计仍是推算量。Read/Write 区间来自 task_statistics.csv；流时长和活跃片段按已完成流统计，不包括未完成流。</p></section>
-<section class="panel"><h2>计算时间推断方法和限制</h2><p class="foot">每层计算时长来自 v15 DAG 的 PREFILL_LAYER.duration_us（GLM FLOPs 或 legacy）。首层起点锚定 batches_debug.csv 的 forecast_compute_start_us，后续每层取“上一层推算计算结束”和“本层全部 Read 观测完成”的较晚者。这不是 ns-3 GPU 计算事件。任何层的必需 Read 缺失/未完成时，该层及无法可信推断的后续计算留空。网络流观测与 DAG 预测存在差异时，推算计算与网络重叠不代表真实 GPU 与网络同步执行。网络活跃时间按每条完成流的区间并集统计；浅色区间包络不代表持续占用。HTML 仅含所选 Batch，通过 --batch-id 添加。</p></section>
+<section class="panel"><h2>计算时间推断方法和限制</h2><p class="foot">每层计算时长来自 v15 DAG 的 PREFILL_LAYER.duration_us（GLM FLOPs 或 legacy）。首层起点锚定 batches_debug.csv 的 forecast_compute_start_us，后续每层取“上一层推算计算结束”和“本层全部 Read 观测完成”的较晚者。这不是 ns-3 GPU 计算事件。任何层的必需 Read 缺失/未完成时，该层及无法可信推断的后续计算留空。网络流观测与 DAG 预测存在差异时，推算计算与网络重叠不代表真实 GPU 与网络同步执行。网络活跃时间按每条完成流的区间并集统计；浅色区间包络不代表持续占用。HTML 默认包含 batches_debug.csv 中全部 Prefill Batch；可通过 --batch-id 指定批次子集，或 --max-batches 限制前 N 个批次。</p></section>
 </main><script id="pipeline-data" type="application/json">__PIPELINE_JSON__</script><script>
 'use strict';
 const D=JSON.parse(document.getElementById('pipeline-data').textContent);
@@ -903,12 +904,38 @@ function renderTable(){const ls=data().layers;let str='<table><thead><tr><th>Lay
   for(const l of ls)str+=`<tr><td>L${l.layer}</td><td>${fmt(l.read.start,4)} / ${fmt(l.read.end,4)}</td><td>${fmt(l.read.bytes/1048576,2)}</td><td>${l.read.completed}/${l.read.expected}</td><td>${fmt(l.compute_start_ms,4)} / ${fmt(l.compute_end_ms,4)}</td><td>${fmt(l.compute_duration_ms,4)}</td><td>${fmt(l.write.start,4)} / ${fmt(l.write.end,4)}</td><td>${fmt(l.write.bytes/1048576,2)}</td><td>${l.write.completed}/${l.write.expected}</td><td>${fmt(l.layer_overlap_ms,4)}</td></tr>`;
   $('layersTable').innerHTML=str+'</tbody></table>';
 }
+function renderBatchOverview(){
+  const ids=Object.keys(D.batches).sort((a,b)=>Number(a)-Number(b));
+  const filter=$('batchFilter').value.trim().toLowerCase();
+  const visible=ids.filter(id=>id.toLowerCase().includes(filter)||String(D.batches[id].service_domain??'').toLowerCase().includes(filter));
+  let html='<table><thead><tr><th>Batch</th><th>Requests</th><th>Domain</th><th>TP</th>';
+  for(const name of names)html+=`<th>${labels[name]} Span ms</th><th>${labels[name]} 重叠率</th>`;
+  html+='</tr></thead><tbody>';
+  for(const id of visible){
+    const b=D.batches[id];
+    html+=`<tr data-bid="${el(id)}" class="${id===$('batch').value?'selected':''}"><td>Batch ${el(id)}</td><td>${b.batch_size}</td><td>${el(b.service_domain)}</td><td>${b.tp_degree}</td>`;
+    for(const name of names){const m=D.schemes[name][id]?.summary;
+      html+=`<td>${fmt(m?.pipeline_span_ms_est,3)}</td><td>${m?.compute_overlap_ratio==null?'—':fmt(m.compute_overlap_ratio*100,1)+'%'}</td>`;
+    }
+    html+='</tr>';
+  }
+  html+='</tbody></table>';
+  $('batchOverview').innerHTML=html;
+  $('batchOverviewCount').textContent=`显示 ${visible.length} / ${ids.length} 个 Batch`;
+}
+function highlightBatchOverview(){
+  const selected=$('batch').value;
+  for(const row of $('batchOverview').querySelectorAll('tr[data-bid]'))row.classList.toggle('selected',row.dataset.bid===selected);
+}
 function updateReq(){const bid=$('batch').value,scheme=$('scheme').value,d=D.schemes[scheme][bid],prev=$('req').value;
   $('req').innerHTML='<option value="">汇总视图</option>'+d.requests.map(r=>`<option value="${r.request_id}">Request ${r.request_id}</option>`).join('');
   if(d.requests.some(r=>String(r.request_id)===prev))$('req').value=prev;
 }
 function render(){const batch=D.batches[$('batch').value],dom=currentWindow();
-  $('batchline').textContent=`Batch ${batch.batch_id} · ${batch.batch_size} Requests · Domain ${batch.service_domain} · TP ${batch.tp_degree} · ${data().layers.length} 层。仅分析选择的 Batch；可通过 --batch-id 添加。`;
+  const batchIds=Object.keys(D.batches);
+  const batchPosition=batchIds.indexOf(String(batch.batch_id))+1;
+  $('batchline').textContent=`当前 Batch ${batchPosition}/${batchIds.length}：${batch.batch_id} · ${batch.batch_size} Requests · Domain ${batch.service_domain} · TP ${batch.tp_degree} · ${data().layers.length} 层。报告共包含 ${batchIds.length} 个 Prefill Batch，可通过上方下拉框或总览表切换。`;
+  highlightBatchOverview();
   $('currentWindow').textContent=`当前显示：${fmt(dom[0],6)} ～ ${fmt(dom[1],6)} ms（跨度 ${fmt(dom[1]-dom[0],6)} ms）`;
   $('manualGroup').hidden=$('rangeMode').value!=='manual';
   if($('rangeMode').value!=='manual'){ $('timeMin').value=fixedInput(dom[0]);$('timeMax').value=fixedInput(dom[1]);}
@@ -963,7 +990,14 @@ for(const id of ['compare','timeline','requestgraph']){
   box.addEventListener('pointercancel',()=>{drag=null;});
   box.addEventListener('dblclick',()=>{$('rangeMode').value='layers';render();});
 }
-for(const bid of Object.keys(D.batches))$('batch').add(new Option(`Batch ${bid}`,bid));
+for(const bid of Object.keys(D.batches).sort((a,b)=>Number(a)-Number(b)))$('batch').add(new Option(`Batch ${bid}`,bid));
+renderBatchOverview();
+$('batchFilter').addEventListener('input',renderBatchOverview);
+$('batchOverview').addEventListener('click',e=>{
+  const row=e.target.closest('tr[data-bid]');if(!row)return;
+  $('batch').value=row.dataset.bid;
+  manualWindow=null;$('rangeMode').value='layers';updateReq();render();
+});
 for(const id of ['batch','scheme'])$(id).addEventListener('change',()=>{
   manualWindow=null;$('rangeMode').value='layers';updateReq();render();
 });
@@ -995,7 +1029,7 @@ def main(argv=None):
     parser.add_argument('--traffic',type=Path,help='当前 V15 converter 生成的 traffic.csv；仅在没有 mapping.csv 时使用')
     parser.add_argument('--data-size-divisor',type=int,default=1,help='required to validate fallback traffic, default 1')
     parser.add_argument('--batch-id',type=int,action='append',help='explicit Prefill Batch ID, repeatable')
-    parser.add_argument('--max-batches',type=int,default=6,help='first N Prefill batches if no --batch-id')
+    parser.add_argument('--max-batches',type=int,default=None,help='limit to first N Prefill batches; default: include ALL batches (ignored when --batch-id is used)')
     parser.add_argument('--detail-requests',type=int,default=12,help='Requests per selected batch in interactive viewer')
     parser.add_argument('--request-id',type=int,action='append',help='additional Request to retain in detailed viewer')
     parser.add_argument('--out-dir',type=Path,help='default DAG_OUTPUT_DIR/output/pipeline_analysis')
@@ -1003,8 +1037,8 @@ def main(argv=None):
     parser.add_argument('--progress-every',type=int,default=1000000)
     parser.add_argument('--version',action='version',version=VERSION)
     args=parser.parse_args(argv)
-    if args.max_batches<1 or args.detail_requests<0 or args.data_size_divisor<1 or args.progress_every<0:
-        parser.error('max-batches >=1, detail-requests >=0, divisor >=1, progress-every >=0 required')
+    if (args.max_batches is not None and args.max_batches<1) or args.detail_requests<0 or args.data_size_divisor<1 or args.progress_every<0:
+        parser.error('max-batches must be >=1 when specified; detail-requests >=0, divisor >=1, progress-every >=0 required')
     if args.batch_id and any(x<0 for x in args.batch_id):
         parser.error('batch IDs must be nonnegative')
     case=args.case.resolve()
@@ -1033,16 +1067,25 @@ def main(argv=None):
             raise ValueError('output cannot overwrite input')
     fingerprints={p.resolve():(p.stat().st_size,p.stat().st_mtime_ns) for p in inputs}
     batches=select_batches(bdebug,args.batch_id or [],args.max_batches)
-    reqs,detail=load_requests(debug,batches,args.detail_requests,set(args.request_id or []))
+    detail=load_requests(debug,batches,args.detail_requests,set(args.request_id or []))
     durations,logical_bytes=load_dag_layers(dag,batches)
-    print('Selected Prefill batches: '+', '.join(map(str,batches)),file=sys.stderr)
+    if args.batch_id:
+        print(f'Selected Prefill batches: {len(batches)} explicitly requested ({", ".join(map(str,batches))})',file=sys.stderr)
+    elif args.max_batches is not None:
+        print(f'Selected first {len(batches)} Prefill batches (--max-batches={args.max_batches})',file=sys.stderr)
+    else:
+        print(f'Selected ALL Prefill batches: {len(batches)}',file=sys.stderr)
     print('Index mode: '+('v15 mapping' if mapping else 'traffic/DAG network validation (TIMER slots retained)'),file=sys.stderr)
     bucket=Buckets(batches,detail)
     work=(args.work_dir or out).resolve()
     work.mkdir(parents=True,exist_ok=True)
     with tempfile.TemporaryDirectory(prefix='.pipeline_',dir=work) as name:
         index,first,count=build_index(mapping,dag,traffic,args.data_size_divisor,Path(name),bucket,args.progress_every)
-        report={'version':VERSION,'upstream_revision':UPSTREAM_REVISION,'batches':batches,'requests':reqs,'schemes':{}}
+        # Only serialize fields used by the HTML UI; the complete request_ids arrays
+        # are needed for analysis but would unnecessarily bloat an all-batch report.
+        batch_view={bid:{key:b[key] for key in ('batch_id','service_domain','batch_size','tp_degree')}
+                    for bid,b in batches.items()}
+        report={'version':VERSION,'upstream_revision':UPSTREAM_REVISION,'batches':batch_view,'schemes':{}}
         summaries=[]; layers=[]; requests_detail=[]
         for scheme in SCHEMES:
             print(f'Analyzing {LABELS[scheme]}: {stats_paths[scheme]}',file=sys.stderr,flush=True)
