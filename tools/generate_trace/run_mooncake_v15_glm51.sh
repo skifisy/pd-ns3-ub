@@ -3,13 +3,10 @@ set -Eeuo pipefail
 
 # ===== Paths =====
 TRACE="/mnt/liujiaxin/scratch/mooncake_agent_v14_pipeline_tp_logical_dspread_10min/trace_10min.jsonl"
-# CONFIG="/mnt/yuhaoze/tools-2/mooncake_pd_config_v15_glm51.json"
-# DAG_SCRIPT="/mnt/yuhaoze/tools-2/mooncake_trace_to_dag_v15.py"
-# TRAFFIC_SCRIPT="/mnt/yuhaoze/tools-2/mooncake_dag_to_traffic_v15.py"
-
-CONFIG="/mnt/yuhaoze/pd-ns3-ub-main/tools/mooncake_pd_config_v15_glm51.json"
-DAG_SCRIPT="/mnt/yuhaoze/pd-ns3-ub-main/tools/mooncake_trace_to_dag_v15.py"
-TRAFFIC_SCRIPT="/mnt/yuhaoze/pd-ns3-ub-main/tools/mooncake_dag_to_traffic_v15.py"
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+CONFIG="${SCRIPT_DIR}/mooncake_pd_config_v15_glm51.json"
+DAG_SCRIPT="${SCRIPT_DIR}/mooncake_trace_to_dag_v15.py"
+TRAFFIC_SCRIPT="${SCRIPT_DIR}/mooncake_dag_to_traffic_v15.py"
 
 OUT_DIR="/mnt/yuhaoze/pd-ns3-ub/ns-3-ub/scratch/mooncake_agent_v18_pipeline"
 WORK_DIR="${OUT_DIR}/traffic_work"
@@ -41,7 +38,7 @@ command -v python3 >/dev/null 2>&1 || fail "python3 not found"
 
 mkdir -p "$OUT_DIR" "$WORK_DIR"
 
-# Validate that the latest config directly enables the GLM-5.1 FLOPs model.
+# Validate Prefill FLOPs and fixed Decode timing independently.
 python3 - "$CONFIG" <<'PY'
 import json
 import sys
@@ -57,6 +54,10 @@ if cm.get("mode") != "glm51_flops":
 
 print("[INFO] Using config:", sys.argv[1])
 print("[INFO] Prefill compute model:", cm.get("mode"))
+if cm.get("decode_mode", "legacy") != "legacy":
+    raise SystemExit("ERROR: this experiment requires compute_model.decode_mode=legacy")
+print("[INFO] Decode timing (us):", cfg["timing"]["first_decode_step_us"],
+      cfg["timing"]["decode_us_per_token"], "(folded into network delays; no Decode TIMERs)")
 print("[INFO] NPU:", cm.get("npu_model"), cm.get("npu_precision"))
 print("[INFO] Peak ops/s:", cm.get("npu_peak_ops_per_sec"))
 print("[INFO] Efficiency:", cm.get("efficiency"))

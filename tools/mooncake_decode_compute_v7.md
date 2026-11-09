@@ -1,123 +1,128 @@
-# Decode FLOPs model and whole-step TIMER
+# Decode fixed timing and folded network delays (v10)
 
-The arithmetic model was introduced by v7 on top of v6. The v8 increment is
-applied on top of v7 and changes Decode to read all input before computation.
-The v9 increment applies on top of v8 and writes output KV once per request.
-Regenerate both
-`task_dag.csv` and traffic outputs with the matching scripts. The simulator's
-existing TIMER support is sufficient; this change does not modify C++.
+Regenerate both `task_dag.csv` and traffic outputs with the matching scripts in
+`tools/generate_trace/`. This revision changes Python generation/conversion only;
+it does not change the native nine-column traffic format or require a C++ change.
+The experiment launcher resolves its configuration and Python scripts beside
+itself in `tools/generate_trace/`; set its trace and output paths for your run.
 
-## Computation model
+## Timing policy
 
-`compute_model.mode=glm51_flops` now applies to both Prefill and Decode.
-Decode reuses the current expanded-KV MLA/DSA/MoE arithmetic coefficients,
-architecture, precision-specific NPU operation rate and MAC-as-two-operations
-convention. Prefill arithmetic is unchanged.
+Prefill and Decode timing are selected independently:
 
-For each active Decode request, exactly one new query is computed per step.
-The cached context is `H = input_length + completed_decode_steps`; the current
-query attends to `L = H + 1` keys, including its own key. The first Decode step
-uses completed steps zero. The configured output length controls how many
-steps are generated; it is not charged as a single compute workload.
+```json
+"compute_model": {
+  "mode": "glm51_flops",
+  "decode_mode": "legacy"
+},
+"timing": {
+  "prefill_us_per_token": 50,
+  "decode_us_per_token": 10000,
+  "first_decode_step_us": 10000,
+  "storage_latency_us": 150
+}
+```
 
-Projection, dense FFN, router and expert arithmetic scales with the number of
-new queries, not with the cached context size. Indexer score pairs sum `L` per
-request; sparse-attention pairs sum `min(L, index_topk)`. History is not projected
-or passed through FFN a second time. Prefix hits still participate in attention.
+The supplied configuration retains Prefill FLOPs and switches Decode to fixed
+timing. `decode_mode` defaults to `legacy` when omitted. Prefill's linear value
+is only used when its own mode is `legacy`; setting it to 50 does not disable
+Prefill FLOPs.
 
-Requests are grouped by their pinned Decode TP group. Attention, dense FFN and
-router use `parallel.decode_tp`; each stage takes the slowest local group.
-Routed experts share the EP pool and retain the existing load-imbalance model.
-Shared experts use `compute_model.decode_shared_expert_tp_degree`, falling back
-to the explicit shared-expert setting and then Decode TP. The supplied config
-sets Decode shared-expert TP to 2 while keeping Prefill shared-expert TP at 8.
+For each scheduled Decode step, take the maximum member duration: a new member
+uses `first_decode_step_us`, a resident member uses `decode_us_per_token`.
+With the supplied values, every nonempty step has 10,000 us of pure computation,
+independent of batch size and context length. These are simulation assumptions,
+not hardware measurements. Storage latency and network time are additional.
 
-`compute_model.decode_efficiency` optionally overrides the common efficiency,
-as either one scalar or a dictionary with attention, dense_ffn, router,
-routed_expert and shared_expert entries. Omitted entries inherit the common
-values; a default entry can override all omitted components.
+`--decode-ms-per-token 7` overrides both fixed Decode values to 7,000 us. It is
+allowed with Prefill FLOPs. For arithmetic comparisons, explicitly select
+`compute_model.decode_mode=glm51_flops`; that option requires Prefill FLOPs
+configuration and rejects the fixed-duration CLI override. Arithmetic still uses
+one new query per member and H=input_length+completed_steps cached keys.
 
-All configured model layers contribute. Their time is quantized using
-cumulative rounding so layer durations sum to the same integer-microsecond
-total as a merged step. Dense/MoE and Indexer-on/off metric classes are reused
-within each batch to avoid repeated calculations.
+## Logical DAG versus traffic execution
 
-This is the same idealized arithmetic-throughput estimate used by the existing
-Prefill model. It does not include HBM weight/KV traffic, TP/EP communication,
-softmax, Top-K selection, normalization, or kernel launch overhead. Efficiency
-1.0 uses peak arithmetic rate; it is not a measured end-to-end token latency.
+The logical DAG retains `DECODE_STEP_COMPUTE`, `D_COMPUTE_DONE`, and step ordering
+for scheduling forecasts and diagnostics. The converter folds Decode computation
+and control tasks into weighted network dependencies. No Decode `TIMER` rows
+are written to `traffic.csv`, `traffic_debug.csv`, or `mapping.csv`. Prefill still
+has its existing explicit batch-start and layer-computation TIMERs.
 
-Fixed `timing.first_decode_step_us` and `timing.decode_us_per_token` are ignored
-in FLOPs mode and listed as ignored settings in the summary. An explicit
-`--decode-ms-per-token` conflicts with FLOPs mode and is rejected. With mode
-legacy, the historical max-member-step timing remains available.
+Every first-use `STORAGE_TO_D` still waits for its request's final Prefill phase.
+Read delay is storage latency only (150 us by default). All input layers, blocks,
+TP members, and uint32 chunks of a Decode batch share an ALL-completion phase.
+A new member's Compute waits for all required input Reads and the previous
+Decode computation. Resident steps do not reread input KV.
 
-## Task dependencies
+For one isolated request with three output tokens:
 
-Every Decode batch now uses one DECODE_STEP_COMPUTE TIMER for all model layers.
-For requests entering Decode, all block/layer/TP Read records are generated
-before computation, each depending only on that request's P_DONE frontier.
-This permits all input layers to be prefetched while a previous batch computes.
-There is no Decode inter-layer Read/Compute pipeline.
+- Input Read phase R finishes at the time measured by ns-3.
+- The logical DAG has three steps, each taking 10 ms.
+- The final output Write depends on R, with `delay=30000us`.
+- A slow Read pushes the Write start later by the same amount; Compute is not
+  replaced by a fixed absolute timestamp.
 
-All input Read records in one batch share a single completion phase. Their
-individual start dependencies still point at their own Prefill final phase;
-sharing a completion phase does not make them wait for other requests to start.
-The completion phase is ready only when ALL of its Read records finish.
-The whole-step Compute waits for that phase plus the preceding Decode Compute.
-This normally gives one dependency per Read and at most two for computation,
-including large batches with hundreds of new requests.
+A simplified native Write row is:
 
-Fully resident batches emit no input Reads, so their Compute only waits for
-previous computation. The Compute TIMER has layer_index=-1 and empty request_id.
-A request keeps generated KV locally until its final output token completes.
-It then emits one logical DECODE_WRITE gathering all output tokens and layers.
-There are no intermediate token writes or D_WRITES_DONE accumulation gates.
-Each request writes as soon as it finishes, even if other batch members continue.
-D_DONE waits for all of that request's final-write TP members and uint32 chunks.
-The next batch waits for Compute, not outstanding writes.
+```csv
+taskId,sourceNode,destNode,dataSize(Byte),opType,priority,delay,phaseId,dependOnPhases
+100,5,20,1024,URMA_WRITE,7,30000us,31,22
+```
 
-Unscaled write bytes equal output_length * kv_bytes_per_token, excluding the
-input KV already in storage. Each rank's size equals output_length times the
-sum of its per-token layer shards, preserving integer rounding across ranks.
-All ranks use one storage object keyed decode:<request_id>:output. This replaces
-the old per-output-block placement; block_index=-1 and decode_token_index is the
-last token's zero-based index. Full DAG output additionally records storage_key
-and kv_extent_kind=all_output_tokens_all_layers. Zero-output requests emit no write.
+Here 22 is the input Read completion phase. All TP members and uint32 chunks
+of that final Write receive the same computation dependency and delay.
+No intermediate token Writes are added. Final output bytes remain
+`output_length * kv_bytes_per_token`, excluding input KV. Writes are TP sharded
+and use the existing `decode:<request_id>:output` storage object.
 
-One write means one logical request write, not necessarily one traffic CSV row:
-nonempty TP ranks remain separate, and the converter splits each rank at uint32
-size limits. With TP=2 and rank payloads below that limit, 100 output tokens now
-produce two WRITE rows, rather than 200. Storage traffic shifts to request end;
-its total unscaled payload is unchanged. --data-size-divisor still rounds up per
-uint32 chunk after aggregation, so scaled byte totals can differ from v8.
-The historical write-completion dependency expansion is removed, but other
-conversion costs, including input Read expansion and file/SQLite I/O, remain.
+The next step depends on computation, not completion of a previous output Write.
+When computation is folded, its dependencies can include earlier batches' Read
+phases with accumulated delays. Never replace that weighted dependency set with
+just the numerically largest phase: a larger phase ID does not prove that an
+earlier independent Read has completed.
 
-The legacy storage_to_d_streaming setting is false in the supplied config.
-A true value in older configs is ignored and reported; it cannot re-enable the
-old inter-layer pipeline. Input flow sizes and layer/rank decomposition are
-retained. Different network contention and the lost Read/Compute overlap can
-change predicted batch timing and subsequent offline scheduling decisions.
+## One-delay format limitation
 
-Batch membership, placement, resource-release forecasts and TIMER durations
-use the same FLOPs estimate. This remains an offline scheduled DAG, not a
-runtime batch scheduler.
+A weighted gate can require `max(finish(R1)+20ms, finish(R2)+10ms)` when new
+requests join between steps. The CSV has only one delay after an AND barrier,
+so it cannot in general represent this expression exactly without extra
+execution semantics or TIMERs.
 
-## Outputs
+This converter keeps both phases and conservatively uses
+`max(finish(R1), finish(R2))+20ms`. It never schedules the Write earlier than the
+logical computation, but it may schedule it later. Uniform lags, including a
+single isolated request and fully resident steps without new joins, are exact.
+`--timing-policy error` rejects unequal-lag Decode network gates. Both
+`conservative` and `max-phase` retain all Decode dependencies and apply padding;
+`max-phase` is not permission to drop a Decode dependency. Prefill policy is
+unchanged.
 
-`decode_compute.csv` has one row per Decode batch by default. It includes batch
-and request IDs, layer/step granularity, new queries, cached/visible context,
-local group loads, full-model component arithmetic, stage times and rounded
-compute_us. Sum the rounded Compute TIMER delays for that batch to reproduce
-compute_us. FLOPs fields are blank for the legacy model.
+Summary fields expose the representation and approximation:
 
-Add `--decode-compute-detail layer` to the Trace-to-DAG command to also write
-`decode_layer_compute.csv`, including all layer metrics even for merged steps.
-This diagnostic option does not change the DAG or compute durations. Without it,
-no 78-row-per-batch Decode detail is produced.
+- `decode_compute_phases`, `decode_step_compute_phases`,
+  `decode_layer_compute_phases`: zero.
+- `folded_decode_compute_tasks`, `folded_decode_compute_ns`: logical computation
+  folded into network dependencies (not elapsed simulation time).
+- `decode_padded_network_tasks`: network tasks requiring unequal-lag padding.
+- `conservative_examples`: weighted predecessor lags for sampled padded gates.
 
-`traffic.csv` keeps the native nine-column format. `traffic_debug.csv` adds
-request_id as before; batch Compute TIMERs leave it empty. Mapping consumers
-must recognize both DECODE_LAYER and DECODE_STEP_COMPUTE. The traffic summary
-reports total and merged-step Decode Compute phase counts, plus shared input Read phase count.
+`decode_compute.csv` still reports one logical step per batch with `compute_us`.
+FLOPs columns are blank under fixed timing. `--decode-compute-detail layer`
+provides arithmetic detail only in FLOPs mode; it does not add execution TIMERs.
+`batches_debug.csv` and `requests_debug.csv` remain generator forecasts. Mapping
+consumers must not expect a physical `DECODE_STEP_COMPUTE` traffic row.
+
+## Scope of this revision
+
+Input Read release conditions, all-layer prefetch, batch membership, TP placement,
+and final-write aggregation retain the current behavior. This change does not
+restore the old layer-by-layer Read/Compute pipeline, add runtime Admission or
+KV memory reservation, impose a prefetch bandwidth limit, or dynamically skip
+unready requests. HBM capacity is still not modeled. Removing Decode TIMERs alone
+does not fix excessive prefetch concurrency.
+
+Run Python regressions without building or running ns-3:
+
+```bash
+python3 -m unittest discover -s tools/tests -p 'test_mooncake*.py'
+```

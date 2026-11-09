@@ -10,7 +10,7 @@ import unittest
 from collections import defaultdict
 
 
-TOOLS = Path(__file__).resolve().parents[1]
+TOOLS = Path(__file__).resolve().parents[1] / "generate_trace"
 GENERATOR = TOOLS / "mooncake_trace_to_dag_v15.py"
 CONVERTER = TOOLS / "mooncake_dag_to_traffic_v15.py"
 CONFIG = TOOLS / "mooncake_pd_config_v15_glm51.json"
@@ -142,8 +142,9 @@ class PrefillTrafficTest(unittest.TestCase):
         summary = json.loads((output / "summary.json").read_text())
         self.assertEqual(summary["prefill_batches"], 1)
         self.assertEqual(summary["prefill_control_phases"] + summary["prefill_compute_phases"], 79)
-        self.assertEqual(summary["decode_compute_phases"], 1)
-        self.assertEqual(summary["timer_rows"], 80)
+        self.assertEqual(summary["decode_compute_phases"], 0)
+        self.assertEqual(summary["folded_decode_compute_tasks"], 1)
+        self.assertEqual(summary["timer_rows"], 79)
         self.assertEqual(summary["total_rows"], len(traffic))
         self.assertIn("traffic-debug", summary["converter_version"])
         self.assertIn("Write=Batch+Layer", summary["prefill_phase_grouping_policy"])
@@ -236,8 +237,11 @@ class PrefillTrafficTest(unittest.TestCase):
                 reads.append(add(count + 2, request, task_class="NETWORK", task_type="STORAGE_TO_D",
                                  layer_index=layer, depends_on=str(done[request]), bytes=2,
                                  network_wave=f"D:all:{layer}", tp_members="[[0,1,0,0,0,1],[1,1,0,2,0,1]]"))
-        add(count + 2, task_class="COMPUTE", task_type="DECODE_STEP_COMPUTE", layer_index=-1,
-            depends_on=" ".join(map(str, [begin] + reads)), duration_us=10)
+        final_compute = add(count + 2, task_class="COMPUTE", task_type="DECODE_STEP_COMPUTE", layer_index=-1,
+                            depends_on=" ".join(map(str, [begin] + reads)), duration_us=10)
+        add(count + 2, 0, task_class="NETWORK", task_type="DECODE_WRITE", layer_index=-1,
+            depends_on=str(final_compute), bytes=2, network_wave="D:final:write",
+            tp_members="[[0,0,0,1,0,1],[1,2,0,1,0,1]]")
         source = self.root / "large-read-all.csv"
         write_csv(source, rows)
         output = self.root / "large-read-all"
@@ -250,7 +254,11 @@ class PrefillTrafficTest(unittest.TestCase):
         pref_writes = {row["request_id"]: row["phaseId"] for row in mapping if row["task_type"] == "PREFIX_STORE_WRITE"}
         self.assertTrue(all(phases(row) == {pref_writes[row["request_id"]]} for row in read_rows))
         computes = [row for row in mapping if row["task_type"] == "DECODE_STEP_COMPUTE"]
-        self.assertEqual(phases(computes[-1]), {computes[0]["phaseId"], read_rows[0]["phaseId"]})
+        self.assertFalse(computes)
+        writes = [row for row in mapping if row["task_type"] == "DECODE_WRITE"]
+        for row in writes:
+            self.assertEqual(phases(row), {pref_writes["0"], read_rows[0]["phaseId"]})
+            self.assertEqual(row["delay"], "1010us")
 
     def test_old_decode_batch_read_gate_is_rejected(self):
         rows = read_csv(self.outputs["traffic-off"] / "task_dag.csv")
@@ -265,61 +273,55 @@ class PrefillTrafficTest(unittest.TestCase):
         self.assertIn("regenerate task_dag.csv with the v8 generator", result.stderr)
         self.assertFalse((output / "traffic.csv").exists())
 
-    def test_generated_decode_compute_waits_all_layers_once(self):
+    def test_generated_decode_write_folds_compute_after_all_layers(self):
         output = self.outputs["traffic-off"]
         mapping = read_csv(output / "mapping.csv")
-        dag = {row["task_id"]: row for row in read_csv(output / "task_dag.csv")}
+        dag = read_csv(output / "task_dag.csv")
         reads = [row for row in mapping if row["task_type"] == "STORAGE_TO_D"]
-        computes = [row for row in mapping if row["task_type"] == "DECODE_STEP_COMPUTE"]
-        self.assertEqual(len(computes), 1)
-        self.assertFalse(any(row["task_type"] == "DECODE_LAYER" for row in mapping))
-        compute = computes[0]
+        self.assertFalse(any(row["task_type"] in {"DECODE_STEP_COMPUTE", "DECODE_LAYER"} for row in mapping))
         read_phases = {row["phaseId"] for row in reads}
         self.assertEqual(len(read_phases), 1)
-        self.assertEqual(phases(compute), read_phases)
         self.assertEqual({int(row["layer_index"]) for row in reads}, set(range(78)))
         self.assertTrue(all(len(phases(row)) == 1 for row in reads))
-        self.assertEqual(compute["request_id"], "")
-        self.assertEqual(compute["delay"], f"{dag[compute['dag_task_id']]['duration_us']}us")
         cfg = json.loads(CONFIG.read_text())
         trace = {str(row["request_id"]): row for row in map(json.loads, self.trace.read_text().splitlines())}
-        dag_reads = [row for row in dag.values() if row["task_type"] == "STORAGE_TO_D"]
+        dag_reads = [row for row in dag if row["task_type"] == "STORAGE_TO_D"]
         requests = {row["request_id"] for row in dag_reads}
         self.assertEqual(sum(int(row["bytes"]) for row in dag_reads),
                          sum(trace[request]["input_length"] for request in requests) * cfg["model"]["kv_bytes_per_token"])
         self.assertEqual(len(reads), sum(len(json.loads(row["tp_members"])) for row in dag_reads))
         for row in mapping:
             if row["task_type"] == "DECODE_WRITE":
-                self.assertEqual(row["delay"], "0us")
-                self.assertEqual(phases(row), {compute["phaseId"]})
+                self.assertEqual(row["delay"], "10000us")
+                self.assertEqual(phases(row), read_phases)
 
-    def test_resident_request_next_token_waits_for_compute_not_write(self):
+    def test_resident_steps_accumulate_compute_without_waiting_for_write(self):
         requests = [json.loads(line) for line in self.trace.read_text().splitlines()]
-        requests[1]["output_length"] = 2
-        source = self.root / "two-token-trace.jsonl"
+        requests[1]["output_length"] = 3
+        source = self.root / "three-token-trace.jsonl"
         source.write_text("".join(json.dumps(row) + "\n" for row in requests))
-        output = self.root / "two-token"
+        output = self.root / "three-token"
         self.run_command([GENERATOR, source, "--config", CONFIG, "--warmup-requests", "1",
                           "--dag-detail", "traffic", "--out-dir", output, "--no-progress"])
-        self.convert(output / "task_dag.csv", output)
+        self.convert(output / "task_dag.csv", output, extra=("--timing-policy", "error"))
         mapping = read_csv(output / "mapping.csv")
         reads = [row for row in mapping if row["task_type"] == "STORAGE_TO_D"]
         self.assertTrue(reads)
         self.assertEqual({row["decode_token_index"] for row in reads}, {"0"})
-        computes = [row for row in mapping if row["task_type"] in {"DECODE_LAYER", "DECODE_STEP_COMPUTE"}]
-        batches = sorted({row["batch_id"] for row in computes}, key=int)
-        self.assertEqual(len(batches), 2)
-        first_last = next(row for row in computes if row["batch_id"] == batches[0])
-        second_first = next(row for row in computes if row["batch_id"] == batches[1] and row["task_type"] == "DECODE_STEP_COMPUTE")
-        self.assertEqual(len(computes), 2)
-        self.assertEqual(second_first["layer_index"], "-1")
-        self.assertEqual(second_first["request_id"], "")
-        self.assertEqual(phases(second_first), {first_last["phaseId"]})
-        write_phases = {row["phaseId"] for row in mapping if row["task_type"] == "DECODE_WRITE"}
-        self.assertTrue(phases(second_first).isdisjoint(write_phases))
+        read_phases = {row["phaseId"] for row in reads}
+        writes = [row for row in mapping if row["task_type"] == "DECODE_WRITE"]
+        self.assertTrue(writes)
+        for row in writes:
+            self.assertEqual(row["delay"], "30000us")
+            self.assertEqual(phases(row), read_phases)
+        self.assertFalse(any(row["task_type"] == "DECODE_STEP_COMPUTE" for row in mapping))
         detail = read_csv(output / "decode_compute.csv")
-        self.assertEqual([row["compute_granularity"] for row in detail], ["step", "step"])
-        self.assertEqual(second_first["delay"], detail[-1]["compute_us"] + "us")
+        self.assertEqual([row["compute_us"] for row in detail], ["10000"] * 3)
+        dag = read_csv(output / "task_dag.csv")
+        write_ids = {row["task_id"] for row in dag if row["task_type"] == "DECODE_WRITE"}
+        for row in dag:
+            if row["task_type"] == "D_BATCH_BEGIN":
+                self.assertTrue(write_ids.isdisjoint(row["depends_on"].split(";")))
 
     def test_decode_forecasts_do_not_change_traffic_but_prefill_arrivals_do(self):
         source = self.outputs["traffic-off"] / "task_dag.csv"
@@ -430,7 +432,7 @@ class PrefillTrafficTest(unittest.TestCase):
 
         for schema, input_rows, options in (
                 ("logical", rows, ()), ("physical", physical_rows(), ()),
-                ("per-rank", rows, ("--phase-grouping", "per-rank", "--timing-policy", "error"))):
+                ("per-rank", rows, ("--phase-grouping", "per-rank", "--timing-policy", "conservative"))):
             with self.subTest(schema=schema):
                 source = self.root / f"decode-read-all-{schema}.csv"
                 write_csv(source, input_rows)
@@ -438,22 +440,30 @@ class PrefillTrafficTest(unittest.TestCase):
                 self.convert(source, output, extra=options)
                 mapping = read_csv(output / "mapping.csv")
                 native = read_csv(output / "traffic.csv")
-                computes = [row for row in mapping if row["task_type"] == "DECODE_STEP_COMPUTE"]
-                self.assertEqual(len(computes), 2)
-                old, new = computes
+                self.assertFalse(any(row["task_type"] == "DECODE_STEP_COMPUTE" for row in mapping))
+                old_reads_native = [row for row in mapping if row["task_type"] == "STORAGE_TO_D" and row["batch_id"] == "3"]
+                old_read_phase = old_reads_native[0]["phaseId"]
                 reads = [row for row in mapping if row["task_type"] == "STORAGE_TO_D" and row["batch_id"] == "4"]
                 read_phases = {row["phaseId"] for row in reads}
                 self.assertEqual(len(read_phases), 1)
                 writes = {row["request_id"]: row["phaseId"] for row in mapping if row["task_type"] == "PREFIX_STORE_WRITE"}
-                self.assertNotEqual(writes["1"], writes["2"])
                 for row in reads:
                     self.assertEqual(phases(row), {writes[row["request_id"]]})
                     self.assertEqual(row["delay"], "150us")
-                self.assertEqual(phases(new), {old["phaseId"]} | read_phases)
-                for row in mapping:
-                    if row["task_type"] == "DECODE_WRITE" and row["batch_id"] == "4":
-                        self.assertEqual(phases(row), {new["phaseId"]})
-                        self.assertEqual(row["delay"], "0us")
+                old_write = next(row for row in mapping if row["task_type"] == "DECODE_WRITE" and row["batch_id"] == "3")
+                self.assertEqual(phases(old_write), {old_read_phase})
+                self.assertEqual(old_write["delay"], "1000us")
+                new_writes = [row for row in mapping if row["task_type"] == "DECODE_WRITE" and row["batch_id"] == "4"]
+                for row in new_writes:
+                    # Losing old_read_phase here would allow old computation
+                    # to be skipped when the new Read happens to finish first.
+                    self.assertEqual(phases(row), {old_read_phase} | read_phases)
+                    self.assertEqual(row["delay"], "1300us")
+                summary = json.loads((output / "summary.json").read_text())
+                self.assertGreater(summary["decode_padded_network_tasks"], 0)
+                # Strict mode must expose the one-delay limitation.
+                self.convert(source, self.root / f"strict-folded-{schema}", expected=1,
+                             extra=("--timing-policy", "error"))
 
                 # Controlled network durations test the phase barrier itself:
                 # a slow last-layer Read must hold Compute despite faster peers.
@@ -482,11 +492,16 @@ class PrefillTrafficTest(unittest.TestCase):
                                     duration = 2000
                                 finishes.append(ready + delay_us + duration)
                         phase_done[phase] = max(finishes)
-                    old_done = phase_done[int(old["phaseId"])]
+                    old_done = phase_done[int(old_read_phase)] + 1000
                     self.assertTrue(all(task_start[row["taskId"]] < old_done for row in reads))
-                    expected = max(old_done, *(phase_done[int(pid)] for pid in read_phases))
-                    self.assertEqual(task_start[new["taskId"]], expected)
-                    self.assertEqual(expected > old_done, slow_read)
+                    exact_compute_done = max(old_done, *(phase_done[int(pid)] for pid in read_phases)) + 300
+                    conservative_done = max(phase_done[int(old_read_phase)],
+                                            *(phase_done[int(pid)] for pid in read_phases)) + 1300
+                    for row in new_writes:
+                        self.assertEqual(task_start[row["taskId"]], conservative_done)
+                        self.assertGreaterEqual(task_start[row["taskId"]], exact_compute_done)
+                    # A very slow old Write must never be a prerequisite.
+                    self.assertTrue(all(old_write["phaseId"] not in phases(row) for row in new_writes))
                 debug = read_csv(output / "traffic_debug.csv")
                 self.assertEqual(len(native), len(debug))
                 self.assertTrue(all(row["request_id"] == origin["request_id"] for row, origin in zip(debug, mapping)))

@@ -1,4 +1,4 @@
-"""Arithmetic and small-trace regressions for incremental Decode FLOPs."""
+"""Fixed Decode timing, optional FLOPs, and folded traffic regressions."""
 
 import copy
 import csv
@@ -11,11 +11,12 @@ import sys
 import tempfile
 import unittest
 
-TOOLS = Path(__file__).resolve().parents[1]
+TOOLS = Path(__file__).resolve().parents[1] / "generate_trace"
 SPEC = importlib.util.spec_from_file_location("mooncake_model_v7", TOOLS / "mooncake_trace_to_dag_v15.py")
 MODULE = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(MODULE)
 CONFIG = json.loads((TOOLS / "mooncake_pd_config_v15_glm51.json").read_text())
+CONFIG["compute_model"]["decode_mode"] = "glm51_flops"
 
 
 def state(request=0, context=1024, token=1, group=0):
@@ -130,6 +131,7 @@ class DecodeArithmeticTest(unittest.TestCase):
     def test_legacy_and_configuration_validation(self):
         cfg = copy.deepcopy(CONFIG)
         cfg["compute_model"]["mode"] = "legacy"
+        cfg["compute_model"]["decode_mode"] = "legacy"
         result, durations, _ = self.model(cfg).decode_compute([state()], include_layers=True)
         self.assertEqual(result["compute_us"], 10000)
         self.assertEqual(sum(durations), 10000)
@@ -139,6 +141,53 @@ class DecodeArithmeticTest(unittest.TestCase):
             cfg["compute_model"][field] = value
             with self.subTest(field=field), self.assertRaises(ValueError):
                 self.model(cfg)
+
+
+class FixedDecodeTimingTest(unittest.TestCase):
+    def config(self):
+        # Use the shipped policy, rather than CONFIG's explicit FLOPs override.
+        return json.loads((TOOLS / "mooncake_pd_config_v15_glm51.json").read_text())
+
+    def test_fixed_decode_does_not_disable_prefill_flops(self):
+        cfg = self.config()
+        model = MODULE.Model(cfg)
+        self.assertEqual(model.prefill_compute_mode, "glm51_flops")
+        self.assertEqual(model.decode_compute_mode, "legacy")
+        for members in ([state(token=0)], [state(token=9)],
+                        [state(i, context=16384, token=i % 2, group=i % 3) for i in range(64)]):
+            summary, durations, _ = model.decode_compute(members, include_layers=True)
+            self.assertEqual(summary["compute_us"], 10000)
+            self.assertEqual(sum(durations), 10000)
+        cfg["compute_model"].pop("decode_mode")
+        self.assertEqual(MODULE.Model(cfg).decode_compute([state()])[0]["compute_us"], 10000)
+
+    def test_distinct_first_and_resident_timings_take_max_not_sum(self):
+        cfg = self.config()
+        cfg["timing"].update(first_decode_step_us=15000, decode_us_per_token=7000)
+        model = MODULE.Model(cfg)
+        for members, expected in (([state(token=0)], 15000), ([state(token=5)], 7000),
+                                  ([state(token=0), state(1, token=5)], 15000)):
+            self.assertEqual(model.decode_compute(members)[0]["compute_us"], expected)
+        cfg["compute_model"]["decode_mode"] = "invalid"
+        with self.assertRaisesRegex(ValueError, "decode_mode"):
+            MODULE.Model(cfg)
+
+    def test_fixed_cli_override_works_with_prefill_flops(self):
+        with tempfile.TemporaryDirectory(prefix="decode-fixed-cli-") as folder:
+            root = Path(folder)
+            trace = root / "trace.jsonl"
+            trace.write_text(json.dumps(dict(request_id=0, timestamp=0, input_length=1,
+                                             output_length=2, hash_ids=["a"])) + "\n")
+            args = [TOOLS / "mooncake_trace_to_dag_v15.py", trace, "--config",
+                    TOOLS / "mooncake_pd_config_v15_glm51.json", "--decode-ms-per-token", "7",
+                    "--out-dir", root, "--no-progress"]
+            DecodeTraceTest.run_command(args)
+            rows = read_csv(root / "decode_compute.csv")
+            self.assertEqual([row["compute_us"] for row in rows], ["7000", "7000"])
+            summary = json.loads((root / "summary.json").read_text())
+            self.assertEqual(summary["decode_first_step_us"], 7000)
+            self.assertEqual(summary["decode_compute_mode"], "legacy")
+            self.assertIn("glm51", summary["prefill_compute_model"])
 
 
 class DecodeTraceTest(unittest.TestCase):
@@ -186,22 +235,21 @@ class DecodeTraceTest(unittest.TestCase):
         for batch in batches:
             compute = [row for row in mapping if row["batch_id"] == batch["batch_id"]
                        and row["task_type"] in {"DECODE_LAYER", "DECODE_STEP_COMPUTE"}]
-            self.assertEqual(len(compute), 1 if batch["compute_granularity"] == "step" else 78)
-            self.assertEqual(sum(int(row["delay"][:-2]) for row in compute), int(batch["compute_us"]))
+            self.assertFalse(compute)  # Compute survives in DAG/detail, not traffic.
+            dag_compute = [row for row in read_csv(self.root / "task_dag.csv")
+                           if row["batch_id"] == batch["batch_id"] and row["task_type"] == "DECODE_STEP_COMPUTE"]
+            self.assertEqual(len(dag_compute), 1)
+            self.assertEqual(int(dag_compute[0]["duration_us"]), int(batch["compute_us"]))
             detail = [row for row in layers if row["batch_id"] == batch["batch_id"]]
             self.assertEqual(sum(int(row["layer_compute_us"]) for row in detail), int(batch["compute_us"]))
-            final = compute[-1]["phaseId"]
-            for write in mapping:
-                if write["batch_id"] == batch["batch_id"] and write["task_type"] == "DECODE_WRITE":
-                    self.assertEqual(write["dependOnPhases"], final)
-                    self.assertEqual(write["delay"], "0us")
         self.assertTrue(all(not row["request_id"] for row in mapping if row["task_type"] == "DECODE_STEP_COMPUTE"))
         self.assertFalse(any(row["task_type"] == "STORAGE_TO_D" and row["batch_id"] == batches[-1]["batch_id"]
                              for row in mapping))
         summary = json.loads((self.root / "traffic_summary.json").read_text())
-        self.assertEqual(summary["decode_step_compute_phases"], 4)
+        self.assertEqual(summary["decode_step_compute_phases"], 0)
+        self.assertEqual(summary["folded_decode_compute_tasks"], 4)
         self.assertEqual(summary.get("decode_layer_compute_phases", 0), 0)
-        self.assertEqual(summary["decode_compute_phases"], 4)
+        self.assertEqual(summary["decode_compute_phases"], 0)
         dag_summary = json.loads((self.root / "summary.json").read_text())
         self.assertEqual(dag_summary["decode_compute_model"], "glm51-mla-dsa-moe-decode-flops-v1")
         self.assertEqual(dag_summary["decode_merged_steps"], 4)
@@ -256,6 +304,7 @@ class DecodeFinalWriteBoundaryTest(unittest.TestCase):
     def run_case(self, root, tokens, kv_bytes, divisor=1):
         cfg = copy.deepcopy(CONFIG)
         cfg["compute_model"]["mode"] = "legacy"
+        cfg["compute_model"]["decode_mode"] = "legacy"
         cfg["model"].update(num_layers=3, kv_bytes_per_token=kv_bytes)
         config = root / "config.json"
         config.write_text(json.dumps(cfg))
@@ -306,7 +355,10 @@ class DecodeFinalWriteBoundaryTest(unittest.TestCase):
                 remaining -= chunk
             rows = [row for row in mapping if int(row["tp_rank"]) == rank]
             self.assertEqual([int(traffic[row["taskId"]]["dataSize(Byte)"]) for row in rows], chunks)
-            self.assertTrue(all(row["delay"] == "0us" for row in rows))
+            self.assertTrue(all(row["delay"] == f"{tokens * 10000}us" for row in rows))
+            read_phases = {row["phaseId"] for row in read_csv(root / "mapping.csv")
+                           if row["task_type"] == "STORAGE_TO_D"}
+            self.assertTrue(all(set(row["dependOnPhases"].split()) == read_phases for row in rows))
             sizes.extend(chunks)
         self.assertEqual(len(mapping), len(sizes))
 

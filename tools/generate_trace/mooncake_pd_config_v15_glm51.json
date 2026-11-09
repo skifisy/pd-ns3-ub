@@ -181,6 +181,7 @@
   "pd_analysis": {},
   "compute_model": {
     "mode": "glm51_flops",
+    "decode_mode": "legacy",
     "npu_model": "Ascend 950PR 32-AI-subsystem",
     "npu_precision": "INT8",
     "npu_peak_ops_per_sec": 919000000000000.0,

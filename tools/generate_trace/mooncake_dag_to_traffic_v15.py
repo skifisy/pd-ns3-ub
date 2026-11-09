@@ -6,8 +6,10 @@ Prefill preserves all required predecessor phases
 (AND semantics). Decode keeps offline batches and request-wave/per-rank
 grouping for writes. Every input Read waits only for its own Prefill final phase.
 All initial Reads of a Decode batch share one completion phase, across requests,
-layers, blocks and TP ranks. One DECODE_STEP_COMPUTE TIMER waits for that entire
-Read phase and the preceding Decode Compute, using exact AND dependencies.
+layers, blocks and TP ranks. Decode Compute stays in the logical DAG but is
+folded into downstream network delay; no Decode TIMER rows are emitted.
+All required predecessor phases are retained. Unequal accumulated lags require
+conservative one-delay padding (or rejection with --timing-policy error).
 Decode Read delay
 is storage latency only; batch-start forecasts are not replay constraints.
 
@@ -39,7 +41,7 @@ UINT32_MAX = (1 << 32) - 1
 SCHEMA = "v12-revised-stable-worker-unlimited"
 V14_SCHEMA = "v14-domain-serial-batch-tp-sharded"
 LOGICAL_SCHEMA = "v14-domain-serial-batch-tp-logical"
-VERSION = "v15-prefill-traffic-debug-decode-read-all-20261105-v8"
+VERSION = "v15-prefill-traffic-debug-decode-folded-compute-20261109-v10"
 
 PREFILL_TASK_TYPES = frozenset({
     "P_BATCH_BEGIN", "P_LAYER_START", "PREFILL_LAYER", "P_LAYER_READY",
@@ -93,7 +95,7 @@ def validate_decode_metadata(row):
         if stage in {"DECODE_LAYER", "STORAGE_TO_D"}:
             integer(row.get("layer_index"), "Decode layer_index")
         if stage in {"DECODE_LAYER", "DECODE_STEP_COMPUTE"}:
-            integer(row.get("src_node") or row.get("d_node"), "Decode TIMER sourceNode (src_node/d_node)")
+            integer(row.get("src_node") or row.get("d_node"), "Decode DAG sourceNode (src_node/d_node)")
         if stage == "DECODE_STEP_COMPUTE" and str(row.get("layer_index")) != "-1":
             raise ValueError("whole-step Decode Compute must have layer_index=-1")
     except ValueError as exc:
@@ -384,6 +386,7 @@ class Compiler:
             " delay INTEGER NOT NULL, floor INTEGER NOT NULL);"
             "CREATE TABLE requests(id INTEGER PRIMARY KEY);"
             "CREATE TABLE prefill_ready(request INTEGER PRIMARY KEY, task INTEGER NOT NULL);"
+            "CREATE INDEX prefill_ready_task ON prefill_ready(task);"
             "CREATE TABLE parent_gates(id INTEGER PRIMARY KEY, parents TEXT NOT NULL);"
             "CREATE TABLE shared_groups(owner TEXT, wave TEXT, parents TEXT, form TEXT NOT NULL,"
             " PRIMARY KEY(owner, wave, parents)) WITHOUT ROWID;"
@@ -662,6 +665,15 @@ class Compiler:
                 self.prune_cache_terms -= len(old_key) + len(old_ids)
         return kept
 
+    def decode_predecessor_terms(self, tid, terms):
+        # Match input Read's existing final-Prefill-frontier convention only
+        # for a direct P_DONE predecessor. Never compact previous Decode
+        # Compute: its weighted Read dependencies must all survive folding.
+        if self.db.execute("SELECT 1 FROM prefill_ready WHERE task=?", (tid,)).fetchone():
+            frontier = max(terms, default=None, key=lambda item: item[0])
+            return [frontier] if frontier is not None else []
+        return terms
+
     def incoming(self, row):
         row["_incoming_pruned"] = False
         decode_begin = row.get("task_type") == "D_BATCH_BEGIN"
@@ -695,8 +707,9 @@ class Compiler:
                 # local/read lag shift preserves weighted dominance exactly.
                 self.seal_terms(row, found[1])
                 if decode_begin:
-                    frontier = max(found[1], default=None, key=lambda item: item[0])
-                    return 0, dict([frontier] if frontier is not None else [])
+                    # Folded Compute may refer to several independent Read
+                    # phases with different accumulated compute lags.
+                    return 0, dict(self.decode_predecessor_terms(tid, found[1]))
                 row["_incoming_pruned"] = True
                 return max(root, found[0]), dict(found[1])
         for value in values:
@@ -708,11 +721,7 @@ class Compiler:
             dep_root, dep_terms = found
             self.seal_terms(row, dep_terms)
             if decode_begin:
-                # Compact each predecessor separately, so a later-numbered
-                # Decode predecessor cannot discard another request's final
-                # Prefill Write phase. All selected frontiers remain ANDed.
-                frontier = max(dep_terms, default=None, key=lambda item: item[0])
-                dep_terms = [frontier] if frontier is not None else []
+                dep_terms = self.decode_predecessor_terms(tid, dep_terms)
             else:
                 root = max(root, dep_root)
             for pid, lag in dep_terms:
@@ -728,7 +737,7 @@ class Compiler:
         return root, terms
 
     def decode_gate(self, row, terms, local_delay=0):
-        """Exact Decode gate; every input Read selects its own Prefill frontier."""
+        """Fold Compute lags into network delay, retaining AND predecessors."""
         if row.get("task_type") == "STORAGE_TO_D":
             # Every layer Read points directly at its request's P_DONE.
             # Its last phase is the final-layer
@@ -738,16 +747,33 @@ class Compiler:
                 terms = {selected: terms[selected]}
         else:
             terms = self.prune(terms)
-        if any(terms.values()):
-            raise ValueError("Decode needs explicit Compute TIMERs; regenerate task_dag.csv")
         parents = tuple(sorted(terms))
         if not parents:
             raise ValueError("Decode task needs a completion dependency; regenerate task_dag.csv")
-        floor = max(self.phase_floor(pid) for pid in parents) + local_delay
-        return parents, local_delay, floor, False
+        lags = set(terms.values())
+        delay = max(lags) + local_delay
+        approximate = len(lags) > 1
+        if approximate:
+            # Nine-column traffic has only one delay after the AND barrier:
+            # max(F_i + lag_i) cannot in general equal max(F_i) + delay.
+            # Keep every phase, pad conservatively, and expose the approximation.
+            # --max-phase must not silently discard a Decode predecessor.
+            detail = dict(request_id=row["request_id"], dag_task_id=row["task_id"],
+                          task_type=row["task_type"],
+                          dependency_lags={str(p): delay_text(terms[p]) for p in parents},
+                          native_delay=delay_text(delay),
+                          reason="folded Decode compute has unequal predecessor lags")
+            if self.args.timing_policy == "error":
+                raise ValueError("native one-delay format cannot represent folded Decode exactly: "
+                                 + json.dumps(detail) + "; use --timing-policy conservative")
+            self.counts["decode_padded_network_tasks"] += 1
+            if len(self.examples) < 12:
+                self.examples.append(detail)
+        floor = max(self.phase_floor(pid) for pid in parents) + delay
+        return parents, delay, floor, approximate
 
     def decode_read_gate(self, row, terms):
-        """Storage-only Read delay; computation is represented by separate phases."""
+        """Storage-only Read delay; these Reads still depend on their own P_DONE."""
         configured = (row.get("storage_read_latency_us", "150")
                       if self.args.storage_read_latency_us is None
                       else self.args.storage_read_latency_us)
@@ -1083,12 +1109,8 @@ class Compiler:
                     prefill_timer = is_prefill and (
                         (kind == "COMPUTE" and stage == "PREFILL_LAYER") or
                         (kind == "TIMER" and stage == "P_BATCH_BEGIN"))
-                    decode_timer = is_decode and kind == "COMPUTE" and stage in {"DECODE_LAYER", "DECODE_STEP_COMPUTE"}
-                    if prefill_timer or decode_timer:
-                        if decode_timer:
-                            parents, timer_delay, floor, _ = self.decode_gate(row, terms, duration)
-                        else:
-                            parents, timer_delay, floor = self.prefill_gate(root, terms, duration)
+                    if prefill_timer:
+                        parents, timer_delay, floor = self.prefill_gate(root, terms, duration)
                         pid = self.next_phase
                         if pid > UINT32_MAX:
                             raise ValueError("phase ID exceeds uint32")
@@ -1102,11 +1124,7 @@ class Compiler:
                             row, request, tid, pid, parents, timer_delay, writer, mapping
                         )
                         out_form = [0, [[pid, 0]]]
-                        if decode_timer:
-                            self.counts["decode_compute_phases"] += 1
-                            self.counts["decode_step_compute_phases" if stage == "DECODE_STEP_COMPUTE"
-                                        else "decode_layer_compute_phases"] += 1
-                        elif stage == "PREFILL_LAYER":
+                        if stage == "PREFILL_LAYER":
                             self.counts["prefill_compute_phases"] += 1
                         else:
                             self.counts["prefill_control_phases"] += 1
@@ -1117,6 +1135,9 @@ class Compiler:
                             self.counts["decode_batch_forecast_releases_ignored"] += 1
                         elif is_decode:
                             terms = self.prune(terms)
+                            if kind == "COMPUTE":
+                                self.counts["folded_decode_compute_tasks"] += 1
+                                self.counts["folded_decode_compute_ns"] += duration
                         elif not is_prefill:
                             root, terms = self.normalize(
                                 root, terms, row.get("_incoming_pruned") is True
@@ -1423,9 +1444,14 @@ def convert(args):
                     ),
                     "decode_dependency_policy": (
                         "every Read waits only for its request's Prefill final phase; "
-                        "one whole-step Compute waits for previous-batch Compute and ALL input Reads; "
-                        "exact AND dependencies without max-phase pruning"
+                        "whole-step Compute folds into downstream network delay; "
+                        "retain all weighted predecessor phases without max-phase pruning; "
+                        "unequal lags are conservatively padded or rejected by timing-policy=error"
                     ),
+                    "decode_compute_phases": 0,
+                    "decode_step_compute_phases": 0,
+                    "decode_layer_compute_phases": 0,
+                    "decode_compute_representation": "network dependency delay; no Decode TIMER records",
                     "decode_read_delay_policy": "storage latency only; no inter-layer Read/Compute gating",
                     "decode_prefetch_policy": "read all input KV after own Prefill, before whole-step Compute",
                     "decode_batch_release_policy": "ignore offline D_BATCH_BEGIN release forecasts; keep completion dependencies",
@@ -1435,7 +1461,7 @@ def convert(args):
                     "traffic_bytes": compiler.counts["traffic_bytes"],
                     "network_bytes": compiler.counts["network_bytes"],
                     "dependency_policy": (
-                        "Prefill and Decode: exact AND phase dependencies; "
+                        "Prefill: exact AND; Decode: AND with folded compute delays; "
                         "every Decode Read uses its request's final Prefill phase"
                     ),
                     "storage_read_latency": ("from DAG rows" if args.storage_read_latency_us is None
@@ -1451,7 +1477,8 @@ def convert(args):
                     "approximation": (
                         "Prefill keeps explicit AND dependency sets; absolute release-floor padding is conservative; "
                         "Decode batch-start forecast releases are ignored; Read delay is storage latency only; "
-                        "Decode reads all input before one whole-step Compute TIMER"
+                        "Decode computation is folded into network delays without TIMERs; "
+                        "unequal predecessor lags use conservative padding or fail under timing-policy=error"
                     ),
                 })
                 if summary_path:
@@ -1470,8 +1497,8 @@ def convert(args):
           f"{summary.get('timer_rows', 0)} TIMER rows, "
           f"{summary.get('network_phases', 0)} network phases, "
           f"{summary.get('prefill_compute_phases', 0) + summary.get('prefill_control_phases', 0)} "
-          f"Prefill TIMER phases, {summary.get('decode_compute_phases', 0)} "
-          f"Decode Compute TIMER phases, {summary.get('requests', 0)} requests")
+          f"Prefill TIMER phases, {summary.get('folded_decode_compute_tasks', 0)} "
+          f"folded Decode Compute tasks (no Decode TIMERs), {summary.get('requests', 0)} requests")
     print(f"Wrote {debug_path}: same rows plus request_id (empty for batch-owned TIMERs)")
     if divisor != 1:
         print(f"Data sizes: ceil(each original traffic row / {divisor}), minimum 1 byte; "

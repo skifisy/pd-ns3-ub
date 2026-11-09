@@ -3,16 +3,16 @@
 
 Open-loop event scheduling. Prefill and Decode optionally use a GLM-5.1
 MLA + DSA + MoE FLOPs model (per-DP TP attention, shared EP routed experts);
-legacy timing remains available when compute_model.mode is absent/"legacy".
+Prefill uses compute_model.mode; Decode defaults to fixed timing (decode_mode=legacy).
 Decode counts one new query per request plus its current KV context. Every
-batch uses one whole-step Compute TIMER after all required input KV is read.
+batch uses one logical whole-step COMPUTE after all required input KV is read.
 New requests may read all layers after their own Prefill completes, while the
 preceding Decode step is still computing. Indexer Key Cache is assumed resident
 when FLOPs mode is used;
 its network traffic is not emitted. Expert and TP communication are not emitted.
 HBM capacity is not modelled. Network forecasts are estimates; execution ordering
-is also encoded as DAG edges. The matching V15 converter emits explicit
-Prefill layer and Decode whole-step TIMER tasks with exact dependencies.
+is also encoded as DAG edges. The matching V15 converter emits Prefill TIMERs;
+Decode computation folds into network dependency delays without TIMER rows.
 """
 
 import argparse
@@ -43,7 +43,7 @@ FIXED_P_DOMAIN_COUNT = 3
 FIXED_D_DOMAIN_COUNT = 1
 SCHEMA = "v14-domain-serial-batch-tp-logical"
 MAX_DEPENDENCY_FANIN = 512
-VERSION = "v15-decode-request-final-write-20261105-v9"
+VERSION = "v15-decode-fixed-folded-compute-20261109-v10"
 
 FLOP_METRIC_FIELDS = (
     "mla_projection_flops", "indexer_projection_flops", "indexer_score_flops",
@@ -680,7 +680,13 @@ class Model:
         }
 
     def _configure_decode_compute_model(self, settings):
-        self.decode_compute_mode = self.prefill_compute_mode
+        # Decode timing is independent of Prefill arithmetic. Fixed timing is
+        # the default; FLOPs remains an explicit opt-in for comparisons.
+        self.decode_compute_mode = str(settings.get("decode_mode", "legacy")).lower()
+        if self.decode_compute_mode not in {"legacy", "glm51_flops"}:
+            raise ValueError("compute_model.decode_mode must be legacy or glm51_flops")
+        if self.decode_compute_mode == "glm51_flops" and self.prefill_compute_mode != "glm51_flops":
+            raise ValueError("Decode glm51_flops requires compute_model.mode=glm51_flops")
         self.decode_compute_model_name = (
             "glm51-mla-dsa-moe-decode-flops-v1" if self.decode_compute_mode == "glm51_flops"
             else "max-member-step-baseline")
@@ -2188,11 +2194,11 @@ class BatchBuilder:
         groups = {s["d_tp_group"] for s in states}
         gi = next(iter(groups)) if len(groups) == 1 else None
         base = self.base(states, domain, gi, "D", domain.step)
-        # A batch-wide compute TIMER needs an execution context even when
-        # the EP wave contains several local TP groups.
+        # Keep a representative endpoint for DAG/debug compatibility; Decode
+        # Compute is folded into network delays by the traffic converter.
         if not base["d_node"]:
             if not states or not states[0]["d_tp_endpoints"]:
-                raise RuntimeError("Decode batch has no representative TP endpoint for TIMER tasks")
+                raise RuntimeError("Decode batch has no representative TP endpoint")
             base["d_node"], base["d_port"] = states[0]["d_tp_endpoints"][0]
         previous = domain.last_compute_done
         deps = [previous] + [s["p_done"] if s["token"] == 0 else s["last_step"] for s in states]
@@ -2504,9 +2510,7 @@ def _generate(reqs, model, out_dir, warmup=0, prewarm_ratio=0, rounding="ceil", 
             capacity_limitations="slot upper bounds only; actual occupancy is trace/schedule-dependent; HBM capacity, memory admission and expert capacity are not modelled",
             residency_definition="generator-scheduled local compute/admission slots; excludes ingress waiting queues and final-write-only draining requests; not ns-3 measured concurrency or HBM occupancy",
             dp_compute_model=(
-                "Prefill and Decode: per-DP-engine TP attention + shared EP routed experts (GLM-5.1 FLOPs)"
-                if model.prefill_compute_mode == "glm51_flops" else
-                "Prefill: unchanged v14.7 global linear duration; Decode: unchanged max-member-step formula"
+                "Prefill: " + model.prefill_compute_model_name + "; Decode: " + model.decode_compute_model_name
             ),
             prefill_max_batch=model.p_max_num_seqs, decode_max_batch=model.d_max_num_seqs,
             prefill_max_batch_tokens=None, prefill_wait_us=0,
@@ -2515,6 +2519,9 @@ def _generate(reqs, model, out_dir, warmup=0, prewarm_ratio=0, rounding="ceil", 
             avg_decode_batch=sum(builder.sizes["D"]) / len(builder.sizes["D"]) if builder.sizes["D"] else 0,
             prefill_compute_model=model.prefill_compute_model_name,
             decode_compute_model=model.decode_compute_model_name,
+            decode_compute_mode=model.decode_compute_mode,
+            decode_first_step_us=model.first_decode_step_us,
+            decode_per_token_us=model.decode_us_per_token,
             decode_compute_rows=len(builder.sizes["D"]),
             decode_layer_compute_rows=builder.decode_layer_compute_rows,
             decode_compute_detail=decode_compute_detail,
@@ -2608,7 +2615,8 @@ def generate(reqs, model, out_dir, warmup=0, prewarm_ratio=0, rounding="ceil", p
             "prefill_max_batch_tokens", "compute_concurrency", "cache_policy", "decode_tp_assignment",
             "batch_limit_scope", "prefill_dp_degree", "decode_dp_degree",
             "prefill_domain_slot_upper_bound", "decode_domain_slot_upper_bound", "dp_compute_model",
-            "prefill_compute_model", "decode_compute_model", "prefill_npu_peak_flops",
+            "prefill_compute_model", "decode_compute_model", "decode_compute_mode",
+            "decode_first_step_us", "decode_per_token_us", "prefill_npu_peak_flops",
             "prefill_npu_peak_ops_per_sec", "prefill_npu_model", "prefill_npu_precision", "prefill_npu_peak_unit",
             "prefill_npu_peak_source", "prefill_npu_peak_is_public_default",
             "prefill_compute_time_interpretation", "prefill_efficiency_assumption",
@@ -2642,7 +2650,9 @@ def main():
     parser.add_argument("--decode-scheduler", choices=("round-robin", "random", "least-load", "first-token-aware"))
     parser.add_argument("--random-seed", type=int)
     parser.add_argument("--prefill-ms-per-token", type=float)
-    parser.add_argument("--decode-ms-per-token", type=float, help="legacy Decode duration override; unavailable in glm51_flops mode")
+    parser.add_argument("--decode-ms-per-token", type=float,
+                        help="override both fixed Decode step durations in milliseconds; "
+                             "unavailable with compute_model.decode_mode=glm51_flops")
     parser.add_argument("--decode-compute-detail", choices=("none", "layer"), default="none",
                         help="always write one decode_compute.csv row per batch; layer additionally writes per-layer FLOPs detail")
     parser.add_argument("--prefill-max-batch", type=int, help="Local BS per Prefill DP engine")
@@ -2668,8 +2678,8 @@ def main():
         if args.prefill_ms_per_token is not None:
             cfg["timing"]["prefill_us_per_token"] = args.prefill_ms_per_token * 1000
         if args.decode_ms_per_token is not None:
-            if str(cfg.get("compute_model", {}).get("mode", "legacy")).lower() == "glm51_flops":
-                raise ValueError("--decode-ms-per-token conflicts with compute_model.mode=glm51_flops")
+            if str(cfg.get("compute_model", {}).get("decode_mode", "legacy")).lower() == "glm51_flops":
+                raise ValueError("--decode-ms-per-token conflicts with compute_model.decode_mode=glm51_flops")
             cfg["timing"]["decode_us_per_token"] = args.decode_ms_per_token * 1000
             cfg["timing"]["first_decode_step_us"] = args.decode_ms_per_token * 1000
         if args.max_requests is not None and args.max_requests <= 0:
