@@ -1853,6 +1853,7 @@ def load_toe(case, args):
     if case.is_baseline:
         case.capabilities["toe_summary"] = False
         return
+    bounded_epochs = {}
     path = find(case, "toe_summary.csv")
     case.capabilities["toe_summary"] = path is not None
     if path:
@@ -1863,6 +1864,7 @@ def load_toe(case, args):
                 raise ValueError("%s: epoch required" % path)
             ev = case.events.setdefault(epoch, Event(epoch))
             status = r.get("status", default="").lower()
+            bounded_epochs[epoch] = bounded_epochs.get(epoch, False) or bool(r.integer("bounded", default=0))
             t = row_time(r)
             if status in ("solved", "draining", "applied"):
                 setattr(ev, status, t)
@@ -1948,9 +1950,14 @@ def load_toe(case, args):
         if applied is not None and ev.applied is None:
             ev.applied = times.get((epoch, "applied"))
         if applied is None and ev.applied is not None:
-            applied = groups.get((epoch, "target"))
+            # A bounded execution can differ from the complete LP target.
+            applied = groups.get((epoch, "planned"))
             if applied is not None:
-                ev.circuit_source = "target_confirmed_by_applied_event"
+                ev.circuit_source = "planned_confirmed_by_applied_event"
+            elif not bounded_epochs.get(epoch, False):
+                applied = groups.get((epoch, "target"))
+                if applied is not None:
+                    ev.circuit_source = "target_confirmed_by_applied_event"
         elif applied is not None:
             ev.circuit_source = "applied_snapshot"
         if ev.applied is not None and applied is not None:

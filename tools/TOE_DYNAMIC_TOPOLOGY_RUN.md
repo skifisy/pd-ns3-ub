@@ -217,3 +217,10 @@ python3 ../tools/make_toe_local_smoke.py --case-path scratch/mooncake_pd_ocs --o
 
 本工作环境没有完整 ns-3 构建工具和运行产物：已执行端口规划回归、修改文件语法检查和 patch 应用检查；未执行此 trace 或大规模仿真。应用后先完成短 trace，再比较相同输入和参数下的 global/selective FCT。
 
+
+
+## 可选的 Prefill 拆链上限
+
+显式指定 `--toe-max-prefill-remove=2`，每轮每台 Prefill Leaf 最多拆两根旧电路。不指定则完整执行原 LP 目标；此参数只进行一次受限重配，不自动追加阶段。
+
+参数边界、算法、TE/TOE 联用、日志和验证见 [TE / TOE 每轮变化限幅](TE_TOE_CHANGE_LIMITS.md)。

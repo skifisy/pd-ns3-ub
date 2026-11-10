@@ -26,9 +26,18 @@ struct TeRouteDecision;
 class UbTeController {
 public:
     static UbTeController& Get();
-    void Configure(const std::string& casePath, double recomputeSeconds,
-                   uint32_t historyWindows, double s,
-                   const std::string& outputDir, bool debug, double maxTransitRatio = -1.0);
+    void Configure(const std::string& casePath,
+                   double recomputeSeconds,
+                   uint32_t historyWindows,
+                   double s,
+                   const std::string& outputDir,
+                   bool debug,
+                   double maxTransitRatio = -1.0,
+                   double maxWeightStep = -1.0);
+    // Preview the same publication rule using the TE history at decision time.
+    double PreviewTopologyUtilization(
+        const std::map<std::pair<uint32_t, uint32_t>, double>& capacities,
+        const std::map<std::pair<uint32_t, uint32_t>, double>& demands);
     void Disable();
     void FlushFinalWindow();
     void RefreshTopology();
@@ -101,6 +110,7 @@ private:
     uint32_t m_historyWindows = 120;
     double m_s = 0.0;
     double m_maxTransitRatio = -1.0;
+    double m_maxWeightStep = -1.0;
     uint64_t m_epoch = 0;
     std::map<std::pair<uint32_t, uint16_t>, uint32_t> m_hostPortToLeaf;
     std::map<Od, std::vector<uint16_t>> m_leafPorts;

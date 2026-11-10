@@ -113,3 +113,10 @@ epoch,time_seconds,status,src_leaf,src_port,dst_leaf,dst_port
 ```
 
 epoch 0 的 `initial` 为初始连接；后续 `retained/remove/add` 为切换计划，`applied` 为切换后经过实际 peer 验证的全部连接。超时轮的计划没有对应 `applied`，不能当成已生效。
+
+
+## 求解后受限拓扑规划
+
+可选参数 `--toe-max-prefill-remove` 在原求解之后，以交替拆建闭合组合选择满足预算、端口守恒和预测 MLU 不恶化的拓扑。目标、计划和应用结果分别记录。
+
+参数边界、算法、TE/TOE 联用、日志和验证见 [TE / TOE 每轮变化限幅](TE_TOE_CHANGE_LIMITS.md)。

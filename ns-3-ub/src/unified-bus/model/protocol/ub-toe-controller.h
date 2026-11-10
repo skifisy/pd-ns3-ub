@@ -25,11 +25,16 @@ class UbToeController
     enum class CutoverMode { DRAIN, LOSSY };
     enum class ReconfigurationMode { AUTO, GLOBAL, SELECTIVE };
     static UbToeController& Get();
-    void Configure(const std::string& casePath, Mode mode, double intervalSeconds,
-                   uint32_t historyWindows, double mluSlack, double switchDelaySeconds,
+    void Configure(const std::string& casePath,
+                   Mode mode,
+                   double intervalSeconds,
+                   uint32_t historyWindows,
+                   double mluSlack,
+                   double switchDelaySeconds,
                    const std::string& outputDir,
                    ReconfigurationMode reconfigurationMode = ReconfigurationMode::AUTO,
-                   CutoverMode cutoverMode = CutoverMode::DRAIN);
+                   CutoverMode cutoverMode = CutoverMode::DRAIN,
+                   int32_t maxPrefillRemove = -1);
     void Disable();
     bool Enabled() const { return m_enabled; }
     bool LossyCutoverEnabled() const { return m_enabled && m_cutoverMode == CutoverMode::LOSSY; }
@@ -80,6 +85,9 @@ class UbToeController
     double m_intervalSeconds{300.0};
     uint32_t m_historyWindows{20};
     double m_mluSlack{0.01};
+    int32_t m_maxPrefillRemove{-1};
+    double m_currentPredictedMlu{0};
+    double m_plannedPredictedMlu{0};
     Time m_switchDelay{Seconds(0)};
     Time m_linkDelay{NanoSeconds(0)};
     Time m_maxLinkDelay{NanoSeconds(0)};
