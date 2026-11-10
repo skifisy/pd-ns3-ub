@@ -98,6 +98,8 @@ build_lib(
 	model/protocol/ub-transport.h
 	model/protocol/ub-retrans.h
 	model/protocol/ub-routing-process.h
+	model/protocol/ub-te-weight-step.h
+	model/protocol/ub-toe-bounded.h
 	model/protocol/ub-te-solver.h
 	model/protocol/ub-toe-solver.h
 	model/protocol/ub-te-controller.h

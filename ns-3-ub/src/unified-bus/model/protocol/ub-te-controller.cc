@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-only
 #include "ns3/ub-te-controller.h"
+#include "ub-te-weight-step.h"
 #include "ns3/ub-network-address.h"
 #include "ns3/ub-port.h"
 #include "ns3/ub-replay-logger.h"
@@ -16,6 +17,8 @@
 #include <filesystem>
 #include <fstream>
 #include <iomanip>
+#include <iostream>
+#include <stdexcept>
 #include <limits>
 #include <sstream>
 #include <utility>
@@ -360,7 +363,10 @@ void UbTeController::RefreshTopology()
         (void)edge;
         std::sort(ports.begin(), ports.end());
     }
-    m_policy.clear();
+    if (m_maxWeightStep < 0)
+    {
+        m_policy.clear();
+    }
     m_flowTransit.clear();
     m_loggedTransitFlows.clear();
 }
@@ -386,10 +392,19 @@ void UbTeController::ResumeAfterAbortedTopologyChange()
                                             &UbTeController::Recompute, this);
 }
 
-void UbTeController::Configure(const std::string& casePath, double recomputeSeconds,
-                               uint32_t historyWindows, double s, const std::string& outputDir,
-                               bool debug, double maxTransitRatio)
+void
+UbTeController::Configure(const std::string& casePath,
+                          double recomputeSeconds,
+                          uint32_t historyWindows,
+                          double s,
+                          const std::string& outputDir,
+                          bool debug,
+                          double maxTransitRatio,
+                          double maxWeightStep)
 {
+    NS_ABORT_MSG_IF(!std::isfinite(maxWeightStep) ||
+                        (maxWeightStep != -1.0 && (maxWeightStep < 0 || maxWeightStep > 1)),
+                    "--te-max-weight-step must be in [0,1] or -1 (disabled API default)");
     NS_ABORT_MSG_IF(recomputeSeconds <= 0 || historyWindows == 0 || s < 0 || s > 1 ||
                         !std::isfinite(maxTransitRatio) ||
                         (maxTransitRatio != -1.0 &&
@@ -458,6 +473,7 @@ void UbTeController::Configure(const std::string& casePath, double recomputeSeco
     m_historyWindows = historyWindows;
     m_s = s;
     m_maxTransitRatio = maxTransitRatio;
+    m_maxWeightStep = maxWeightStep;
     m_debug.store(debug, std::memory_order_relaxed);
     if (m_debug.load(std::memory_order_relaxed))
     {
@@ -471,6 +487,17 @@ void UbTeController::Configure(const std::string& casePath, double recomputeSeco
             << "window,src_leaf,dst_leaf,bytes,complete\n";
         std::ofstream(m_outputDir + "/prediction.csv")
             << "epoch,src_leaf,dst_leaf,bps\n";
+        if (m_maxWeightStep >= 0)
+        {
+            std::ofstream(m_outputDir + "/target_weights.csv")
+                << "epoch,src_leaf,dst_leaf,transit_leaf,weight\n";
+            std::ofstream(m_outputDir + "/weight_step.csv")
+                << "epoch,src_leaf,dst_leaf,target_distance,published_distance,forced_distance,"
+                   "status\n";
+            std::ofstream(m_outputDir + "/publication_summary.csv")
+                << "epoch,status,lp_min_mlu,published_predicted_mlu,old_transit_ratio,"
+                   "published_transit_ratio,max_weight_step\n";
+        }
         std::ofstream(m_outputDir + "/weights.csv")
             << "epoch,src_leaf,dst_leaf,transit_leaf,weight\n";
         std::ofstream(m_outputDir + "/link_bytes.csv")
@@ -532,6 +559,7 @@ void UbTeController::Configure(const std::string& casePath, double recomputeSeco
                 << " interval_seconds=" << m_intervalSeconds
                 << " history_windows=" << m_historyWindows << " s=" << m_s
                 << " max_transit_ratio=" << m_maxTransitRatio
+                << " max_weight_step=" << m_maxWeightStep
                 << " host_ports=" << m_hostPortToLeaf.size() << " leaves=" << leaves.size()
                 << " directed_logical_edges=" << m_leafPorts.size()
                 << " directed_circuits=" << circuitCount;
@@ -963,6 +991,66 @@ int UbTeController::SelectLeafOutPort(uint32_t leaf,
     return chosen;
 }
 
+double
+UbTeController::PreviewTopologyUtilization(const std::map<Od, double>& capacities,
+                                           const std::map<Od, double>& demands)
+{
+    const uint64_t complete =
+        static_cast<uint64_t>(std::floor((Simulator::Now().GetSeconds() + 1e-9) / 30.0));
+    const auto observed = SnapshotDemandWindows();
+    std::map<Od, uint64_t> maxima;
+    std::map<Od, PathWeights> old;
+    {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        old = m_policy;
+        for (const TrafficWindows* windows :
+             {static_cast<const TrafficWindows*>(&m_history), &observed})
+        {
+            for (const auto& [window, traffic] : *windows)
+            {
+                if (window < complete && window + m_historyWindows >= complete)
+                {
+                    for (const auto& [od, bytes] : traffic)
+                    {
+                        maxima[od] = std::max(maxima[od], bytes);
+                    }
+                }
+            }
+        }
+    }
+    std::map<Od, double> prediction;
+    for (const auto& [od, bytes] : maxima)
+    {
+        prediction[od] = 8.0 * bytes / 30.0;
+    }
+    std::map<Od, PathWeights> target;
+    try
+    {
+        if (!prediction.empty())
+        {
+            target = UbTeSolver::Solve(capacities, prediction, m_s, m_maxTransitRatio).policy;
+        }
+    }
+    catch (const std::exception&)
+    {
+        if (m_maxWeightStep < 0)
+        {
+            throw;
+        }
+    }
+    auto next = target;
+    if (m_maxWeightStep >= 0)
+    {
+        next = UbTeWeightStep::Prepare(old, target, capacities, m_maxWeightStep);
+        if (m_maxTransitRatio >= 0 &&
+            UbTeWeightStep::TransitRatio(next, capacities, prediction) > m_maxTransitRatio + 1e-8)
+        {
+            next = UbTeWeightStep::Prepare(old, {}, capacities, m_maxWeightStep);
+        }
+    }
+    return UbTeWeightStep::Mlu(next, capacities, demands);
+}
+
 void UbTeController::Recompute()
 {
     if (!m_enabled.load(std::memory_order_acquire) ||
@@ -1055,84 +1143,136 @@ void UbTeController::Recompute()
     bool solverRan = false;
     double maxUtilization = 0.0;
     size_t policyPathCount = 0;
+    std::map<Od, PathWeights> old;
+    {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        old = m_policy;
+    }
+    std::map<Od, PathWeights> target;
+    std::string publicationStatus = "published";
     if (!maxima.empty())
     {
         solverRan = true;
-        UbTeSolver::Result result;
         try
         {
-            result = UbTeSolver::Solve(m_edgeCapacityBps, predictedDemands, m_s,
-                                       m_maxTransitRatio);
+            auto result =
+                UbTeSolver::Solve(m_edgeCapacityBps, predictedDemands, m_s, m_maxTransitRatio);
+            target = std::move(result.policy);
+            maxUtilization = result.minMaxUtilization;
+            for (const auto& [od, bytes] : maxima)
+            {
+                (void)bytes;
+                if (!target.count(od))
+                {
+                    throw std::runtime_error("TE solver omitted active OD");
+                }
+                double sum = 0;
+                for (const auto& [path, weight] : target.at(od))
+                {
+                    (void)path;
+                    sum += weight;
+                }
+                if (!std::isfinite(sum) || std::abs(sum - 1) > 1e-6)
+                {
+                    throw std::runtime_error("TE solver weights do not sum to one");
+                }
+                target.at(od) = UbTeWeightStep::Normalize(target.at(od));
+            }
         }
         catch (const std::exception& error)
         {
-            NS_ABORT_MSG("Jupiter TE in-process LP solver failed: " << error.what());
-        }
-        std::map<Od, PathWeights> next = std::move(result.policy);
-        maxUtilization = result.minMaxUtilization;
-        policyPathCount = result.pathCount;
-        std::ofstream weights;
-        std::ofstream currentPolicy;
-        if (m_debug.load(std::memory_order_relaxed))
-        {
-            weights.open(m_outputDir + "/weights.csv", std::ios::app);
-            weights << std::setprecision(17);
-            currentPolicy.open(m_outputDir + "/policy-current.csv");
-            currentPolicy << std::setprecision(17)
-                          << "src_leaf,dst_leaf,transit_leaf,weight\n";
-        }
-        for (const auto& [od, bytes] : maxima)
-        {
-            (void)bytes;
-            const auto policy = next.find(od);
-            NS_ABORT_MSG_IF(policy == next.end(),
-                            "Jupiter TE solver omitted active OD " << od.first << "->"
-                                                                    << od.second);
-            double totalWeight = 0.0;
-            for (const auto& [mid, weight] : policy->second)
+            if (m_maxWeightStep < 0)
             {
-                (void)mid;
-                totalWeight += weight;
+                NS_ABORT_MSG("Jupiter TE in-process LP solver failed: " << error.what());
             }
-            NS_ABORT_MSG_IF(!std::isfinite(totalWeight) ||
-                                std::abs(totalWeight - 1.0) > 1e-6,
-                            "Jupiter TE weights do not sum to one for "
-                                << od.first << "->" << od.second << ": " << totalWeight);
-            // Eliminate harmless solver/CSV round-off before publishing.
-            for (auto& [mid, weight] : policy->second)
+            target.clear();
+            publicationStatus = "held-solver-error";
+            std::clog << "TE retained policy: " << error.what() << std::endl;
+        }
+    }
+    auto next = target;
+    double oldRatio = 0;
+    if (m_maxWeightStep >= 0)
+    {
+        const auto repaired = UbTeWeightStep::Prepare(old, {}, m_edgeCapacityBps, m_maxWeightStep);
+        oldRatio = UbTeWeightStep::TransitRatio(repaired, m_edgeCapacityBps, predictedDemands);
+        next = UbTeWeightStep::Prepare(old, target, m_edgeCapacityBps, m_maxWeightStep);
+        if (m_maxTransitRatio >= 0 &&
+            UbTeWeightStep::TransitRatio(next, m_edgeCapacityBps, predictedDemands) >
+                m_maxTransitRatio + 1e-8)
+        {
+            next = repaired;
+            publicationStatus = oldRatio > m_maxTransitRatio + 1e-8
+                                    ? "held-cap-conflict-old-over-cap"
+                                    : "held-cap-conflict";
+            std::clog << "TE " << publicationStatus << " at epoch " << epoch << std::endl;
+        }
+    }
+    for (const auto& [od, paths] : next)
+    {
+        (void)od;
+        policyPathCount += paths.size();
+    }
+    if (m_debug.load(std::memory_order_relaxed))
+    {
+        std::ofstream weights(m_outputDir + "/weights.csv", std::ios::app);
+        std::ofstream currentPolicy(m_outputDir + "/policy-current.csv");
+        weights << std::setprecision(17);
+        currentPolicy << std::setprecision(17) << "src_leaf,dst_leaf,transit_leaf,weight\n";
+        for (const auto& [od, paths] : next)
+        {
+            for (const auto& [path, weight] : paths)
             {
-                weight /= totalWeight;
-                if (m_debug.load(std::memory_order_relaxed))
+                weights << epoch << ',' << od.first << ',' << od.second << ',' << path << ','
+                        << weight << '\n';
+                currentPolicy << od.first << ',' << od.second << ',' << path << ',' << weight
+                              << '\n';
+            }
+        }
+        std::ofstream summary(m_outputDir + "/solver-summary-current.csv");
+        summary << std::setprecision(17) << "active_od_count,path_count,min_max_utilization\n";
+        if (solverRan)
+        {
+            summary << predictedDemands.size() << ',' << policyPathCount << ',' << maxUtilization
+                    << '\n';
+        }
+        if (m_maxWeightStep >= 0)
+        {
+            std::ofstream targets(m_outputDir + "/target_weights.csv", std::ios::app);
+            std::ofstream steps(m_outputDir + "/weight_step.csv", std::ios::app);
+            targets << std::setprecision(17);
+            steps << std::setprecision(17);
+            for (const auto& [od, paths] : target)
+            {
+                for (const auto& [path, weight] : paths)
                 {
-                    weights << epoch << ',' << od.first << ',' << od.second << ',' << mid << ','
+                    targets << epoch << ',' << od.first << ',' << od.second << ',' << path << ','
                             << weight << '\n';
-                    currentPolicy << od.first << ',' << od.second << ',' << mid << ',' << weight
-                                  << '\n';
                 }
             }
+            for (const auto& [od, paths] : next)
+            {
+                const auto previous =
+                    old.count(od) ? old.at(od) : UbTeWeightStep::Fallback(od, m_edgeCapacityBps);
+                const auto base = UbTeWeightStep::Repair(od, previous, m_edgeCapacityBps);
+                const auto goal = target.count(od) ? target.at(od) : base;
+                steps << epoch << ',' << od.first << ',' << od.second << ','
+                      << UbTeWeightStep::Distance(base, goal) << ','
+                      << UbTeWeightStep::Distance(base, paths) << ','
+                      << UbTeWeightStep::Distance(previous, base) << ',' << publicationStatus
+                      << '\n';
+            }
+            std::ofstream(m_outputDir + "/publication_summary.csv", std::ios::app)
+                << std::setprecision(17) << epoch << ',' << publicationStatus << ','
+                << maxUtilization << ','
+                << UbTeWeightStep::Mlu(next, m_edgeCapacityBps, predictedDemands) << ',' << oldRatio
+                << ',' << UbTeWeightStep::TransitRatio(next, m_edgeCapacityBps, predictedDemands)
+                << ',' << m_maxWeightStep << '\n';
         }
-        if (m_debug.load(std::memory_order_relaxed))
-        {
-            std::ofstream(m_outputDir + "/solver-summary-current.csv")
-                << std::setprecision(17)
-                << "active_od_count,path_count,min_max_utilization\n"
-                << predictedDemands.size() << ',' << policyPathCount << ',' << maxUtilization
-                << '\n';
-        }
-        std::lock_guard<std::mutex> lock(m_mutex);
-        m_policy.swap(next); // atomic policy publication; existing flows stay pinned.
     }
-    else
     {
         std::lock_guard<std::mutex> lock(m_mutex);
-        m_policy.clear();
-        if (m_debug.load(std::memory_order_relaxed))
-        {
-            std::ofstream(m_outputDir + "/policy-current.csv")
-                << "src_leaf,dst_leaf,transit_leaf,weight\n";
-            std::ofstream(m_outputDir + "/solver-summary-current.csv")
-                << "active_od_count,path_count,min_max_utilization\n";
-        }
+        m_policy.swap(next); // Atomic publication; retain the existing per-flow routing cache.
     }
     if (m_debug.load(std::memory_order_relaxed))
     {

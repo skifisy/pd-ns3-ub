@@ -179,6 +179,27 @@ class UnifiedTests(unittest.TestCase):
         self.assertIn("summary_render",report["stage_seconds"])
         self.assertTrue(report["cases"][1]["capabilities"]["dynamic_physical_snapshots"])
 
+    def test_bounded_plan_fallback_never_uses_full_lp_target(self):
+        directory = self.root / "toe/toe"
+        path = directory / "toe_topology.csv"
+        rows = read_csv(path)
+        header = list(rows[0])
+        rows = [r for r in rows if not (r["epoch"] == "1" and r["status"] == "applied")]
+        planned = {(37,53):5, (37,54):3, (38,53):3, (38,54):5}
+        rows += [dict(zip(header, [1,1,"planned",a,b,n,n*400])) for (a,b),n in planned.items()]
+        write_csv(path, header, [[r[k] for k in header] for r in rows])
+        path = directory / "toe_summary.csv"
+        summary = read_csv(path)
+        header = list(summary[0]) + ["bounded"]
+        write_csv(path, header, [[r[k] for k in header[:-1]] + [1] for r in summary])
+        (directory / "toe_circuits.csv").unlink()
+        status, out, log = self.run_combined("--trace-mode", "off")
+        self.assertEqual(status, 0, log)
+        changes = [r for r in read_csv(out/"topology_changes.csv") if r["epoch"] == "1"]
+        self.assertEqual(len(changes),4)
+        # Full target differs by two per pair, bounded plan by one.
+        self.assertTrue(all(abs(int(r["delta_circuits"])) == 1 for r in changes))
+
     def test_streamed_focus_equals_explicit_summary_only(self):
         status,out,log = self.run_combined()
         self.assertEqual(status,0,log)

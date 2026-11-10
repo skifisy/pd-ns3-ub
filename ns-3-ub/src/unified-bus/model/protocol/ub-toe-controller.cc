@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-only
 #include "ub-toe-controller.h"
+#include "ub-toe-bounded.h"
 
 #include "ns3/fatal-error.h"
 #include "ns3/ipv4-address.h"
@@ -21,6 +22,8 @@
 #include <filesystem>
 #include <fstream>
 #include <iomanip>
+#include <limits>
+#include <set>
 #include <sstream>
 #include <stdexcept>
 
@@ -59,21 +62,27 @@ void UbToeController::Disable()
     m_drainPolls = 0;
 }
 
-void UbToeController::Configure(const std::string& casePath,
-                                Mode mode,
-                                double intervalSeconds,
-                                uint32_t historyWindows,
-                                double mluSlack,
-                                double switchDelaySeconds,
-                                const std::string& outputDir,
-                                ReconfigurationMode reconfigurationMode,
-                                CutoverMode cutoverMode)
+void
+UbToeController::Configure(const std::string& casePath,
+                           Mode mode,
+                           double intervalSeconds,
+                           uint32_t historyWindows,
+                           double mluSlack,
+                           double switchDelaySeconds,
+                           const std::string& outputDir,
+                           ReconfigurationMode reconfigurationMode,
+                           CutoverMode cutoverMode,
+                           int32_t maxPrefillRemove)
 {
     NS_ABORT_MSG_IF(!UbToeSolver::IsAvailable(), "ToE requires the in-process HiGHS backend");
     NS_ABORT_MSG_IF(intervalSeconds <= 0 || historyWindows == 0 || mluSlack < 0 ||
                         mluSlack > 1 || switchDelaySeconds < 0,
                     "invalid ToE configuration");
+    NS_ABORT_MSG_IF(maxPrefillRemove < -1 || maxPrefillRemove > 64,
+                    "--toe-max-prefill-remove must be in [0,64] or -1 (disabled API default)");
     Disable();
+    m_maxPrefillRemove = maxPrefillRemove;
+    m_currentPredictedMlu = m_plannedPredictedMlu = 0;
     m_cutoverMode = cutoverMode;
     m_casePath = casePath;
     m_mode = mode;
@@ -149,7 +158,9 @@ void UbToeController::Configure(const std::string& casePath,
     m_enabled = true;
     std::ofstream(m_outputDir + "/toe_summary.csv")
         << "epoch,time_seconds,status,min_mlu,applied_mlu_bound,changed_circuits,"
-           "solver_optimal,drain_seconds,pause_seconds\n";
+           "solver_optimal,drain_seconds,pause_seconds"
+        << (m_maxPrefillRemove >= 0 ? ",bounded,current_predicted_mlu,planned_predicted_mlu" : "")
+        << '\n';
     std::ofstream(m_outputDir + "/toe_topology.csv")
         << "epoch,time_seconds,status,src_leaf,dst_leaf,circuit_count,"
            "capacity_gbps_per_direction\n";
@@ -163,6 +174,14 @@ void UbToeController::Configure(const std::string& casePath,
         << "epoch,decision_seconds,src_leaf,dst_leaf,demand_bps,demand_gbps,"
            "peak_window_bytes,latest_window_bytes,latest_gbps,sample_window_seconds,"
            "history_windows,completed_window,matrix_complete,matrix_kind\n";
+    if (m_maxPrefillRemove >= 0)
+    {
+        std::ofstream(m_outputDir + "/toe_bounded.csv")
+            << "epoch,current_predicted_mlu,planned_predicted_mlu,target_changed_circuits,"
+               "planned_changed_circuits,candidate_evaluations,search_limited,status\n";
+        std::ofstream(m_outputDir + "/toe_prefill_remove.csv")
+            << "epoch,status,leaf,removed_circuits,max_prefill_remove\n";
+    }
     if (LossyCutoverEnabled())
     {
         Simulator::ScheduleDestroy(&UbToeController::WriteCutoverDrops, this);
@@ -245,6 +264,7 @@ void UbToeController::Recompute()
     std::map<Od, double> demand;
     for (const auto& [od, bytes] : peak) demand[od] = 8.0 * bytes / 30.0;
     ++m_epoch;
+    m_currentPredictedMlu = m_plannedPredictedMlu = std::numeric_limits<double>::quiet_NaN();
     // Export the exact directional input to Solve before drain/apply changes time.
     // Complete matrices include explicit zeros; OD peaks need not share a window.
     {
@@ -288,7 +308,69 @@ void UbToeController::Recompute()
                                          m_mluSlack, 30.0);
         WriteSummary(result, "solved");
         WriteTopology(result.topology, "target");
-        if (result.changedCircuits > 0) BeginReconfiguration(result.topology, result);
+        if (m_maxPrefillRemove >= 0)
+        {
+            const auto current = CurrentTopology();
+            std::set<uint32_t> prefill;
+            // Fixed Mooncake role mapping already required by Configure().
+            for (uint32_t leaf = 37; leaf <= 48; ++leaf)
+            {
+                prefill.insert(leaf);
+            }
+            auto evaluate = [&](const UbToeBounded::Topology& topology) {
+                if (m_mode == Mode::ONLY)
+                {
+                    return UbToeBounded::EcmpMlu(topology, m_groups, demand);
+                }
+                std::map<Od, double> capacities;
+                for (const auto& [pair, count] : topology)
+                {
+                    capacities[pair] = 400e9 * count;
+                    capacities[{pair.second, pair.first}] = 400e9 * count;
+                }
+                return UbTeController::Get().PreviewTopologyUtilization(capacities, demand);
+            };
+            // WCMP previews solve the existing TE LP, so bound their total cost.
+            const auto bounded = UbToeBounded::Select(current,
+                                                      result.topology,
+                                                      prefill,
+                                                      static_cast<uint32_t>(m_maxPrefillRemove),
+                                                      evaluate,
+                                                      m_mode == Mode::ONLY ? 20000 : 128);
+            m_currentPredictedMlu = bounded.beforeMlu;
+            m_plannedPredictedMlu = bounded.plannedMlu;
+            WriteTopology(bounded.topology, "planned");
+            std::ofstream(m_outputDir + "/toe_bounded.csv", std::ios::app)
+                << std::setprecision(17) << m_epoch << ',' << bounded.beforeMlu << ','
+                << bounded.plannedMlu << ',' << result.changedCircuits << ','
+                << bounded.changedCircuits << ',' << bounded.evaluations << ','
+                << bounded.searchLimited << ','
+                << (bounded.changedCircuits ? "planned" : "no-acceptable-move") << '\n';
+            std::ofstream removals(m_outputDir + "/toe_prefill_remove.csv", std::ios::app);
+            for (uint32_t leaf : prefill)
+            {
+                removals << m_epoch << ",planned," << leaf << ','
+                         << (bounded.removed.count(leaf) ? bounded.removed.at(leaf) : 0) << ','
+                         << m_maxPrefillRemove << '\n';
+            }
+            auto execution = result;
+            execution.topology = bounded.topology;
+            execution.changedCircuits = bounded.changedCircuits;
+            // LP bounds remain target attributes, never claims about this plan.
+            if (execution.changedCircuits > 0)
+            {
+                BeginReconfiguration(execution.topology, execution);
+            }
+            else
+            {
+                WriteTopology(current, "applied");
+                WriteSummary(execution, "bounded-no-change");
+            }
+        }
+        else if (result.changedCircuits > 0)
+        {
+            BeginReconfiguration(result.topology, result);
+        }
         else WriteTopology(result.topology, "applied");
     }
     catch (const std::exception& error)
@@ -307,10 +389,14 @@ void UbToeController::Recompute()
 void UbToeController::WriteSummary(const UbToeSolver::Result& result, const char* status)
 {
     std::ofstream output(m_outputDir + "/toe_summary.csv", std::ios::app);
-    output << std::setprecision(12)
-        << m_epoch << ',' << Simulator::Now().GetSeconds() << ',' << status << ','
-        << result.minMaxUtilization << ',' << result.appliedUtilizationBound << ','
-        << result.changedCircuits << ',' << result.optimal << ",0,0\n";
+    output << std::setprecision(12) << m_epoch << ',' << Simulator::Now().GetSeconds() << ','
+           << status << ',' << result.minMaxUtilization << ',' << result.appliedUtilizationBound
+           << ',' << result.changedCircuits << ',' << result.optimal << ",0,0";
+    if (m_maxPrefillRemove >= 0)
+    {
+        output << ",1," << m_currentPredictedMlu << ',' << m_plannedPredictedMlu;
+    }
+    output << '\n';
 }
 
 void UbToeController::WriteTopology(const UbToeSolver::Topology& topology,
@@ -652,13 +738,35 @@ void UbToeController::ApplyReconfiguration()
     WriteTopology(CurrentTopology(), "applied");
     WriteCircuits(m_currentCircuits, "applied");
     WriteReconfiguration("applied");
+    if (m_maxPrefillRemove >= 0)
+    {
+        // Physical planner's removed endpoints are authoritative after readback.
+        std::map<uint32_t, uint32_t> removed;
+        for (const auto& circuit : m_plan.removed)
+        {
+            ++removed[circuit.a];
+            ++removed[circuit.b];
+        }
+        std::ofstream output(m_outputDir + "/toe_prefill_remove.csv", std::ios::app);
+        for (uint32_t leaf = 37; leaf <= 48; ++leaf)
+        {
+            NS_ABORT_MSG_IF(removed[leaf] > static_cast<uint32_t>(m_maxPrefillRemove),
+                            "physical TOE plan exceeds Prefill removal budget");
+            output << m_epoch << ",applied," << leaf << ',' << removed[leaf] << ','
+                   << m_maxPrefillRemove << '\n';
+        }
+    }
     std::ofstream summary(m_outputDir + "/toe_summary.csv", std::ios::app);
-    summary << std::setprecision(12)
-        << m_epoch << ',' << Simulator::Now().GetSeconds() << ",applied,"
-        << m_pendingResult.minMaxUtilization << ',' << m_pendingResult.appliedUtilizationBound
-        << ',' << m_pendingResult.changedCircuits << ',' << m_pendingResult.optimal << ','
-        << (m_drainFinish - m_pauseStart).GetSeconds() << ','
-        << (Simulator::Now() - m_pauseStart).GetSeconds() << '\n';
+    summary << std::setprecision(12) << m_epoch << ',' << Simulator::Now().GetSeconds()
+            << ",applied," << m_pendingResult.minMaxUtilization << ','
+            << m_pendingResult.appliedUtilizationBound << ',' << m_pendingResult.changedCircuits
+            << ',' << m_pendingResult.optimal << ',' << (m_drainFinish - m_pauseStart).GetSeconds()
+            << ',' << (Simulator::Now() - m_pauseStart).GetSeconds();
+    if (m_maxPrefillRemove >= 0)
+    {
+        summary << ",1," << m_currentPredictedMlu << ',' << m_plannedPredictedMlu;
+    }
+    summary << '\n';
     if (m_timeoutEvent.IsPending()) Simulator::Cancel(m_timeoutEvent);
     if (LossyCutoverEnabled())
     {

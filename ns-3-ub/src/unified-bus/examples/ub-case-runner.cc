@@ -20,6 +20,8 @@
 #include <array>
 #include <cctype>
 #include <chrono>
+#include <cmath>
+#include <stdexcept>
 #include <cstdlib>
 #include <ctime>
 #include <filesystem>
@@ -64,6 +66,8 @@ struct QuickExampleOptions
     uint32_t teHistoryWindows = 120;
     double teS = 0.0;
     double teMaxTransitRatio = -1.0; // Disabled unless explicitly configured.
+    std::string teMaxWeightStepArg;
+    double teMaxWeightStep = -1.0;
     std::string teOutput;
     std::string toeMode = "off";
     std::string toeReconfiguration = "auto";
@@ -71,6 +75,8 @@ struct QuickExampleOptions
     double toeRecomputeSeconds = 300.0;
     uint32_t toeHistoryWindows = 20;
     double toeMluSlack = 0.01;
+    std::string toeMaxPrefillRemoveArg;
+    int32_t toeMaxPrefillRemove = -1;
     double toeSwitchDelaySeconds = 0.0;
     std::string toeOutput;
     bool replay = false;
@@ -510,10 +516,14 @@ BuildScenarioFromConfig(const QuickExampleOptions& options, const RuntimeSelecti
     if (useJupiterTe) {
         NS_ABORT_MSG_IF(runtime.enableMpi,
                         "Jupiter TE requires a single MPI rank for a globally observed matrix");
-        UbTeController::Get().Configure(configPath, options.teRecomputeSeconds,
-                                        options.teHistoryWindows, options.teS,
-                                        options.teOutput, options.debugTe,
-                                        options.teMaxTransitRatio);
+        UbTeController::Get().Configure(configPath,
+                                        options.teRecomputeSeconds,
+                                        options.teHistoryWindows,
+                                        options.teS,
+                                        options.teOutput,
+                                        options.debugTe,
+                                        options.teMaxTransitRatio,
+                                        options.teMaxWeightStep);
     }
     if (options.toeMode == "only" || options.toeMode == "te") {
         const auto toeAppDefaults = CreateObject<UbApp>();
@@ -528,15 +538,19 @@ BuildScenarioFromConfig(const QuickExampleOptions& options, const RuntimeSelecti
         UbToeController::Get().Configure(
             configPath,
             options.toeMode == "only" ? UbToeController::Mode::ONLY
-                                        : UbToeController::Mode::WITH_TE,
-            options.toeRecomputeSeconds, options.toeHistoryWindows, options.toeMluSlack,
-            options.toeSwitchDelaySeconds, options.toeOutput,
+                                      : UbToeController::Mode::WITH_TE,
+            options.toeRecomputeSeconds,
+            options.toeHistoryWindows,
+            options.toeMluSlack,
+            options.toeSwitchDelaySeconds,
+            options.toeOutput,
             options.toeReconfiguration == "global" ? UbToeController::ReconfigurationMode::GLOBAL
-                : options.toeReconfiguration == "selective"
-                    ? UbToeController::ReconfigurationMode::SELECTIVE
-                    : UbToeController::ReconfigurationMode::AUTO,
+            : options.toeReconfiguration == "selective"
+                ? UbToeController::ReconfigurationMode::SELECTIVE
+                : UbToeController::ReconfigurationMode::AUTO,
             options.toeCutover == "lossy" ? UbToeController::CutoverMode::LOSSY
-                                         : UbToeController::CutoverMode::DRAIN);
+                                          : UbToeController::CutoverMode::DRAIN,
+            options.toeMaxPrefillRemove);
     }
     UbUtils::Get()->CreateTp(configPath + "/transport_channel.csv");
     UbUtils::Get()->TopoTraceConnect();
@@ -585,6 +599,8 @@ BuildScenarioFromConfig(const QuickExampleOptions& options, const RuntimeSelecti
         replay.Metadata("toe_recompute_seconds", precise(options.toeRecomputeSeconds));
         replay.Metadata("toe_history_windows", std::to_string(options.toeHistoryWindows));
         replay.Metadata("toe_mlu_slack", precise(options.toeMluSlack));
+        replay.Metadata("te_max_weight_step", precise(options.teMaxWeightStep));
+        replay.Metadata("toe_max_prefill_remove", std::to_string(options.toeMaxPrefillRemove));
         replay.Metadata("toe_switch_delay_seconds", precise(options.toeSwitchDelaySeconds));
         replay.Metadata("toe_reconfiguration", options.toeReconfiguration);
         replay.Metadata("dependency_visibility_delay_argument", options.dependencyVisibilityDelay);
@@ -896,6 +912,9 @@ QuickExampleOptions ParseOptions(int argc, char* argv[])
     cmd.AddValue("te-max-transit-ratio",
                  "Aggregate optional-transit demand ratio in [0,1] (-1 disables; default -1)",
                  options.teMaxTransitRatio);
+    cmd.AddValue("te-max-weight-step",
+                 "Optional per-OD probability migration limit per TE epoch in [0,1] (default off)",
+                 options.teMaxWeightStepArg);
     cmd.AddValue("te-output", "Debug directory for TE audit logs and CSV files",
                  options.teOutput);
     cmd.AddValue("toe-mode", "Dynamic topology mode: off, only (ECMP), or te (ToE + Jupiter TE)",
@@ -911,6 +930,10 @@ QuickExampleOptions ParseOptions(int argc, char* argv[])
     cmd.AddValue("toe-mlu-slack",
                  "Relative MLU slack allowed to reduce topology changes (default 0.01)",
                  options.toeMluSlack);
+    cmd.AddValue(
+        "toe-max-prefill-remove",
+        "Optional old OCS circuits removed per Prefill leaf per epoch in [0,64] (default off)",
+        options.toeMaxPrefillRemoveArg);
     cmd.AddValue("toe-switch-delay-seconds", "OCS reconnection delay (default 0s)",
                  options.toeSwitchDelaySeconds);
     cmd.AddValue("toe-output", "ToE audit output directory", options.toeOutput);
@@ -926,6 +949,69 @@ QuickExampleOptions ParseOptions(int argc, char* argv[])
                      "Required unified-bus case directory when --case-path is omitted",
                      positionalCasePath);
     cmd.Parse(argc, argv);
+    try
+    {
+        // Strings distinguish an omitted option from an explicit zero, and
+        // reject explicit negative values instead of treating them as disabled.
+        bool weightSpecified = false, removalSpecified = false;
+        for (int i = 1; i < argc; ++i)
+        {
+            const std::string arg(argv[i]);
+            if (arg == "--te-max-weight-step" || arg.rfind("--te-max-weight-step=", 0) == 0 ||
+                arg == "-te-max-weight-step" || arg.rfind("-te-max-weight-step=", 0) == 0)
+            {
+                weightSpecified = true;
+            }
+            if (arg == "--toe-max-prefill-remove" ||
+                arg.rfind("--toe-max-prefill-remove=", 0) == 0 ||
+                arg == "-toe-max-prefill-remove" || arg.rfind("-toe-max-prefill-remove=", 0) == 0)
+            {
+                removalSpecified = true;
+            }
+        }
+        if (weightSpecified)
+        {
+            size_t parsed = 0;
+            options.teMaxWeightStep = std::stod(options.teMaxWeightStepArg, &parsed);
+            if (parsed != options.teMaxWeightStepArg.size() ||
+                !std::isfinite(options.teMaxWeightStep) || options.teMaxWeightStep < 0 ||
+                options.teMaxWeightStep > 1)
+            {
+                throw std::invalid_argument(
+                    "--te-max-weight-step requires a finite value in [0,1]");
+            }
+            if (!options.jupiterTe && options.toeMode != "te")
+            {
+                throw std::invalid_argument("--te-max-weight-step requires TE or --toe-mode=te");
+            }
+        }
+        if (removalSpecified)
+        {
+            const auto& arg = options.toeMaxPrefillRemoveArg;
+            if (arg.empty() || arg.find_first_not_of("0123456789") != std::string::npos)
+            {
+                throw std::invalid_argument(
+                    "--toe-max-prefill-remove requires an integer in [0,64]");
+            }
+            const auto value = std::stoull(arg);
+            if (value > 64)
+            {
+                throw std::invalid_argument(
+                    "--toe-max-prefill-remove requires an integer in [0,64]");
+            }
+            options.toeMaxPrefillRemove = static_cast<int32_t>(value);
+            if (options.toeMode == "off")
+            {
+                throw std::invalid_argument(
+                    "--toe-max-prefill-remove requires --toe-mode=only or te");
+            }
+        }
+    }
+    catch (const std::exception& error)
+    {
+        std::cerr << "Invalid TE/TOE change limit: " << error.what() << std::endl;
+        std::exit(EXIT_FAILURE);
+    }
     // Shell-style quoting is for human reproducibility only; this string is
     // recorded as CSV metadata and is never executed by the simulator.
     for (int i = 0; i < argc; ++i)

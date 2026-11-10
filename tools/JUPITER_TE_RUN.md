@@ -486,3 +486,10 @@ python3 tools/analyze_jupiter_te.py \
 限制作用于 LP 预测流量分配，实测字节比例会受到预测误差、flow 大小和已有转发行为影响，不能将该值当作实测流量的硬上限。初始化调试日志记录 `max_transit_ratio`，replay 元数据记录 `te_max_transit_ratio`。参数不会自动开启 TE；需使用现有 TE 启用方式。
 
 建议与 `--te-s=0` 配合：较大的 `te-s` 会限制直达份额，与较小中转预算组合时可能不可行，求解器会报错，不会悄悄取消上限。离线参考求解器使用 `--max-transit-ratio=0.10`，默认也为 `-1`。
+
+
+## 可选的每轮 WCMP 权重变化上限
+
+显式指定 `--te-max-weight-step=0.10`，将每个 OD 每轮总概率迁移量限制为 0.10；不指定则保持原行为。建议配合 `--debug-te=1` 查看实际发布与完整目标。
+
+参数边界、算法、TE/TOE 联用、日志和验证见 [TE / TOE 每轮变化限幅](TE_TOE_CHANGE_LIMITS.md)。
