@@ -1,28 +1,42 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""Compare ECMP/TE/TOE and two-layer EPS request metrics and per-flow FCT.
+r"""Compare request metrics and per-flow FCT across TE/TOE variants and baselines.
 
 Example:
-  python3 stat_request_compare_v4.py --case /data/CASE \
-      --ecmp-dir /data/ecmp --te-dir /data/te --toe-dir /data/toe \
+  python3 stat_request_compare_v10.py --case /data/CASE \
+      --ecmp-dir /data/ecmp \
+      --te-dir /data/transit_010 --te-dir /data/transit_020 \
+      --toe-dir /data/slack_020 --toe-dir /data/slack_050 \
       --eps2-dir /data/eps_2layer \
       --data-size-divisor 100000 --num-layers 78 --out-dir /data/compare
 
 Common inputs:
   CASE/task_dag.csv, CASE/traffic.csv (or --mapping), CASE/requests_debug.csv
-Per-scheme input: DIR/output/task_statistics.csv (or --*-statistics override).
+Repeat --te-dir or --toe-dir once per tuning directory. When a family has
+multiple directory inputs, each run is named te_<directory> or toe_<directory>.
+Duplicate automatic names get numeric suffixes. For explicit names, repeat
+--te NAME=DIR_OR_CSV or --toe NAME=DIR_OR_CSV.
+DIR contains output/task_statistics.csv or task_statistics.csv.
+With zero or one directory per family, --*-statistics supplies or overrides
+the original run. With multiple directories, it adds a separate original run.
+Select at least two runs. All runs must use the common traffic taskId mapping.
+Prefill read/write times use observed network flows in task_statistics.csv.
+The traffic.csv + DAG path provides their taskIds without a mapping file.
 Outputs (exactly two CSVs):
-  request_comparison.csv: one row/request, 4 shared + 5 columns/scheme.
-  summary_comparison.csv: four scheme rows, TTFT P50/P90/P99/P999,
-      mean TPS, mean logical-read throughput, flow FCT P50/P90/P99/P999.
+  request_comparison.csv: one row/request with timing metrics for each run.
+  summary_comparison.csv: one row per run, TTFT P50/P90/P99/P999,
+      mean TPS, mean logical-read throughput, flow FCT quantiles.
 
-Definitions, consistent with the supplied v15 stat_request_latency.py:
-  TTFT_ms = (P-A)/1000, where A=timestamp_us, and P=max start of all
-      last-layer PREFIX_STORE_WRITE shards in the Prefill batch (or max end
-      of PREFIX_READ in a full-hit, no-write batch). This is a Prefill-ready
-      proxy, NOT an observed first-token time.
+Definitions:
+  TTFT_ms = (earliest final-layer PREFIX_STORE_WRITE start
+             - earliest PREFIX_READ start across layers) / 1000.
+      Both starts are in microseconds, from task_statistics.csv for the same
+      request. Each endpoint requires valid starts for its expected shards.
+      TTFT is blank if either endpoint is unavailable. A started write can
+      contribute while its completion is still pending.
   decode_load_compute_ms = (L-R)/1000, where R=min start of STORAGE_TO_D
-      and L=max start of last-token DECODE_WRITE shards.
+      and L=max start of last-token DECODE_WRITE shards, or of the single
+      request-final output write in the current generator.
   TPS = output_tokens * 1000 / decode_load_compute_ms.
   completion_time_ms = (max completion - min start) / 1000, among ALL
       expected request network flows, valid ONLY if all are completed.
@@ -31,7 +45,7 @@ Definitions, consistent with the supplied v15 stat_request_latency.py:
       not physical-link throughput when traffic sizes were scaled.
   FCT_ms = (taskCompletesTime(us) - taskStartTime(us))/1000 for EACH
       individually completed flow. FCT percentiles use taskIds completed
-      in ALL FOUR schemes; no request aggregation for FCT.
+      in all selected runs; no request aggregation for FCT.
 
 Summary request metrics each use their own common-valid request subset.
 Exact percentiles use linear interpolation at (n-1)*p. FCT percentiles
@@ -41,6 +55,8 @@ waits). They retain their index positions but are excluded from ALL network
 metrics, expected/completed-flow counts and FCT intersections. Statistics may
 include or omit TIMER rows. Network rows are streamed against the DAG's exact
 TP-rank/uint32-chunk expansion; TIMERs never consume that expansion.
+Both legacy per-token writes and current request-final writes are validated.
+Each Decode Compute TIMER is one whole-model token step, not a network flow.
 Task-to-request mapping/index is built only once (4 bytes per traffic task).
 Only standard library modules are required.
 """
@@ -54,27 +70,34 @@ import math
 import mmap
 import os
 from pathlib import Path
+import re
 import struct
 import sys
 import tempfile
 
-VERSION = "v15-four-scheme-request-and-fct-v4-20261105"
-# Source snapshot: https://github.com/skifisy/pd-ns3-ub/commit/7a41f3456c0f65c8831c68f070cfbb7aa57cd682
-# Compared against tools/mooncake_{trace_to_dag,dag_to_traffic}_v15.py.
-# All five flag bits are already used. Reserve the all-ones index as a TIMER.
+VERSION = "v15-multi-dir-prefill-ttft-v10-20261113"
+# Source snapshot: https://github.com/skifisy/pd-ns3-ub/commit/634eb5557a93ee68e7ddd6c6397c867af4923e1b
+# Compared against tools/generate_trace/mooncake_{trace_to_dag,dag_to_traffic}_v15.py.
+# Reserve the all-ones index for TIMERs. Network indexes pack a request slot and flags.
 TIMER_CODE = (1 << 32) - 1
-MAPPING_TIMER_TYPES = frozenset({"P_BATCH_BEGIN", "PREFILL_LAYER", "DECODE_READ_COMPUTE_WAIT"})
+MAPPING_TIMER_TYPES = frozenset({
+    "P_BATCH_BEGIN", "PREFILL_LAYER", "DECODE_READ_COMPUTE_WAIT",
+    "DECODE_LAYER", "DECODE_STEP_COMPUTE",
+})
 U32_MAX = (1 << 32) - 1
 SCHEMA = "v14-domain-serial-batch-tp-logical"
 OPS = {"PREFIX_READ": "URMA_READ", "STORAGE_TO_D": "URMA_READ",
        "PREFIX_STORE_WRITE": "URMA_WRITE", "DECODE_WRITE": "URMA_WRITE"}
-LOAD, FIRST, LAST, P_LAST, P_READ = 1, 2, 4, 8, 16
-# eps2 represents the additional two-layer electrical packet-switch topology/case.
-SCHEMES = ("ecmp", "te", "toe", "eps2")
-SCHEME_LABELS = {"ecmp": "ECMP", "te": "TE", "toe": "TOE", "eps2": "EPS-2L"}
+LOAD, FIRST, LAST = 1, 2, 4
+PREFILL_READ, PREFILL_FINAL_WRITE = 8, 16
+FLAG_BITS = 5
+FLAG_MASK = (1 << FLAG_BITS) - 1
+LEGACY_LABELS = {"ecmp": "ECMP", "te": "TE", "toe": "TOE", "eps2": "EPS-2L"}
 COMMON_FIELDS = ("request_id", "prefill_read_bytes", "decode_read_bytes", "output_tokens")
 SCHEME_FIELDS = ("ttft_ms", "decode_load_compute_ms", "tps",
-                 "completion_time_ms", "throughput_gbps")
+                 "completion_time_ms", "throughput_gbps",
+                 "prefill_first_read_start_ms", "prefill_final_write_start_ms")
+QUANTILES = (("p50", .5), ("p90", .9), ("p99", .99), ("p999", .999))
 SUMMARY_FIELDS = (
     "scheme", "common_valid_ttft_requests", "common_valid_tps_requests",
     "common_valid_throughput_requests", "common_valid_completion_requests",
@@ -83,7 +106,6 @@ SUMMARY_FIELDS = (
     "avg_tps", "avg_throughput_gbps",
     "fct_p50_ms", "fct_p90_ms", "fct_p99_ms", "fct_p999_ms",
 )
-QUANTILES = (("p50", .5), ("p90", .9), ("p99", .99), ("p999", .999))
 
 
 def csv_header(path):
@@ -121,8 +143,8 @@ def nonnegative_int(text, label):
 
 def load_request_metadata(path):
     requests, seen, batches = {}, set(), {}
-    cols = ["request_id", "phase", "timestamp_us", "output_length", "p_batch_id", "miss_tokens"]
-    for rid, phase, arrival, output, batch_id, miss in csv_rows(path, cols):
+    cols = ["request_id", "phase", "output_length", "p_batch_id"]
+    for rid, phase, output, batch_id in csv_rows(path, cols):
         rid = nonnegative_int(rid, "request_id")
         if rid in seen:
             raise ValueError(f"requests_debug 的请求编号重复：{rid}")
@@ -132,19 +154,16 @@ def load_request_metadata(path):
         if phase.upper() != "FORMAL":
             raise ValueError(f"requests_debug 未知 phase：{phase!r}")
         batch_id = nonnegative_int(batch_id, "requests_debug.p_batch_id")
-        if batch_id not in batches:
-            batches[batch_id] = dict(batch_id=batch_id, miss_tokens=0, has_writes=False,
-                                     layer_count=None, expected_last=0, expected_reads=0,
-                                     read_layers=0)
-        batch = batches[batch_id]
-        batch["miss_tokens"] += nonnegative_int(miss, "requests_debug.miss_tokens")
+        batch = batches.setdefault(batch_id, dict(batch_id=batch_id, layer_count=None))
         requests[rid] = dict(
-            request_id=rid, arrival_us=nonnegative_int(arrival, "timestamp_us"),
+            request_id=rid,
             output_tokens=nonnegative_int(output, "output_length"), dag_write_tokens=0,
+            decode_write_mode=None,
             expected=[0, 0, 0], expected_flows=0,
+            expected_prefill_reads=0, expected_prefill_final_writes=0,
             prefill_read_bytes=0, decode_read_bytes=0, prefill_batch=batch,
         )
-    return requests, batches
+    return requests
 
 
 def original_expansion(dag, requests, num_layers=None):
@@ -152,6 +171,7 @@ def original_expansion(dag, requests, num_layers=None):
     cols = ["task_id", "request_id", "task_class", "task_type", "execution_schema",
             "bytes", "tp_members", "tp_degree", "decode_token_index", "batch_id", "layer_index"]
     header = csv_header(dag)
+    write_metadata = [key for key in ("block_index", "kv_extent_kind") if key in header]
     has_count = "layer_count" in header
     if not has_count and num_layers is None:
         last_layer = -1
@@ -162,7 +182,8 @@ def original_expansion(dag, requests, num_layers=None):
             raise ValueError("紧凑 DAG 无 P 层计算记录；请用 --num-layers 指定模型层数")
         num_layers = last_layer + 1
     previous = -1
-    for row in csv_rows(dag, cols + (["layer_count"] if has_count else [])):
+    required = cols + (["layer_count"] if has_count else []) + write_metadata
+    for row in csv_rows(dag, required):
         tid, rid, kind, stage, schema, total, raw, degree, token, batch_id, layer = row[:11]
         layer_count = row[11] if has_count else str(num_layers)
         tid = nonnegative_int(tid, "DAG task_id")
@@ -197,12 +218,9 @@ def original_expansion(dag, requests, num_layers=None):
                 raise ValueError("同一 P batch 模型层数不一致")
             batch["layer_count"] = count
             if stage == "PREFIX_READ":
-                flags |= P_READ
-                batch["read_layers"] |= 1 << index
-            else:
-                batch["has_writes"] = True
-                if index == count - 1:
-                    flags |= P_LAST
+                flags = PREFILL_READ
+            elif index == count - 1:
+                flags = PREFILL_FINAL_WRITE
         if stage == "STORAGE_TO_D":
             if state["output_tokens"] == 0:
                 raise ValueError(f"请求 {rid} output_length=0 却有 Decode 读取")
@@ -211,9 +229,27 @@ def original_expansion(dag, requests, num_layers=None):
             flags = LOAD
         elif stage == "DECODE_WRITE":
             token = nonnegative_int(token, "DECODE_WRITE decode_token_index")
-            if token != state["dag_write_tokens"] or token >= state["output_tokens"]:
-                raise ValueError(f"请求 {rid} 的 Decode token 索引不连续、重复或超出 output_length")
-            state["dag_write_tokens"] += 1
+            metadata = dict(zip(write_metadata, row[len(cols) + int(has_count):]))
+            final_write = (metadata.get("block_index") == "-1" or
+                           metadata.get("kv_extent_kind") == "all_output_tokens_all_layers")
+            if final_write:
+                # Compact v9 DAGs use block_index=-1; full DAGs also carry
+                # kv_extent_kind. Never infer aggregation just from a missing
+                # token prefix, which could instead be a truncated old DAG.
+                if (state["dag_write_tokens"] != 0 or state["decode_write_mode"] is not None or
+                        state["output_tokens"] == 0 or token != state["output_tokens"] - 1 or
+                        layer != "-1" or
+                        ("block_index" in metadata and metadata["block_index"] != "-1") or
+                        metadata.get("kv_extent_kind", "") not in ("", "all_output_tokens_all_layers")):
+                    raise ValueError(f"请求 {rid} 的统一 Decode 写回重复、混用或与末 token/范围不符")
+                state["decode_write_mode"] = "request-final"
+                state["dag_write_tokens"] = state["output_tokens"]
+            else:
+                if (state["decode_write_mode"] not in (None, "per-token") or
+                        token != state["dag_write_tokens"] or token >= state["output_tokens"]):
+                    raise ValueError(f"请求 {rid} 的 Decode token 索引不连续、重复或超出 output_length")
+                state["decode_write_mode"] = "per-token"
+                state["dag_write_tokens"] += 1
             if token == 0:
                 flags |= FIRST
             if token == state["output_tokens"] - 1:
@@ -257,16 +293,16 @@ def build_index(args, requests, index_path):
     """
     states = list(requests.values())
     slots = {s["request_id"]: i for i, s in enumerate(states)}
-    # 27 request-slot bits + 5 flags, reserving UINT32_MAX for TIMER.
-    if len(states) >= (1 << 27):
+    if len(states) >= (1 << (32 - FLAG_BITS)):
         raise ValueError("请求数量超出保留 TIMER 标记后的 4 字节任务索引范围")
     expansion = original_expansion(args.task_dag, requests, args.num_layers)
     cols = (["taskId", "request_id", "task_type", "decode_token_index", "batch_id", "layer_index"]
             if args.mapping else ["taskId", "sourceNode", "destNode", "opType", "dataSize(Byte)"])
+    header = set(csv_header(args.mapping)) if args.mapping else set()
     # The repository's full mapping also carries these exact identity fields.
     # Accept legacy mappings without them; validate every available field.
-    optional = ([key for key in ("dag_task_id", "tp_rank", "chunk_index", "chunk_count")
-                 if key in csv_header(args.mapping)] if args.mapping else [])
+    optional = [key for key in ("dag_task_id", "tp_rank", "chunk_index", "chunk_count")
+                if key in header]
     first, task_count, flow_count, timer_count = None, 0, 0, 0
     timer_types = Counter()
     with index_path.open("wb", buffering=1024 * 1024) as out:
@@ -293,7 +329,7 @@ def build_index(args, requests, index_path):
                         if rid not in requests:
                             raise ValueError(f"Decode TIMER 请求 {rid} 不在正式请求中")
                     elif row[1]:
-                        raise ValueError(f"taskId={tid} Prefill TIMER 应为 batch 任务，request_id 应为空")
+                        raise ValueError(f"taskId={tid} 计算/批次 TIMER 的 request_id 应为空")
                     timer_types[stage] += 1
             else:
                 src_actual = nonnegative_int(row[1], "sourceNode")
@@ -314,7 +350,7 @@ def build_index(args, requests, index_path):
                 if args.mapping:
                     if nonnegative_int(row[1], "mapping request_id") != rid:
                         raise ValueError(f"taskId={tid} 的 mapping 请求归属与 DAG 不匹配")
-                    if tuple(row[2:]) != (stage, token, batch_id, layer):
+                    if tuple(row[2:6]) != (stage, token, batch_id, layer):
                         raise ValueError(f"taskId={tid} mapping 类型/token/batch/层编号与 DAG 不匹配")
                     expected_ids = dict(dag_task_id=dag_tid, tp_rank=rank,
                                         chunk_index=chunk_index, chunk_count=chunk_count)
@@ -329,15 +365,14 @@ def build_index(args, requests, index_path):
                                          "请核对数据来源及 --data-size-divisor")
                 state = requests[rid]
                 state["expected_flows"] += 1
+                if flags == PREFILL_READ:
+                    state["expected_prefill_reads"] += 1
+                elif flags == PREFILL_FINAL_WRITE:
+                    state["expected_prefill_final_writes"] += 1
                 for i, flag in enumerate((LOAD, FIRST, LAST)):
                     if flags & flag:
                         state["expected"][i] += 1
-                batch = state["prefill_batch"]
-                if flags & P_LAST:
-                    batch["expected_last"] += 1
-                if flags & P_READ:
-                    batch["expected_reads"] += 1
-                code = (slots[rid] << 5) | flags
+                code = (slots[rid] << FLAG_BITS) | flags
                 flow_count += 1
             buf.append(code)
             task_count += 1
@@ -358,25 +393,18 @@ def build_index(args, requests, index_path):
     print(f"公共索引：任务 {task_count:,}，网络流 {flow_count:,}，"
           f"排除 TIMER {timer_count:,}" +
           (f"（{dict(timer_types)}）" if timer_types else ""), file=sys.stderr)
+    print(f"Decode 写回模式：{dict(Counter(s['decode_write_mode'] or 'no-output' for s in states))}",
+          file=sys.stderr)
     return states, first, task_count, flow_count
 
 
 def new_scheme_states(base_states):
-    batch_map = {}
-    states = []
-    for src in base_states:
-        meta = src["prefill_batch"]
-        bid = meta["batch_id"]
-        if bid not in batch_map:
-            batch_map[bid] = dict(observed_last=0, last_write_start=None,
-                                  completed_reads=0, read_end=None)
-        states.append(dict(
-            observed=[0, 0, 0], completed_flows=0, statistics_rows=0,
-            first_flow_start=None, last_flow_finish=None,
-            read_start=None, first_ready=None, last_ready=None,
-            batch=batch_map[bid],
-        ))
-    return states
+    return [dict(observed=[0, 0, 0], completed_flows=0, statistics_rows=0,
+                 first_flow_start=None, last_flow_finish=None,
+                 read_start=None, first_ready=None, last_ready=None,
+                 started_prefill_reads=0, started_prefill_final_writes=0,
+                 prefill_read_start=None, prefill_final_write_start=None)
+            for _ in base_states]
 
 
 def scan_scheme(name, stat_path, base_states, first, count, flow_count, index_path, fct_path, progress_every):
@@ -407,7 +435,7 @@ def scan_scheme(name, stat_path, base_states, first, count, flow_count, index_pa
                 if code == TIMER_CODE:
                     counters["timer_rows"] += 1
                     continue
-                state, flags = states[code >> 5], code & 31
+                state, flags = states[code >> FLAG_BITS], code & FLAG_MASK
                 state["statistics_rows"] += 1
                 counters["rows"] += 1
                 try:
@@ -419,8 +447,7 @@ def scan_scheme(name, stat_path, base_states, first, count, flow_count, index_pa
                 if not valid:
                     counters["invalid_time_rows"] += 1
                     continue
-                # Started-but-not-completed flows may be used as v15 computation proxies,
-                # but must NOT be counted as completed or included in FCT.
+                # Start-based metrics can use pending flows. FCT requires completion.
                 if fin == 0:
                     counters["started_unfinished"] += 1
                 else:
@@ -428,6 +455,14 @@ def scan_scheme(name, stat_path, base_states, first, count, flow_count, index_pa
                     counters["completed_flows"] += 1
                     valid_fct[byte] |= bit
                     struct.pack_into("=d", fct, pos * 8, (fin - st) / 1000.0)
+                if flags == PREFILL_READ:
+                    state["started_prefill_reads"] += 1
+                    old = state["prefill_read_start"]
+                    state["prefill_read_start"] = st if old is None else min(old, st)
+                elif flags == PREFILL_FINAL_WRITE:
+                    state["started_prefill_final_writes"] += 1
+                    old = state["prefill_final_write_start"]
+                    state["prefill_final_write_start"] = st if old is None else min(old, st)
                 old = state["first_flow_start"]
                 state["first_flow_start"] = st if old is None else min(old, st)
                 if fin > 0:
@@ -436,15 +471,6 @@ def scan_scheme(name, stat_path, base_states, first, count, flow_count, index_pa
                 for i, flag in enumerate((LOAD, FIRST, LAST)):
                     if flags & flag:
                         state["observed"][i] += 1
-                batch = state["batch"]
-                if flags & P_LAST:
-                    batch["observed_last"] += 1
-                    old = batch["last_write_start"]
-                    batch["last_write_start"] = st if old is None else max(old, st)
-                if flags & P_READ and fin > 0:
-                    batch["completed_reads"] += 1
-                    old = batch["read_end"]
-                    batch["read_end"] = fin if old is None else max(old, fin)
                 if flags & LOAD:
                     old = state["read_start"]
                     state["read_start"] = st if old is None else min(old, st)
@@ -471,23 +497,19 @@ def compute_scheme_metrics(name, base_states, states):
     for meta, state in zip(base_states, states):
         rid = meta["request_id"]
         result = {field: None for field in SCHEME_FIELDS}
+        read_start = state["prefill_read_start"]
+        write_start = state["prefill_final_write_start"]
+        read_observed = read_start is not None and (
+            state["started_prefill_reads"] == meta["expected_prefill_reads"])
+        write_observed = write_start is not None and (
+            state["started_prefill_final_writes"] == meta["expected_prefill_final_writes"])
+        if read_observed:
+            result["prefill_first_read_start_ms"] = read_start / 1000.0
+        if write_observed:
+            result["prefill_final_write_start_ms"] = write_start / 1000.0
+        if read_observed and write_observed and write_start >= read_start:
+            result["ttft_ms"] = (write_start - read_start) / 1000.0
         if meta["output_tokens"] > 0:
-            batch_meta, batch_stat = meta["prefill_batch"], state["batch"]
-            p_done = None
-            if batch_meta["expected_last"] > 0:
-                if batch_stat["observed_last"] == batch_meta["expected_last"]:
-                    p_done = batch_stat["last_write_start"]
-                    counters["p_last_write"] += 1
-            elif (batch_meta["miss_tokens"] == 0 and not batch_meta["has_writes"] and
-                  batch_meta["expected_reads"] > 0 and batch_meta["layer_count"] is not None and
-                  batch_meta["read_layers"] == (1 << batch_meta["layer_count"]) - 1 and
-                  batch_stat["completed_reads"] == batch_meta["expected_reads"]):
-                p_done = batch_stat["read_end"]
-                counters["p_full_hit"] += 1
-            if p_done is not None:
-                if p_done < meta["arrival_us"]:
-                    raise ValueError(f"{name} 请求 {rid} 的 P 估算时刻早于到达；请核对时间原点")
-                result["ttft_ms"] = (p_done - meta["arrival_us"]) / 1000.0
             ready = [expected > 0 and expected == observed
                      for expected, observed in zip(meta["expected"], state["observed"])]
             if ready[0] and ready[2]:
@@ -574,56 +596,41 @@ def sorted_run_percentiles(paths, n):
             for name, (lo, hi, w) in targets.items()}
 
 
-def common_fct_percentiles(valid_bitmaps, fct_paths, task_count, temp_dir, chunk_size):
-    """All-scheme valid taskId intersection, exact external-memory FCT quantiles."""
-    if not all(len(bits) == (task_count + 7) // 8 for bits in valid_bitmaps):
-        raise ValueError("FCT 位图长度不一致")
-    run_paths = [[] for _ in SCHEMES]
-    buffers = [[] for _ in SCHEMES]
-    common_count = 0
-
-    def flush_runs():
-        for i, values in enumerate(buffers):
-            if not values:
-                continue
-            values.sort()
-            path = temp_dir / f"fct_{SCHEMES[i]}_{len(run_paths[i]):05d}.bin"
-            with path.open("wb", buffering=1024 * 1024) as out:
-                array("d", values).tofile(out)
-            run_paths[i].append(path)
-            values.clear()
-
-    handles = [path.open("rb") for path in fct_paths]
-    mmaps = []
-    try:
-        mmaps = [mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ) if task_count else None
-                 for f in handles]
-        for byte_idx, packed in enumerate(zip(*valid_bitmaps)):
-            # Keep only flows that completed validly in every compared scheme.
-            mask = packed[0]
-            for bitmap_byte in packed[1:]:
-                mask &= bitmap_byte
-            while mask:
-                bit = mask & -mask
-                pos = (byte_idx << 3) + (bit.bit_length() - 1)
-                if pos < task_count:
-                    for i in range(len(SCHEMES)):
-                        buffers[i].append(struct.unpack_from("=d", mmaps[i], pos * 8)[0])
-                    common_count += 1
-                    if len(buffers[0]) >= chunk_size:
-                        flush_runs()
-                mask ^= bit
-        flush_runs()
-    finally:
-        for mm in mmaps:
-            if mm is not None:
-                mm.close()
-        for handle in handles:
-            handle.close()
-
+def common_fct_percentiles(fct_paths, common_mask, task_count, temp_dir, chunk_size):
+    """Sort one run at a time on the shared set of completed network taskIds."""
+    if not common_mask:
+        return 0, {name: sorted_run_percentiles([], 0) for name in fct_paths}
+    bitmap = common_mask.to_bytes((task_count + 7) // 8, "little")
+    popcounts = [bin(byte).count("1") for byte in range(256)]
+    common_count = sum(popcounts[byte] for byte in bitmap)
     output = {}
-    for i, name in enumerate(SCHEMES):
-        output[name] = sorted_run_percentiles(run_paths[i], common_count)
+    for name, fct_path in fct_paths.items():
+        with tempfile.TemporaryDirectory(prefix="fct_sort_", dir=temp_dir) as sort_dir:
+            paths, values = [], []
+
+            def flush_run():
+                values.sort()
+                path = Path(sort_dir) / f"{len(paths):05d}.bin"
+                with path.open("wb", buffering=1024 * 1024) as out:
+                    array("d", values).tofile(out)
+                paths.append(path)
+                values.clear()
+
+            with fct_path.open("rb") as stream, mmap.mmap(
+                stream.fileno(), 0, access=mmap.ACCESS_READ
+            ) as fct:
+                for byte_idx, mask in enumerate(bitmap):
+                    while mask:
+                        bit = mask & -mask
+                        pos = (byte_idx << 3) + bit.bit_length() - 1
+                        values.append(struct.unpack_from("=d", fct, pos * 8)[0])
+                        if len(values) >= chunk_size:
+                            flush_run()
+                        mask ^= bit
+            if values:
+                flush_run()
+            output[name] = sorted_run_percentiles(paths, common_count)
+        fct_path.unlink()
     return common_count, output
 
 
@@ -655,27 +662,27 @@ def make_detail_rows(base_states, metrics):
     for meta in sorted(base_states, key=lambda x: x["request_id"]):
         rid = meta["request_id"]
         row = {k: meta[k] for k in COMMON_FIELDS}
-        for scheme in SCHEMES:
+        for scheme, results in metrics.items():
             for field in SCHEME_FIELDS:
-                row[f"{scheme}_{field}"] = fmt(metrics[scheme][rid][field])
+                row[f"{scheme}_{field}"] = fmt(results[rid][field])
         yield row
 
 
-def make_summary_rows(base_states, metrics, fct_quantiles, valid_fct_counts, common_flow_count):
+def make_summary_rows(base_states, metrics, labels, fct_quantiles, valid_fct_counts, common_flow_count):
     # Use a different common-valid request set per metric, so an incomplete
     # trailing WRITE cannot invalidate otherwise available TTFT/TPS.
     request_ids = [meta["request_id"] for meta in base_states]
     common = {}
     for field in ("ttft_ms", "tps", "throughput_gbps", "completion_time_ms"):
         common[field] = [rid for rid in request_ids if all(
-            metrics[scheme][rid][field] is not None for scheme in SCHEMES)]
-    for scheme in SCHEMES:
+            results[rid][field] is not None for results in metrics.values())]
+    for scheme, label in labels.items():
         ttft = linear_percentiles([metrics[scheme][rid]["ttft_ms"] for rid in common["ttft_ms"]])
         tps_values = [metrics[scheme][rid]["tps"] for rid in common["tps"]]
         th_values = [metrics[scheme][rid]["throughput_gbps"]
                      for rid in common["throughput_gbps"]]
         row = dict(
-            scheme=SCHEME_LABELS[scheme],
+            scheme=label,
             common_valid_ttft_requests=len(common["ttft_ms"]),
             common_valid_tps_requests=len(common["tps"]),
             common_valid_throughput_requests=len(common["throughput_gbps"]),
@@ -704,6 +711,49 @@ def resolve_stat_path(directory, override, scheme):
     raise ValueError(f"找不到 {scheme} 统计文件：{nested} 或 {direct}")
 
 
+def resolve_runs(args, parser):
+    paths, labels = {}, {}
+    for scheme, label in LEGACY_LABELS.items():
+        directories = getattr(args, f"{scheme}_dir")
+        override = getattr(args, f"{scheme}_statistics")
+        if scheme not in ("te", "toe"):
+            directories = [directories] if directories is not None else []
+        if override is not None or len(directories) == 1:
+            directory = directories[0] if len(directories) == 1 else None
+            paths[scheme] = resolve_stat_path(directory, override, label)
+            labels[scheme] = label
+
+        named = {}
+        for spec in getattr(args, scheme, ()):
+            name, sep, raw_path = spec.partition("=")
+            if not sep or not raw_path.strip() or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}", name):
+                parser.error(f"--{scheme} 需要 NAME=DIR_OR_CSV。NAME 以字母或数字开头，"
+                             "最多 64 个字符，可用字母、数字、点、下划线和连字符")
+            key = f"{scheme}_{name}"
+            if key in named:
+                parser.error(f"--{scheme} 版本名重复：{name}")
+            path = Path(raw_path).resolve()
+            named[key] = path if path.is_file() else resolve_stat_path(path, None, key)
+
+        if len(directories) > 1:
+            for directory in directories:
+                name = re.sub(r"[^A-Za-z0-9._-]+", "_", directory.name).strip("._-")[:64] or "run"
+                key = f"{scheme}_{name}"
+                suffix = 2
+                while key in paths or key in named:
+                    ending = f"_{suffix}"
+                    key = f"{scheme}_{name[:64 - len(ending)]}{ending}"
+                    suffix += 1
+                paths[key] = resolve_stat_path(directory, None, key)
+                labels[key] = key
+
+        paths.update(named)
+        labels.update((key, key) for key in named)
+    if len(paths) < 2:
+        parser.error("请至少指定两个对比结果，例如 --te-dir /data/te_a --te-dir /data/te_b")
+    return paths, labels
+
+
 def main():
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("case_dir", nargs="?", type=Path, help="公共 CASE 目录（兼容原脚本的位置参数）")
@@ -712,13 +762,18 @@ def main():
     p.add_argument("--traffic", type=Path)
     p.add_argument("--mapping", type=Path, help="v15 完整 mapping；替代 traffic.csv")
     p.add_argument("--requests-debug", type=Path)
+    p.add_argument("--ecmp-dir", type=Path, help="ECMP 结果目录，含 output/task_statistics.csv")
+    for scheme in ("te", "toe"):
+        p.add_argument(f"--{scheme}-dir", type=Path, action="append", default=[], metavar="DIR",
+                       help=f"添加 {LEGACY_LABELS[scheme]} 结果目录，可重复指定")
     for scheme in ("ecmp", "te", "toe"):
-        p.add_argument(f"--{scheme}-dir", type=Path, required=True,
-                       help=f"{SCHEME_LABELS[scheme]} 结果目录，含 output/task_statistics.csv")
         p.add_argument(f"--{scheme}-statistics", type=Path,
-                       help=f"覆盖 {SCHEME_LABELS[scheme]} statistics 路径")
+                       help=f"直接指定 {LEGACY_LABELS[scheme]} 的 statistics CSV")
+    for scheme in ("te", "toe"):
+        p.add_argument(f"--{scheme}", action="append", default=[], metavar="NAME=DIR_OR_CSV",
+                       help=f"添加一个具名 {LEGACY_LABELS[scheme]} 版本，可重复指定")
     p.add_argument("--eps2-dir", "--eps-2layer-dir", "--two-layer-eps-dir",
-                   dest="eps2_dir", type=Path, required=True,
+                   dest="eps2_dir", type=Path,
                    help="两层 EPS 结果目录，含 output/task_statistics.csv")
     p.add_argument("--eps2-statistics", "--eps-2layer-statistics",
                    dest="eps2_statistics", type=Path,
@@ -756,9 +811,7 @@ def main():
     out_dir = (args.out_dir or case / "output" / "compare").resolve()
     out_detail = out_dir / "request_comparison.csv"
     out_summary = out_dir / "summary_comparison.csv"
-    stats = {scheme: resolve_stat_path(getattr(args, f"{scheme}_dir"),
-                                       getattr(args, f"{scheme}_statistics"), scheme)
-             for scheme in SCHEMES}
+    stats, labels = resolve_runs(args, p)
     if args.mapping is not None:
         args.mapping = args.mapping.resolve()
     inputs = [args.task_dag, args.requests_debug, args.mapping or args.traffic, *stats.values()]
@@ -771,40 +824,45 @@ def main():
     out_dir.mkdir(parents=True, exist_ok=True)
     work = (args.work_dir or out_dir).resolve()
     work.mkdir(parents=True, exist_ok=True)
-    requests, _ = load_request_metadata(args.requests_debug)
+    requests = load_request_metadata(args.requests_debug)
     with tempfile.TemporaryDirectory(prefix="request_compare_", dir=work) as tmp:
         temp_dir = Path(tmp)
         index_path = temp_dir / "flow_request_index.bin"
         base_states, first, task_count, flow_count = build_index(args, requests, index_path)
-        metrics, valid_fct, fct_files, reports = {}, [], [], {}
-        for scheme in SCHEMES:
+        metrics, fct_files, valid_fct_counts = {}, {}, {}
+        common_fct_mask = None
+        for scheme, stat_path in stats.items():
+            print(f"{labels[scheme]} 统计文件 {stat_path}", file=sys.stderr, flush=True)
             fct_path = temp_dir / f"{scheme}_fct_ms.bin"
             scheme_states, bitmap, counters = scan_scheme(
-                scheme, stats[scheme], base_states, first, task_count, flow_count,
+                scheme, stat_path, base_states, first, task_count, flow_count,
                 index_path, fct_path, args.progress_every,
             )
-            result, metric_counters = compute_scheme_metrics(scheme, base_states, scheme_states)
-            metrics[scheme] = result
-            valid_fct.append(bitmap)
-            fct_files.append(fct_path)
-            reports[scheme] = (counters, metric_counters)
-            del scheme_states
-            print(f"{SCHEME_LABELS[scheme]}：完成流 {counters['completed_flows']:,} / {flow_count:,}；"
+            metrics[scheme], metric_counts = compute_scheme_metrics(scheme, base_states, scheme_states)
+            print(f"{labels[scheme]} TTFT 有效请求 {metric_counts['valid_ttft_ms']:,}；"
+                  f"首次 Prefill Read 时间有效 {metric_counts['valid_prefill_first_read_start_ms']:,}，"
+                  f"末层 Write 开始时间有效 {metric_counts['valid_prefill_final_write_start_ms']:,}",
+                  file=sys.stderr)
+            mask = int.from_bytes(bitmap, "little")
+            common_fct_mask = mask if common_fct_mask is None else common_fct_mask & mask
+            fct_files[scheme] = fct_path
+            valid_fct_counts[scheme] = counters["completed_flows"]
+            del scheme_states, bitmap, mask
+            print(f"{labels[scheme]}：完成流 {counters['completed_flows']:,} / {flow_count:,}；"
                   f"无效记录 {counters['invalid_time_rows']:,}，"
                   f"已开始未完成 {counters['started_unfinished']:,}，"
                   f"缺失网络流 {counters['missing_rows']:,}，"
                   f"已排除 TIMER 记录 {counters['timer_rows']:,}", file=sys.stderr)
         common_flow_count, fct_quantiles = common_fct_percentiles(
-            valid_fct, fct_files, task_count, temp_dir, args.fct_sort_chunk,
+            fct_files, common_fct_mask, task_count, temp_dir, args.fct_sort_chunk,
         )
         detail_fields = list(COMMON_FIELDS) + [f"{s}_{field}"
-                                                for s in SCHEMES for field in SCHEME_FIELDS]
+                                                for s in stats for field in SCHEME_FIELDS]
         tmp_detail = tmp_summary = None
         try:
             tmp_detail = write_csv_temp(out_detail, detail_fields, make_detail_rows(base_states, metrics))
             tmp_summary = write_csv_temp(out_summary, SUMMARY_FIELDS, make_summary_rows(
-                base_states, metrics, fct_quantiles,
-                {scheme: reports[scheme][0]["completed_flows"] for scheme in SCHEMES},
+                base_states, metrics, labels, fct_quantiles, valid_fct_counts,
                 common_flow_count,
             ))
             for path in inputs:
@@ -820,10 +878,11 @@ def main():
             if tmp_summary is not None:
                 tmp_summary.unlink(missing_ok=True)
     print(f"正式 Request：{len(base_states):,}；预期网络流：{flow_count:,}；"
-          f"四方案共同完成网络流：{common_flow_count:,}")
+          f"{len(stats)} 个结果共同完成网络流：{common_flow_count:,}")
     print(f"Request 明细：{out_detail}")
     print(f"统计对比：{out_summary}")
-    print("TIMER 不计入网络流统计；TTFT 沿用 P 计算完成代理口径；FCT 是逐流 finish-start；"
+    print("TTFT 为同一请求末层 Prefill Write 最早启动减去首次 Prefill Read 启动，"
+          "缺少观测则留空；FCT 是逐流 finish-start；"
           "吞吐为未缩放逻辑读字节数 / Request 网络流时间跨度。")
 
 
