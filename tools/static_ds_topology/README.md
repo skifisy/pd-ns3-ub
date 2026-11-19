@@ -1,14 +1,43 @@
 # D–S 静态增容拓扑
 
-从原始 Mooncake case 生成一次静态容量重分配：每个具体的 P–S pair 拆一根，
+直接生成默认 Mooncake 拓扑并完成一次静态容量重分配，无需输入 base case。
+也支持从已有的原始 Mooncake case 生成。每个具体的 P–S pair 拆一根，
 共 `12 × 4 = 48` 根；每个 P–D pair 同样拆一根，释放 48 个 D 端口。
 16 个 D–S pair 各增加三根，每个跨组 P–P pair 各增加一根。
 所有 leaf 仍保持 64 个 OCS 端口。脚本只生成文件，不启动仿真，不修改 ToE 控制器。
 
 ## 使用
 
-需要 Python 3.9+，仅使用标准库和仓库现有的 `tools/generate_routing_table.py`。
-在仓库根目录执行：
+需要 Python 3.9+，使用标准库及仓库现有的 `tools/generate_ocs_topology.py`、
+`tools/generate_routing_table.py`。在仓库根目录执行即可：
+
+```bash
+python3 tools/static_ds_topology/build_static_ds_topology.py
+```
+
+结果写入当前工作目录下的 `static_ds_case/`，包含节点表、最终扩容拓扑和路由表。
+内置原始拓扑只在临时目录中生成，不会写入原生成器的默认 case 目录。
+可用 `--out-dir` 指定其他输出位置：
+
+```bash
+python3 tools/static_ds_topology/build_static_ds_topology.py \
+  --out-dir /path/to/static_ds_case
+```
+
+将所有物理链路带宽缩小 100000 倍：
+
+```bash
+python3 tools/static_ds_topology/build_static_ds_topology.py \
+  --out-dir /path/to/static_ds_4mbps_case \
+  --bandwidth-divisor 100000
+```
+
+`400 Gbps / 100000 = 4 Mbps = 0.5 MB/s`，这里的单位是 Mbps，不是 MB/s。
+该选项同时作用于全部服务器接入链路和 OCS 链路；默认除数为 1，保留 400 Gbps。
+除数必须为正整数，缩放后每根链路必须是至少 1 bit/s 的整数速率。
+链路时延、端口、路由结构及流量文件内容不会随带宽缩放而改变。
+
+如需保留已有 case 的节点表和输入文件，可选传入 `--base-case`：
 
 ```bash
 python3 tools/static_ds_topology/build_static_ds_topology.py \
@@ -16,13 +45,15 @@ python3 tools/static_ds_topology/build_static_ds_topology.py \
   --out-dir /path/to/static_ds_case
 ```
 
-两个参数均必填。输出目录必须不存在或为空，且不能与原 case 相同、互相嵌套。
+所有参数均可省略。输出目录必须不存在或为空；使用 `--base-case` 时，
+输出目录不能与原 case 相同、互相嵌套。
 脚本在临时目录内完成生成与验证，再发布最终目录；失败不会留下部分生成的 case。
 不覆盖已有文件，不改写原 case。
 
 ## 输入与输出
 
-必需输入为 `node.csv`、`topology.csv`。适用范围固定为当前 Mooncake：
+默认无须提供输入文件。仅在传入 `--base-case` 时，原目录必须包含
+`node.csv`、`topology.csv`。适用范围固定为当前 Mooncake：
 
 - 计算服务器 0–15，各 64 端口；存储服务器 16–36，各 12 端口。
 - Prefill leaf 37–48、Decode leaf 49–52、Storage leaf 53–56，各 128 端口。
@@ -30,18 +61,21 @@ python3 tools/static_ds_topology/build_static_ds_topology.py \
 - OCS 使用端口 64–127，链路 `bandwidth` 为 `400Gbps`，OCS 传播时延一致。
 - 服务器接入关系与 `tools/generate_ocs_topology.py` 相同。
 
-只接受原始均匀拓扑，不接受将已扩容的拓扑再次作为输入。
+`--base-case` 只接受原始均匀的 400 Gbps 拓扑，不接受已扩容或已缩放的拓扑作为输入。
+默认模式先构造上述原始拓扑，再应用同一套端口交换和可选带宽缩放。
 
 | 输出文件 | 内容 |
 |---|---|
-| `node.csv` | 原样复制原节点表 |
+| `node.csv` | 默认自动生成；指定 base case 时原样复制原节点表 |
 | `topology.csv` | 新的静态连接，复用原物理端口，保留服务器接入链路 |
 | `routing_table.csv` | 按新拓扑重新生成，检查所有目的端口的最短路输出集合 |
 | `static_ds_changes.csv` | 48 组交换的实际拆除/新增端点，共 192 条记录 |
-| `static_ds_summary.json` | 前后容量、每 leaf 分配、D–S 矩阵、输入缺失项、文件 SHA256 |
+| `static_ds_summary.json` | 输入模式、带宽除数、前后容量、每 leaf 分配、D–S 矩阵、缺失项、SHA256 |
 
-若原 case 存在 `traffic.csv`、`network_attribute.txt`、`transport_channel.csv`，则原样复制。
+指定原 case 且存在 `traffic.csv`、`network_attribute.txt`、`transport_channel.csv` 时原样复制。
+默认模式不生成业务流量或网络属性配置；这些实验输入需要另行提供。
 前两项缺失时仍生成三个拓扑文件，但明确标记为 topology-only，不能直接运行完整实验。
+汇总中的 before/after 容量均使用选定除数缩放后的链路带宽，便于在相同带宽下比较。
 不会复制旧的路由表、仿真输出或大型 DAG 分析文件。
 
 ## 一次调整的确定性规则
@@ -59,8 +93,8 @@ s = 53 + r
 
 `p` 与 `q` 始终在不同组。D–S 使用释放的 D、S 端口；P–P 使用释放的 P 端口。
 每台 P 对四台 D、四台 S 分别各拆一根，共拆八根；这些 pair 均从四根降至三根。
-每个跨组 P–P pair 各增加一根，由四根增至五根。这不是现有
-`--toe-max-prefill-remove=1` 的计数语义。
+每个跨组 P–P pair 各增加一根，由四根增至五根。
+本脚本一次性生成这些调整后的静态拓扑，仿真期间无需启用 ToE 重配。
 
 | 电路类别 | 原始 | 调整后 |
 |---|---:|---:|
@@ -81,6 +115,7 @@ D–S 每方向总容量从 25.6 Tbps 增至 44.8 Tbps，每台 D/S 的 D–S �
 每个 D–S pair 从四根增至七根，每方向容量从 1.6 Tbps 增至 2.8 Tbps（增加 75%）。
 P–S 总容量同时减少 25%，需要在仿真中评估对 Prefill 读写性能的影响。
 保留所有跨组 pair、所有物理端口和接入链路，验证端口唯一性与路由完整性。
+以上容量为未缩放时的值。除数为 100000 时，D–S 每方向总容量从 256 Mbps 增至 448 Mbps。
 
 ## 仿真对照
 
@@ -101,5 +136,6 @@ python3 -m unittest discover \
 ```
 
 测试使用原始拓扑生成器建立完整输入，覆盖精确容量、每个具体 pair 的链路数、
-端口复用、输入保留、确定性、路由实际出端口、重复应用/覆盖拒绝、异常清理和 CLI 输出。
+端口复用、输入保留、确定性、路由实际出端口、重复应用/覆盖拒绝、异常清理、
+无参数生成、全部链路的带宽缩放、无效除数和 CLI 输出。
 无需编译 ns-3，也不依赖 HiGHS。

@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
-"""Build a static D--S expansion from an original Mooncake OCS case.
+"""Generate a static D--S expanded Mooncake topology in one command.
 
 Each P--D/P--S pair loses one circuit; each D--S pair gains three circuits.
 Each cross-group P--P pair gains one circuit. Every leaf keeps 64 OCS ports.
-Existing host attachments and physical port IDs are preserved. No simulation
-is started. Only the original four-circuit-per-pair topology is accepted.
+Generate the standard baseline automatically, or supply --base-case to use
+an original four-circuit-per-pair case. --bandwidth-divisor scales every
+physical link; 100000 changes 400Gbps to 4Mbps. No simulation is started.
 """
 
 from __future__ import annotations
@@ -13,10 +14,12 @@ import argparse
 from collections import Counter, defaultdict, deque
 import csv
 from dataclasses import dataclass
+from decimal import Decimal, InvalidOperation
 import hashlib
 import json
 import os
 from pathlib import Path
+import re
 import shutil
 import sys
 import tempfile
@@ -24,11 +27,60 @@ import tempfile
 # Keep the reusable Mooncake routing generator in tools/, one level above us.
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from generate_routing_table import generate_routing_table
+import generate_ocs_topology as original_topology
 
 
 TOPOLOGY_FIELDS = ("nodeId1", "portId1", "nodeId2", "portId2", "bandwidth", "delay")
 LEAVES = range(37, 57)
 COPY_INPUTS = ("traffic.csv", "network_attribute.txt", "transport_channel.csv")
+DEFAULT_OUTPUT = Path("static_ds_case")
+RATE_UNITS = {"bps": 1, "Kbps": 10**3, "Mbps": 10**6,
+              "Gbps": 10**9, "Tbps": 10**12}
+
+
+def rate_bps(text: str) -> int:
+    match = re.fullmatch(r"\s*([0-9]+(?:\.[0-9]+)?)\s*(bps|Kbps|Mbps|Gbps|Tbps)\s*", text)
+    if not match:
+        raise ValueError(f"unsupported link bandwidth {text!r}; use bps/Kbps/Mbps/Gbps/Tbps")
+    try:
+        value = Decimal(match[1]) * RATE_UNITS[match[2]]
+    except InvalidOperation as error:
+        raise ValueError(f"invalid link bandwidth {text!r}") from error
+    if value < 1 or value != value.to_integral_value():
+        raise ValueError(f"link bandwidth must be a positive integer number of bit/s: {text!r}")
+    return int(value)
+
+
+def format_rate(bits_per_second: int) -> str:
+    for unit, factor in reversed(list(RATE_UNITS.items())):
+        if bits_per_second >= factor and bits_per_second % factor == 0:
+            return f"{bits_per_second // factor}{unit}"
+    return f"{bits_per_second}bps"
+
+
+def scale_bandwidth(rows: list[dict], divisor: int) -> list[dict]:
+    if isinstance(divisor, bool) or not isinstance(divisor, int) or divisor < 1:
+        raise ValueError("bandwidth divisor must be a positive integer")
+    result = [dict(row) for row in rows]
+    for row in result:
+        bits = rate_bps(row["bandwidth"])
+        if bits % divisor or bits // divisor < 1:
+            raise ValueError(f"cannot divide {row['bandwidth']} by {divisor} into whole positive bit/s")
+        if divisor != 1:
+            row["bandwidth"] = format_rate(bits // divisor)
+    return result
+
+
+def generate_default_baseline(directory: Path) -> None:
+    """Use the existing generator's functions without writing its default case."""
+    directory.mkdir()
+    ids = original_topology.generate_ids()
+    links = []
+    next_id = original_topology.generate_compute_links(links, 0, ids[0], ids[2])
+    next_id = original_topology.generate_storage_links(links, next_id, ids[1], ids[3])
+    original_topology.generate_ocs_links(links, next_id, ids[2] + ids[3])
+    original_topology.generate_node_csv(directory / "node.csv", *ids)
+    original_topology.generate_topology_csv(links, directory / "topology.csv")
 
 
 def role(node: int) -> str:
@@ -231,6 +283,7 @@ def validate_routes(path: Path, topology: list[dict]) -> int:
 
 def topology_summary(rows: list[dict]) -> dict:
     totals = Counter()
+    ds_capacity_bps = 0
     per_leaf = {str(leaf): Counter() for leaf in LEAVES}
     ds = [[0] * 4 for _ in range(4)]
     for row in rows:
@@ -242,8 +295,10 @@ def topology_summary(rows: list[dict]) -> dict:
         per_leaf[str(link.b)][role(link.a)] += 1
         if 49 <= link.a <= 52 and 53 <= link.b <= 56:
             ds[link.a - 49][link.b - 53] += 1
+            ds_capacity_bps += rate_bps(row["bandwidth"])
     return dict(circuits_by_role=dict(totals), ocs_neighbours_by_role=per_leaf,
-                ds_matrix=ds, ds_capacity_gbps_per_direction=totals["DS"] * 400)
+                ds_matrix=ds, ds_capacity_bps_per_direction=ds_capacity_bps,
+                ds_capacity_gbps_per_direction=ds_capacity_bps / 10**9)
 
 
 def sha256(path: Path) -> str:
@@ -254,48 +309,65 @@ def sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
-def build_case(base_case: Path, out_dir: Path) -> dict:
-    base_case, out_dir = base_case.resolve(), out_dir.resolve()
-    if base_case == out_dir or base_case in out_dir.parents or out_dir in base_case.parents:
+def build_case(base_case: Path | None, out_dir: Path, bandwidth_divisor: int = 1) -> dict:
+    base_case = base_case.resolve() if base_case is not None else None
+    out_dir = out_dir.resolve()
+    if base_case is not None and (base_case == out_dir or base_case in out_dir.parents
+                                  or out_dir in base_case.parents):
         raise ValueError("base case and output must be separate, non-nested directories")
     if out_dir.exists() and (not out_dir.is_dir() or any(out_dir.iterdir())):
         raise ValueError("output must be a new or empty directory; existing files are never overwritten")
-    nodes = read_nodes(base_case / "node.csv")
-    fields, before = read_table(base_case / "topology.csv", TOPOLOGY_FIELDS)
-    after, changes = transform(before, nodes)
+    if (isinstance(bandwidth_divisor, bool) or not isinstance(bandwidth_divisor, int)
+            or bandwidth_divisor < 1):
+        raise ValueError("bandwidth divisor must be a positive integer")
     out_dir.parent.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(prefix=f".{out_dir.name}-", dir=out_dir.parent) as temp:
+        source = base_case
+        if source is None:
+            source = Path(temp) / "baseline"
+            generate_default_baseline(source)
+        nodes = read_nodes(source / "node.csv")
+        fields, before = read_table(source / "topology.csv", TOPOLOGY_FIELDS)
+        after, changes = transform(before, nodes)
+        before = scale_bandwidth(before, bandwidth_divisor)
+        after = scale_bandwidth(after, bandwidth_divisor)
         stage = Path(temp) / "case"
         stage.mkdir()
-        shutil.copy2(base_case / "node.csv", stage / "node.csv")
+        shutil.copy2(source / "node.csv", stage / "node.csv")
         with (stage / "topology.csv").open("w", newline="", encoding="utf-8") as stream:
             writer = csv.DictWriter(stream, fields)
             writer.writeheader()
             writer.writerows(after)
         generate_routing_table(stage / "topology.csv", stage / "routing_table.csv")
         route_rows = validate_routes(stage / "routing_table.csv", after)
-        copied = ["node.csv"]
+        copied = ["node.csv"] if base_case is not None else []
         for name in COPY_INPUTS:
-            source = base_case / name
-            if source.exists():
-                shutil.copy2(source, stage / name)
+            input_path = source / name
+            if input_path.exists():
+                shutil.copy2(input_path, stage / name)
                 copied.append(name)
         with (stage / "static_ds_changes.csv").open("w", newline="", encoding="utf-8") as stream:
             writer = csv.DictWriter(stream, list(changes[0]))
             writer.writeheader()
             writer.writerows(changes)
         summary = dict(
-            schema_version=2, base_case=str(base_case), output_case=str(out_dir),
+            schema_version=3, base_case=str(base_case) if base_case is not None else None,
+            baseline_source="base-case" if base_case is not None else "builtin-mooncake",
+            output_case=str(out_dir), bandwidth_divisor=bandwidth_divisor,
+            ocs_bandwidth_bps=400 * 10**9 // bandwidth_divisor,
             allocation="uniform-pair-expansion", swaps=48,
             removed_circuits=96, added_circuits=96,
             pd_removed_per_prefill=4, ps_removed_per_prefill=4,
             pd_removed_per_pair=1, ps_removed_per_pair=1, ds_added_per_pair=3,
             before=topology_summary(before), after=topology_summary(after),
-            copied_inputs=copied, route_rows_checked=route_rows,
+            copied_inputs=copied,
+            generated_inputs=["node.csv"] if base_case is None else [],
+            route_rows_checked=route_rows,
             missing_run_inputs=[name for name in ("traffic.csv", "network_attribute.txt")
                                 if name not in copied],
             sha256={name: sha256(stage / name) for name in
-                    [*copied, "topology.csv", "routing_table.csv"]},
+                    ["node.csv", *[name for name in copied if name != "node.csv"],
+                     "topology.csv", "routing_table.csv"]},
             simulation_started=False,
         )
         (stage / "static_ds_summary.json").write_text(
@@ -306,18 +378,24 @@ def build_case(base_case: Path, out_dir: Path) -> dict:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--base-case", required=True, type=Path,
-                        help="original Mooncake case containing node.csv and topology.csv")
-    parser.add_argument("--out-dir", required=True, type=Path,
-                        help="new or empty directory for the static expanded case")
+    parser.add_argument("--base-case", type=Path,
+                        help="optional original case; omitted: generate the standard Mooncake baseline")
+    parser.add_argument("--out-dir", type=Path, default=DEFAULT_OUTPUT,
+                        help="new or empty output directory (default: ./static_ds_case)")
+    parser.add_argument("--bandwidth-divisor", type=int, default=1,
+                        help="divide every link rate by this positive integer; 100000: 400Gbps -> 4Mbps")
     args = parser.parse_args()
     try:
-        summary = build_case(args.base_case, args.out_dir)
+        summary = build_case(args.base_case, args.out_dir, args.bandwidth_divisor)
     except (ValueError, OSError, csv.Error) as error:
         parser.exit(2, f"error: {error}\n")
     print(f"Generated: {summary['output_case']}")
     print("Every P-D/P-S pair: 4 -> 3 circuits; every D-S pair: 4 -> 7 circuits.")
-    print("D-S circuits: 64 -> 112; per-direction capacity: 25.6 -> 44.8 Tbps")
+    old_rate = format_rate(summary["before"]["ds_capacity_bps_per_direction"])
+    new_rate = format_rate(summary["after"]["ds_capacity_bps_per_direction"])
+    print(f"D-S circuits: 64 -> 112; per-direction capacity: {old_rate} -> {new_rate}")
+    print(f"OCS link bandwidth: {format_rate(summary['ocs_bandwidth_bps'])}; "
+          f"all link rates divided by {summary['bandwidth_divisor']}")
     print(f"Validated {summary['route_rows_checked']} routing entries; no simulation started.")
     if summary["missing_run_inputs"]:
         print("Topology-only output; missing run inputs: " + ", ".join(summary["missing_run_inputs"]))

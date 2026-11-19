@@ -139,6 +139,8 @@ class StaticDsTopologyTest(unittest.TestCase):
         for out in (self.out, self.base, self.base / "nested", self.root):
             with self.subTest(out=out), self.assertRaises(ValueError):
                 static.build_case(self.base, out)
+        with self.assertRaises(ValueError):
+            static.build_case(None, self.out)
         self.assertEqual(static.sha256(self.out / "topology.csv"),
                          self.summary["sha256"]["topology.csv"])
 
@@ -172,12 +174,75 @@ class StaticDsTopologyTest(unittest.TestCase):
             static.validate_routes(bad, self.after)
 
     def test_failure_does_not_publish_a_partial_case(self):
-        output = self.root / "route-failure"
-        with patch.object(static, "generate_routing_table", side_effect=OSError("route generation failed")):
-            with self.assertRaisesRegex(OSError, "route generation failed"):
-                static.build_case(self.base, output)
+        for mode, base in (("base", self.base), ("builtin", None)):
+            output = self.root / f"route-failure-{mode}"
+            with patch.object(static, "generate_routing_table", side_effect=OSError("route generation failed")):
+                with self.assertRaisesRegex(OSError, "route generation failed"):
+                    static.build_case(base, output)
+            self.assertFalse(output.exists())
+            self.assertEqual(list(self.root.glob(f".route-failure-{mode}-*")), [])
+
+    def test_cli_without_any_arguments_generates_the_complete_topology(self):
+        working_dir = self.root / "default-command"
+        working_dir.mkdir()
+        run = subprocess.run([sys.executable, str(STATIC / "build_static_ds_topology.py")],
+                             capture_output=True, text=True, timeout=30, cwd=working_dir)
+        self.assertEqual(run.returncode, 0, run.stderr)
+        output = working_dir / "static_ds_case"
+        for name in ("node.csv", "topology.csv", "routing_table.csv", "static_ds_changes.csv"):
+            self.assertEqual(static.sha256(output / name), static.sha256(self.out / name))
+        report = json.loads((output / "static_ds_summary.json").read_text())
+        self.assertIsNone(report["base_case"])
+        self.assertEqual(report["baseline_source"], "builtin-mooncake")
+        self.assertEqual(report["bandwidth_divisor"], 1)
+        self.assertEqual(report["generated_inputs"], ["node.csv"])
+        self.assertEqual(report["copied_inputs"], [])
+        self.assertEqual(report["route_rows_checked"], 71456)
+        self.assertEqual(set(path.name for path in output.iterdir()),
+                         {"node.csv", "topology.csv", "routing_table.csv",
+                          "static_ds_changes.csv", "static_ds_summary.json"})
+
+    def test_cli_scales_all_links_to_four_megabits_per_second(self):
+        output = self.root / "scaled-command"
+        run = subprocess.run([sys.executable, str(STATIC / "build_static_ds_topology.py"),
+                              "--out-dir", str(output), "--bandwidth-divisor", "100000"],
+                             capture_output=True, text=True, timeout=30, cwd=self.root)
+        self.assertEqual(run.returncode, 0, run.stderr)
+        self.assertIn("OCS link bandwidth: 4Mbps", run.stdout)
+        rows = read_rows(output / "topology.csv")
+        self.assertEqual(len(rows), 1916)
+        self.assertEqual({row["bandwidth"] for row in rows}, {"4Mbps"})
+        for expected, actual in zip(self.after, rows):
+            self.assertEqual({k: v for k, v in expected.items() if k != "bandwidth"},
+                             {k: v for k, v in actual.items() if k != "bandwidth"})
+        self.assertEqual(static.sha256(output / "routing_table.csv"),
+                         static.sha256(self.out / "routing_table.csv"))
+        report = json.loads((output / "static_ds_summary.json").read_text())
+        self.assertEqual(report["ocs_bandwidth_bps"], 4000000)
+        self.assertEqual(report["bandwidth_divisor"], 100000)
+        self.assertEqual(report["before"]["ds_capacity_bps_per_direction"], 256000000)
+        self.assertEqual(report["after"]["ds_capacity_bps_per_direction"], 448000000)
+        self.assertEqual(report["after"]["ds_capacity_gbps_per_direction"], 0.448)
+
+    def test_invalid_bandwidth_divisors_are_rejected(self):
+        for divisor in (0, -1, True, 1.5):
+            output = self.root / f"bad-divisor-{divisor}"
+            with self.subTest(divisor=divisor), self.assertRaisesRegex(ValueError, "positive integer"):
+                static.build_case(None, output, divisor)
+            self.assertFalse(output.exists())
+        for divisor in (3, 400000000001):
+            with self.subTest(divisor=divisor), self.assertRaisesRegex(ValueError, "whole positive bit/s"):
+                static.scale_bandwidth([{"bandwidth": "400Gbps"}], divisor)
+
+    def test_explicit_missing_base_does_not_fall_back_to_default(self):
+        output = self.root / "missing-base-output"
+        run = subprocess.run([sys.executable, str(STATIC / "build_static_ds_topology.py"),
+                              "--base-case", str(self.root / "missing-base"),
+                              "--out-dir", str(output)],
+                             capture_output=True, text=True, timeout=30, cwd=self.root)
+        self.assertEqual(run.returncode, 2)
+        self.assertIn("node.csv", run.stderr)
         self.assertFalse(output.exists())
-        self.assertEqual(list(self.root.glob(".route-failure-*")), [])
 
     def test_cli_generates_three_files_without_optional_run_inputs(self):
         bare = self.root / "bare"
