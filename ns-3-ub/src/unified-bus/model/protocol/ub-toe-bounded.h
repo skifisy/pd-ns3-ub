@@ -50,6 +50,36 @@ class UbToeBounded
         return removed;
     }
 
+    // Budgets apply to each undirected pair incident to a Prefill leaf.
+    // Leaf totals remain useful audit data, but are not removal limits.
+    static Topology RemovedPairs(const Topology& old, const Topology& next)
+    {
+        Topology removed;
+        for (const auto& [pair, count] : old)
+        {
+            if (count > next.at(pair))
+            {
+                removed[pair] = count - next.at(pair);
+            }
+        }
+        return removed;
+    }
+
+    static bool WithinBudget(const Topology& old,
+                             const Topology& next,
+                             const std::set<uint32_t>& prefill,
+                             uint32_t budget)
+    {
+        for (const auto& [pair, removed] : RemovedPairs(old, next))
+        {
+            if ((prefill.count(pair.first) || prefill.count(pair.second)) && removed > budget)
+            {
+                return false;
+            }
+        }
+        return true;
+    }
+
     static double EcmpMlu(const Topology& topology,
                           const std::map<uint32_t, uint32_t>& groups,
                           const std::map<Od, double>& demands)
@@ -132,6 +162,31 @@ class UbToeBounded
         if (!std::isfinite(result.beforeMlu))
         {
             throw std::runtime_error("invalid current TOE MLU");
+        }
+        if (current == target)
+        {
+            return result;
+        }
+        // A legal complete target need not be rediscovered through thousands
+        // of individually neutral swaps. In particular, uniformly increasing
+        // all D-S pairs may leave MLU unchanged until every bottleneck moves.
+        if (maxEvaluations > 0 && WithinBudget(current, target, prefill, budget))
+        {
+            ++result.evaluations;
+            const double mlu = evaluate(target);
+            const double tolerance = 1e-12 * std::max(1.0, result.beforeMlu);
+            if (std::isfinite(mlu) && mlu <= result.beforeMlu + tolerance)
+            {
+                result.topology = target;
+                result.plannedMlu = mlu;
+                result.removed = Removed(current, target);
+                for (const auto& [pair, removed] : RemovedPairs(current, target))
+                {
+                    (void)pair;
+                    result.changedCircuits += removed;
+                }
+                return result;
+            }
         }
         for (;;)
         {
@@ -220,27 +275,11 @@ class UbToeBounded
                         }
                         move[pair] += sign;
                         bool withinBudget = true;
-                        if (sign < 0)
+                        if (sign < 0 && (prefill.count(pair.first) || prefill.count(pair.second)))
                         {
-                            for (uint32_t p : {pair.first, pair.second})
-                            {
-                                if (!prefill.count(p))
-                                {
-                                    continue;
-                                }
-                                uint32_t removed = result.removed[p];
-                                for (const auto& [edge, change] : move)
-                                {
-                                    if (change < 0 && (edge.first == p || edge.second == p))
-                                    {
-                                        removed += static_cast<uint32_t>(-change);
-                                    }
-                                }
-                                if (removed > budget)
-                                {
-                                    withinBudget = false;
-                                }
-                            }
+                            const uint32_t removed = current.at(pair) - count +
+                                                     static_cast<uint32_t>(-move.at(pair));
+                            withinBudget = removed <= budget;
                         }
                         const uint32_t next = pair.first == leaf ? pair.second : pair.first;
                         if (withinBudget && walk(next, -sign))
@@ -274,15 +313,7 @@ class UbToeBounded
                         static_cast<uint32_t>(static_cast<int64_t>(candidate.at(pair)) + delta);
                 }
                 const auto removed = Removed(current, candidate);
-                bool legal = true;
-                for (uint32_t leaf : prefill)
-                {
-                    if (removed.count(leaf) && removed.at(leaf) > budget)
-                    {
-                        legal = false;
-                    }
-                }
-                if (!legal)
+                if (!WithinBudget(current, candidate, prefill, budget))
                 {
                     continue;
                 }

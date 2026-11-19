@@ -34,7 +34,7 @@ class UbToeController
                    const std::string& outputDir,
                    ReconfigurationMode reconfigurationMode = ReconfigurationMode::AUTO,
                    CutoverMode cutoverMode = CutoverMode::DRAIN,
-                   int32_t maxPrefillRemove = -1);
+                   int32_t maxPrefillRemove = -1); // Per Prefill-incident leaf pair, per epoch.
     void Disable();
     bool Enabled() const { return m_enabled; }
     bool LossyCutoverEnabled() const { return m_enabled && m_cutoverMode == CutoverMode::LOSSY; }
@@ -72,6 +72,7 @@ class UbToeController
     void WriteTopology(const UbToeSolver::Topology& topology, const char* status) const;
     void WriteReconfiguration(const char* status) const;
     void WriteCircuits(const std::vector<PortPair>& circuits, const char* status) const;
+    void WritePrefillRemovals(const UbToeSolver::Topology& removedPairs, const char* status) const;
     bool VerifyPhysicalTopology() const;
 
     CutoverMode m_cutoverMode{CutoverMode::DRAIN};

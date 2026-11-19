@@ -117,6 +117,6 @@ epoch 0 的 `initial` 为初始连接；后续 `retained/remove/add` 为切换�
 
 ## 求解后受限拓扑规划
 
-可选参数 `--toe-max-prefill-remove` 在原求解之后，以交替拆建闭合组合选择满足预算、端口守恒和预测 MLU 不恶化的拓扑。目标、计划和应用结果分别记录。
+可选参数 `--toe-max-prefill-remove` 在原求解之后，以交替拆建闭合组合选择满足预算、端口守恒和预测 MLU 不恶化的拓扑。预算按每个涉及 Prefill 的具体无向 Leaf Pair 分别计算，不按每台 Prefill 的拆链总和计算；例如 `=1` 允许同一 P 对四台 D、四台 S 各拆一根。目标、计划和应用结果分别记录，并输出每 Pair 的 planned/applied 拆链审计。
 
 参数边界、算法、TE/TOE 联用、日志和验证见 [TE / TOE 每轮变化限幅](TE_TOE_CHANGE_LIMITS.md)。

@@ -30,9 +30,10 @@ static void Check(const Toe::Topology &old, const Toe::Topology &target,
       removed += count - value;
   }
   assert(before == after && removed == result.changedCircuits);
-  const auto counts = Toe::Removed(old, result.topology);
-  for (auto leaf : prefill)
-    assert(!counts.count(leaf) || counts.at(leaf) <= budget);
+  assert(Toe::WithinBudget(old, result.topology, prefill, budget));
+  for (const auto &[pair, count] : Toe::RemovedPairs(old, result.topology))
+    if (prefill.count(pair.first) || prefill.count(pair.second))
+      assert(count <= budget);
   assert(result.plannedMlu <= result.beforeMlu + 1e-10);
 }
 
@@ -137,13 +138,37 @@ static void TestLongCircuits() {
   assert(result.topology == target);
   result =
       Toe::Select(old, target, prefill, 1, [](const auto &) { return 1.; });
-  assert(result.topology == old); // Shared leaf needs two removals atomically.
+  assert(result.topology == target); // Two distinct pairs may each lose one.
   result =
       Toe::Select(old, target, prefill, 0, [](const auto &) { return 1.; });
   assert(result.topology == old);
   result = Toe::Select(old, target, prefill, 2,
                        [&](const auto &t) { return t == old ? 1. : 2.; });
   assert(result.topology == old); // Reject MLU regression.
+
+  // A pair budget still forbids removing two circuits from the same pair,
+  // including removals accumulated over separately accepted swaps.
+  auto repeatedOld = old;
+  for (auto &[pair, count] : repeatedOld) {
+    (void)pair;
+    count = 3;
+  }
+  auto repeatedTarget = repeatedOld;
+  for (auto pair : {Toe::Od{1, 2}, {3, 4}})
+    repeatedTarget[pair] -= 2;
+  for (auto pair : {Toe::Od{1, 3}, {2, 4}})
+    repeatedTarget[pair] += 2;
+  const auto once = Toe::Select(repeatedOld, repeatedTarget, prefill, 1,
+                                [](const auto &) { return 1.; });
+  Check(repeatedOld, repeatedTarget, once, prefill, 1);
+  assert(once.topology.at({1, 2}) == 2 && once.topology.at({3, 4}) == 2);
+  assert(once.changedCircuits == 2);
+  const auto twice = Toe::Select(once.topology, repeatedTarget, prefill, 1,
+                                 [](const auto &) { return 1.; });
+  assert(twice.topology == repeatedTarget); // Budget resets each epoch.
+  const auto unrestricted = Toe::Select(repeatedOld, repeatedTarget, {5, 6}, 0,
+                                        [](const auto &) { return 1.; });
+  assert(unrestricted.topology == repeatedTarget); // Non-P pairs are uncapped.
   bool rejected = false;
   ++target[{1, 2}];
   try {
@@ -152,6 +177,141 @@ static void TestLongCircuits() {
     rejected = true;
   }
   assert(rejected);
+}
+
+static void TestRemoveOnePerPair() {
+  Toe::Topology old;
+  std::map<unsigned, unsigned> groups;
+  std::set<unsigned> prefill;
+  std::vector<Planner::Circuit> circuits;
+  std::map<unsigned, uint16_t> port;
+  std::map<Toe::Od, double> demand;
+  for (unsigned a = 37; a <= 56; ++a) {
+    groups[a] = (a - 37) / 4;
+    port[a] = 64;
+    if (a <= 48)
+      prefill.insert(a);
+  }
+  for (unsigned a = 37; a <= 56; ++a)
+    for (unsigned b = a + 1; b <= 56; ++b)
+      if (groups.at(a) != groups.at(b)) {
+        old[{a, b}] = 4;
+        for (unsigned lane = 0; lane < 4; ++lane)
+          circuits.push_back({a, port[a]++, b, port[b]++});
+      }
+  auto target = old;
+  for (auto &[pair, count] : target) {
+    const auto [a, b] = pair;
+    if (b <= 48)
+      count = 5; // All 48 allowed inter-group P-P pairs gain one.
+    else if (a <= 48)
+      count = 3; // Every P-D and P-S pair loses one.
+    else {
+      count = 7; // All 16 D-S pairs gain three.
+      demand[{b, a}] = 1600e9;
+    }
+  }
+  // The former per-leaf remove1 cap would reject eight removals on each P.
+  assert(Toe::WithinBudget(old, target, prefill, 1));
+  assert(!Toe::WithinBudget(old, target, prefill, 0));
+  for (unsigned p : prefill)
+    assert(Toe::Removed(old, target).at(p) == 8);
+  const auto evaluate = [&](const auto &t) {
+    return Toe::EcmpMlu(t, groups, demand);
+  };
+  const auto result = Toe::Select(old, target, prefill, 1, evaluate);
+  Check(old, target, result, prefill, 1);
+  assert(result.topology == target);
+  assert(result.evaluations == 1 && !result.searchLimited);
+  Near(result.beforeMlu, 1);
+  Near(result.plannedMlu, 4.0 / 7);
+  assert(result.changedCircuits == 96);
+  unsigned pp = 0, pd = 0, ps = 0, ds = 0;
+  for (const auto &[pair, count] : result.topology) {
+    if (pair.second <= 48)
+      pp += count;
+    else if (pair.first <= 48 && pair.second <= 52)
+      pd += count;
+    else if (pair.first <= 48)
+      ps += count;
+    else
+      ds += count;
+  }
+  assert(pp == 240 && pd == 144 && ps == 144 && ds == 112);
+  const auto plan = Planner::Build(circuits, result.topology);
+  assert(plan.retained.size() == 544);
+  assert(plan.removed.size() == 96 && plan.added.size() == 96);
+  for (const auto &[leaf, changed] : plan.changedPorts)
+    assert(changed.size() == (leaf <= 48 ? 8 : 12));
+  Toe::Topology readback;
+  std::map<unsigned, std::set<uint16_t>> endpoints;
+  auto record = [&](const auto &circuit) {
+    assert(endpoints[circuit.a].insert(circuit.ap).second);
+    assert(endpoints[circuit.b].insert(circuit.bp).second);
+    ++readback[{circuit.a, circuit.b}];
+  };
+  for (const auto &circuit : plan.retained)
+    record(circuit);
+  for (const auto &circuit : plan.added)
+    record(circuit);
+  assert(readback == target);
+  for (const auto &[leaf, ports] : endpoints) {
+    (void)leaf;
+    assert(ports.size() == 64 && *ports.begin() == 64 && *ports.rbegin() == 127);
+  }
+  const auto again = Toe::Select(old, target, prefill, 1, evaluate);
+  assert(again.topology == result.topology);
+  const auto frozen = Toe::Select(old, target, prefill, 0, evaluate);
+  assert(frozen.topology == old);
+}
+
+static void TestBoundedFallback() {
+  // Keep the full target over budget so both long-trail shapes exercise the
+  // local search rather than the complete-target fast path.
+  for (bool sharedLeaf : {false, true}) {
+    Toe::Topology old;
+    std::set<unsigned> prefill;
+    for (unsigned a = 1; a <= 10; ++a) {
+      prefill.insert(a);
+      for (unsigned b = a + 1; b <= 10; ++b)
+        if ((a <= 6) == (b <= 6))
+          old[{a, b}] = 3;
+    }
+    auto target = old;
+    const std::vector<Toe::Od> removed = sharedLeaf
+        ? std::vector<Toe::Od>{{1, 2}, {1, 3}, {4, 5}}
+        : std::vector<Toe::Od>{{1, 2}, {3, 4}, {5, 6}};
+    const std::vector<Toe::Od> added = sharedLeaf
+        ? std::vector<Toe::Od>{{2, 3}, {1, 4}, {1, 5}}
+        : std::vector<Toe::Od>{{2, 3}, {4, 5}, {1, 6}};
+    for (auto pair : removed)
+      --target[pair];
+    for (auto pair : added)
+      ++target[pair];
+    for (auto pair : {Toe::Od{7, 8}, {9, 10}})
+      target[pair] -= 2;
+    for (auto pair : {Toe::Od{7, 9}, {8, 10}})
+      target[pair] += 2;
+    const auto result = Toe::Select(old, target, prefill, 1,
+                                    [](const auto &) { return 1.; });
+    Check(old, target, result, prefill, 1);
+    for (auto pair : removed)
+      assert(result.topology.at(pair) == target.at(pair));
+    for (auto pair : added)
+      assert(result.topology.at(pair) == target.at(pair));
+    assert(result.topology.at({7, 8}) == 2 && result.topology.at({9, 10}) == 2);
+    assert(result.changedCircuits == 5);
+
+    // A legal full target with a worse preview must fall back to safe partial
+    // moves; exhausting the evaluation budget never publishes the bad target.
+    auto legalTarget = result.topology;
+    const auto evaluate = [&](const auto &t) { return t == legalTarget ? 2. : 1.; };
+    const auto partial = Toe::Select(old, legalTarget, prefill, 1, evaluate);
+    Check(old, legalTarget, partial, prefill, 1);
+    assert(partial.topology != legalTarget && partial.changedCircuits > 0);
+    const auto limited = Toe::Select(old, legalTarget, prefill, 1, evaluate, 1);
+    assert(limited.topology == old && limited.evaluations == 1 && limited.searchLimited);
+  }
 }
 
 static void TestMooncake() {
@@ -210,9 +370,11 @@ static void TestMooncake() {
 int main() {
   TestWeights();
   TestLongCircuits();
+  TestRemoveOnePerPair();
+  TestBoundedFallback();
   TestMooncake();
   std::cout
       << "PASS: TE probabilities, reversal/freeze/idle/fallback/cap/repair; "
-         "TOE long trails, budgets, ECMP transit, deterministic Mooncake "
+         "TOE long trails, per-pair budgets, remove1 D-S 4-to-7, ECMP transit, deterministic Mooncake "
          "physical plans\n";
 }

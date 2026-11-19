@@ -221,6 +221,8 @@ python3 ../tools/make_toe_local_smoke.py --case-path scratch/mooncake_pd_ocs --o
 
 ## 可选的 Prefill 拆链上限
 
-显式指定 `--toe-max-prefill-remove=2`，每轮每台 Prefill Leaf 最多拆两根旧电路。不指定则完整执行原 LP 目标；此参数只进行一次受限重配，不自动追加阶段。
+显式指定 `--toe-max-prefill-remove=1`（remove1），每轮每个涉及 Prefill 的具体无向 Leaf Pair 最多拆一根旧电路。同一 P 可向不同 D、S 各拆一根；同 Pair 在本轮累计最多拆一根。`=2` 则将每 Pair 上限改为两根。不指定则完整执行原 LP 目标；此参数只进行一次受限重配，不自动追加阶段。
+
+注意：旧版本按每台 P 的拆链总数限制，当前按 Pair 限制。`toe_prefill_pair_remove.csv` 记录逐 Pair 预算验收，`toe_prefill_remove.csv` 保留逐 P 总量并追加 `budget_scope=pair,max_removed_per_pair`；逐 P 总量大于 1 不再意味着违反 remove1。
 
 参数边界、算法、TE/TOE 联用、日志和验证见 [TE / TOE 每轮变化限幅](TE_TOE_CHANGE_LIMITS.md)。

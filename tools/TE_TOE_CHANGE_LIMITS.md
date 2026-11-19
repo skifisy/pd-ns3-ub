@@ -7,7 +7,7 @@
 | 参数 | 不指定 | 显式指定 |
 |---|---|---|
 | `--te-max-weight-step=0.10` | 原 TE 发布方式 | 每个有方向 OD 每轮最多迁移 0.10 的路径选择概率 |
-| `--toe-max-prefill-remove=2` | 原 TOE 完整目标拓扑 | 每台 Prefill Leaf 每轮最多拆除 2 根旧 OCS 电路 |
+| `--toe-max-prefill-remove=2` | 原 TOE 完整目标拓扑 | 每个涉及 Prefill 的具体 Leaf Pair 每轮最多拆除 2 根旧 OCS 电路 |
 
 ```bash
 # TE，其他 case / 仿真参数按原实验保留
@@ -57,12 +57,28 @@ step 约束概率分布的总变差距离，不约束实际迁移流数、字节
 
 固定 Mooncake 映射：L37–L48 为 Prefill；20 个 Leaf 的分组和每 Leaf 64 个 OCS 端口沿用现有控制器要求。
 
-每台 Prefill Leaf 的拆链数为 `sum_j max(0,current(i,j)-planned(i,j))`，包括 P–P、P–D、P–S；新增电路不能抵消拆除量。P–P 两端分别消耗各自预算。预算以每轮实际拓扑为起点，不跨轮累积。
+`--toe-max-prefill-remove=k` 对每个涉及 Prefill 的无向具体 Leaf Pair `{i,j}` 分别施加 `max(0,current(i,j)-planned(i,j)) <= k`，包括 P–P、P–D、P–S。新增电路不能抵消拆除量，同一 Pair 在本轮多次接受的候选中累计拆除也不能超过 k；不同 Pair 不共用预算。P–P 按一个无向 Pair 检查，D–S 不受此 Prefill 拆链参数限制。预算以每轮实际拓扑为起点，不跨轮累积。
 
-规划器从当前拓扑向完整 LP 目标挑选交替拆建链闭合组合：先生成两拆两建候选，再寻找更长的交替闭合路径，包括同一 Leaf 以不同拆建状态出现的组合。每次接受一组后重新计算剩余差分和预算。每组均保证：
+**口径变更：**旧版本按每台 P 的拆链总和限幅；当前 `remove1`（`--toe-max-prefill-remove=1`）改为每个具体 P 相邻 Pair 最多拆一根。同名旧实验与新实验不可直接视为相同限制；回放元数据新增 `toe_prefill_remove_scope=pair`，审计 CSV 同时写出 `budget_scope=pair`。
+
+例如从原始每 Pair 四根的均匀拓扑出发，各 P–D、P–S Pair 拆一根，所有允许的跨组 P–P Pair 各加一根，所有 D–S Pair 各加三根，可得到：
+
+| 电路类别 | 原始 | 调整后 | 变化 |
+|---|---:|---:|---:|
+| P–P | 192 | 240 | +48 |
+| P–D | 192 | 144 | −48 |
+| P–S | 192 | 144 | −48 |
+| D–S | 64 | 112 | +48 |
+| 总计 | 640 | 640 | 0 |
+
+每台 P 共拆八根，但每个 P–D、P–S Pair 只拆一根，符合新 `remove1`；每台 D、S 各释放十二个连接 P 的端口并增加十二个 D–S 端口。每台 Leaf 仍使用 64 个 OCS 端口。实际物理计划保留 544 根、拆除 96 根、新建 96 根；D–S 的 48 根增量不是整个计划的重连总数。这里的 P–P 新增只发生在原有允许的跨组 Pair，不增加组内直连。
+
+这是受限规划器应能执行的可行目标示例，不代表任意需求下 LP 都会选择它。控制器仍使用已观测需求、完整 LP 目标与预测 MLU 验收，不强制每个 D–S Pair 都增加三根。
+
+规划器先验证完整 LP 目标：若其本身符合每 Pair 拆链预算，且预测 MLU 相对当前不恶化，就直接采用整组目标，仅需一次候选评估，避免大量局部中性交换耗尽搜索预算。否则从当前拓扑向完整 LP 目标挑选交替拆建链闭合组合：先生成两拆两建候选，再寻找更长的交替闭合路径，包括同一 Leaf 以不同拆建状态出现的组合。每次接受一组后重新计算剩余差分和预算。每组均保证：
 
 - 每台 Leaf 端口数守恒；所有原允许 Pair 至少 1 根，不新增禁止的 Pair。
-- 各 Pair 数量只向目标单调移动；Prefill 累计拆链不超预算。
+- 各 Pair 数量只向目标单调移动；每个涉及 Prefill 的 Pair 累计拆链不超预算。
 - 预测 MLU 相对起始拓扑及上一接受拓扑均不恶化（浮点容差 `1e-12 * max(1,initial_mlu)`）。
 
 在搜索到的候选中选择 MLU 最小者；收益相当时选择拆链更少者，然后使用固定 Pair 排序打破平局。预算只限制上限，不保证用满；无可接受组合就保持当前拓扑。`0` 禁止任何 Prefill 拆链，但仍允许完全不触及 Prefill 的合法变化。
@@ -79,7 +95,8 @@ ECMP 评估包含同组 OD 按第一跳物理端口数分配的两跳负载。WC
 | `toe_topology.csv: planned` | 本轮受限目标，只在开启限制时出现 |
 | `toe_topology.csv: applied` | 物理回读后的实际拓扑；未调整时为当前拓扑 |
 | `toe_bounded.csv` | 起始/计划预测 MLU、LP/计划重连数、搜索量和状态 |
-| `toe_prefill_remove.csv` | 每台 Prefill 的 planned 拆链数；成功应用后追加 applied 实际拆链数 |
+| `toe_prefill_remove.csv` | 每台 Prefill 的 planned/applied 拆链总数，以及 `max_removed_per_pair`；总数可以大于预算，`max_prefill_remove` 是每 Pair 上限，`budget_scope=pair` |
+| `toe_prefill_pair_remove.csv` | 每个涉及 Prefill 的无向具体 Pair 的 planned/applied 拆链数和预算，包括零拆链 Pair；applied 按实际物理拆链计数，并逐 Pair 验证上限 |
 
 开启限制时 `toe_summary.csv` 追加 `bounded,current_predicted_mlu,planned_predicted_mlu`；原有 `min_mlu,applied_mlu_bound,solver_optimal` 始终为完整 LP 目标属性。`solved` 行的重连数为 LP 目标，后续 `draining/applied/bounded-no-change` 行为实际执行计划数量。物理拆建一致性检查也使用计划数量。原 `toe-mlu-slack` 不保证约束受限拓扑。切换期间历史可能推进，候选预览是决策时快照，应用后 TE 会按应用时的最新窗口重新求解，不能保证两次策略或实际 MLU 完全相同。
 
@@ -97,4 +114,4 @@ g++ -std=c++20 -O2 -Wall -Wextra -Werror -fsanitize=undefined tools/tests/test_t
 python3 -m unittest discover -s tools/tests -p test_analyze_toe_v3.py
 ```
 
-新增测试覆盖 10,000 组概率分布、首次 fallback、冻结/反向/空窗口、路径失效、强制中转排除与全网 cap 冲突、六边闭合组合、重复 Leaf 组合、预算不足、MLU 退化拒绝，以及 30 组固定种子的 Mooncake 拓扑及物理端口拆建一致性。
+新增测试覆盖 10,000 组概率分布、首次 fallback、冻结/反向/空窗口、路径失效、强制中转排除与全网 cap 冲突、六边闭合组合、重复 Leaf 的不同 Pair 独立预算、同 Pair 累计拆链限幅、跨轮预算重置、D–S 不受 P 预算限制、MLU 退化拒绝，以及 30 组固定种子的 Mooncake 拓扑及物理端口拆建一致性。`remove1` 专项测试验证上述 240/144/144/112 拓扑、每台 Leaf 度数守恒、D–S 每 Pair 从四根增至七根、每台 P 拆八根，以及实际保留/拆除/新增端口计划；均匀 D–S 需求下预测 MLU 从 1 降至 4/7。

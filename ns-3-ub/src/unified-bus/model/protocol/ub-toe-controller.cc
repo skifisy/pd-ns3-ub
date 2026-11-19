@@ -180,7 +180,10 @@ UbToeController::Configure(const std::string& casePath,
             << "epoch,current_predicted_mlu,planned_predicted_mlu,target_changed_circuits,"
                "planned_changed_circuits,candidate_evaluations,search_limited,status\n";
         std::ofstream(m_outputDir + "/toe_prefill_remove.csv")
-            << "epoch,status,leaf,removed_circuits,max_prefill_remove\n";
+            << "epoch,status,leaf,removed_circuits,max_prefill_remove,budget_scope,"
+               "max_removed_per_pair\n";
+        std::ofstream(m_outputDir + "/toe_prefill_pair_remove.csv")
+            << "epoch,status,src_leaf,dst_leaf,removed_circuits,max_prefill_remove,budget_scope\n";
     }
     if (LossyCutoverEnabled())
     {
@@ -346,13 +349,7 @@ void UbToeController::Recompute()
                 << bounded.changedCircuits << ',' << bounded.evaluations << ','
                 << bounded.searchLimited << ','
                 << (bounded.changedCircuits ? "planned" : "no-acceptable-move") << '\n';
-            std::ofstream removals(m_outputDir + "/toe_prefill_remove.csv", std::ios::app);
-            for (uint32_t leaf : prefill)
-            {
-                removals << m_epoch << ",planned," << leaf << ','
-                         << (bounded.removed.count(leaf) ? bounded.removed.at(leaf) : 0) << ','
-                         << m_maxPrefillRemove << '\n';
-            }
+            WritePrefillRemovals(UbToeBounded::RemovedPairs(current, bounded.topology), "planned");
             auto execution = result;
             execution.topology = bounded.topology;
             execution.changedCircuits = bounded.changedCircuits;
@@ -741,20 +738,12 @@ void UbToeController::ApplyReconfiguration()
     if (m_maxPrefillRemove >= 0)
     {
         // Physical planner's removed endpoints are authoritative after readback.
-        std::map<uint32_t, uint32_t> removed;
+        UbToeSolver::Topology removedPairs;
         for (const auto& circuit : m_plan.removed)
         {
-            ++removed[circuit.a];
-            ++removed[circuit.b];
+            ++removedPairs[std::minmax(circuit.a, circuit.b)];
         }
-        std::ofstream output(m_outputDir + "/toe_prefill_remove.csv", std::ios::app);
-        for (uint32_t leaf = 37; leaf <= 48; ++leaf)
-        {
-            NS_ABORT_MSG_IF(removed[leaf] > static_cast<uint32_t>(m_maxPrefillRemove),
-                            "physical TOE plan exceeds Prefill removal budget");
-            output << m_epoch << ",applied," << leaf << ',' << removed[leaf] << ','
-                   << m_maxPrefillRemove << '\n';
-        }
+        WritePrefillRemovals(removedPairs, "applied");
     }
     std::ofstream summary(m_outputDir + "/toe_summary.csv", std::ios::app);
     summary << std::setprecision(12) << m_epoch << ',' << Simulator::Now().GetSeconds()
@@ -776,6 +765,44 @@ void UbToeController::ApplyReconfiguration()
         WriteCutoverDrops();
     }
     ResumeTraffic();
+}
+
+void
+UbToeController::WritePrefillRemovals(const UbToeSolver::Topology& removedPairs,
+                                     const char* status) const
+{
+    std::map<uint32_t, uint32_t> totals, maxima;
+    std::ofstream pairs(m_outputDir + "/toe_prefill_pair_remove.csv", std::ios::app);
+    for (const auto& [pair, count] : CurrentTopology())
+    {
+        (void)count;
+        const bool firstPrefill = pair.first >= 37 && pair.first <= 48;
+        const bool secondPrefill = pair.second >= 37 && pair.second <= 48;
+        if (!firstPrefill && !secondPrefill)
+        {
+            continue;
+        }
+        const auto found = removedPairs.find(pair);
+        const uint32_t removed = found == removedPairs.end() ? 0 : found->second;
+        NS_ABORT_MSG_IF(removed > static_cast<uint32_t>(m_maxPrefillRemove),
+                        "TOE plan exceeds per-pair Prefill removal budget");
+        pairs << m_epoch << ',' << status << ',' << pair.first << ',' << pair.second << ','
+              << removed << ',' << m_maxPrefillRemove << ",pair\n";
+        for (uint32_t leaf : {pair.first, pair.second})
+        {
+            if (leaf >= 37 && leaf <= 48)
+            {
+                totals[leaf] += removed;
+                maxima[leaf] = std::max(maxima[leaf], removed);
+            }
+        }
+    }
+    std::ofstream leaves(m_outputDir + "/toe_prefill_remove.csv", std::ios::app);
+    for (uint32_t leaf = 37; leaf <= 48; ++leaf)
+    {
+        leaves << m_epoch << ',' << status << ',' << leaf << ',' << totals[leaf] << ','
+               << m_maxPrefillRemove << ",pair," << maxima[leaf] << '\n';
+    }
 }
 
 void UbToeController::RecordCutoverDrop(const char* reason, uint32_t bytes)
