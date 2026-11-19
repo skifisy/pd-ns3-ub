@@ -601,6 +601,10 @@ BuildScenarioFromConfig(const QuickExampleOptions& options, const RuntimeSelecti
         replay.Metadata("toe_mlu_slack", precise(options.toeMluSlack));
         replay.Metadata("te_max_weight_step", precise(options.teMaxWeightStep));
         replay.Metadata("toe_max_prefill_remove", std::to_string(options.toeMaxPrefillRemove));
+        replay.Metadata("toe_bounded_allocator",
+                        options.toeMaxPrefillRemove >= 0 ? "lp_target_ratio" : "disabled");
+        replay.Metadata("toe_prefill_remove_scope",
+                        options.toeMaxPrefillRemove >= 0 ? "pair" : "disabled");
         replay.Metadata("toe_switch_delay_seconds", precise(options.toeSwitchDelaySeconds));
         replay.Metadata("toe_reconfiguration", options.toeReconfiguration);
         replay.Metadata("dependency_visibility_delay_argument", options.dependencyVisibilityDelay);
@@ -932,7 +936,7 @@ QuickExampleOptions ParseOptions(int argc, char* argv[])
                  options.toeMluSlack);
     cmd.AddValue(
         "toe-max-prefill-remove",
-        "Optional old OCS circuits removed per Prefill leaf per epoch in [0,64] (default off)",
+        "Per-pair Prefill donor limit for LP-guided D-S allocation in [0,64] (default off)",
         options.toeMaxPrefillRemoveArg);
     cmd.AddValue("toe-switch-delay-seconds", "OCS reconnection delay (default 0s)",
                  options.toeSwitchDelaySeconds);

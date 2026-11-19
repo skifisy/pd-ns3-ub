@@ -117,6 +117,6 @@ epoch 0 的 `initial` 为初始连接；后续 `retained/remove/add` 为切换�
 
 ## 求解后受限拓扑规划
 
-可选参数 `--toe-max-prefill-remove` 在原求解之后，以交替拆建闭合组合选择满足预算、端口守恒和预测 MLU 不恶化的拓扑。目标、计划和应用结果分别记录。
+可选参数 `--toe-max-prefill-remove` 在原求解之后，用 LP 目标满足率 `target/current_planned` 逐根分配 D–S 扩容，不再调用第二次拓扑/候选 TE 求解。P–D 捐赠不受原 LP 目标限制，P–S 捐赠仍沿 LP 减链方向，每个具体 Pair 最多拆 k 根并保留至少一根。P–P 作为合法跨组补边，不受原目标限制。每台 Leaf 端口守恒，目标/计划/应用和逐根分配分别审计。该贪心模式不执行逐候选 MLU 单调验收，MLU 日志为 ECMP 算术诊断，with-TE 时明确标记为 `ecmp_proxy`。
 
 参数边界、算法、TE/TOE 联用、日志和验证见 [TE / TOE 每轮变化限幅](TE_TOE_CHANGE_LIMITS.md)。

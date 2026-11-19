@@ -13,29 +13,6 @@ using Planner = ns3::UbToeReconfiguration;
 
 static void Near(double a, double b) { assert(std::abs(a - b) < 1e-10); }
 
-static void Check(const Toe::Topology &old, const Toe::Topology &target,
-                  const Toe::Result &result, const std::set<uint32_t> &prefill,
-                  unsigned budget) {
-  std::map<uint32_t, unsigned> before, after;
-  unsigned removed = 0;
-  for (const auto &[pair, count] : old) {
-    auto value = result.topology.at(pair);
-    assert(value >= 1 && value >= std::min(count, target.at(pair)) &&
-           value <= std::max(count, target.at(pair)));
-    before[pair.first] += count;
-    before[pair.second] += count;
-    after[pair.first] += value;
-    after[pair.second] += value;
-    if (count > value)
-      removed += count - value;
-  }
-  assert(before == after && removed == result.changedCircuits);
-  const auto counts = Toe::Removed(old, result.topology);
-  for (auto leaf : prefill)
-    assert(!counts.count(leaf) || counts.at(leaf) <= budget);
-  assert(result.plannedMlu <= result.beforeMlu + 1e-10);
-}
-
 static void TestWeights() {
   const Te::Weights old{{-1, 1}}, target{{-1, .4}, {41, .4}, {42, .2}};
   auto next = Te::Limit(old, target, .1);
@@ -110,109 +87,208 @@ static void TestWeights() {
          .5 / 11 + .01);
 }
 
-static void TestLongCircuits() {
-  Toe::Topology old;
-  for (unsigned a = 1; a <= 6; ++a)
-    for (unsigned b = a + 1; b <= 6; ++b)
-      old[{a, b}] = 2;
-  auto target = old;
-  for (auto e : {Toe::Od{1, 2}, {3, 4}, {5, 6}})
-    --target[e];
-  for (auto e : {Toe::Od{2, 3}, {4, 5}, {1, 6}})
-    ++target[e];
-  const std::set<unsigned> prefill{1, 2, 3, 4, 5, 6};
-  auto result =
-      Toe::Select(old, target, prefill, 1, [](const auto &) { return 1.; });
-  Check(old, target, result, prefill, 1);
-  assert(result.topology == target);
-  // Two odd cycles sharing a vertex require visiting that leaf in both colors.
-  target = old;
-  for (auto e : {Toe::Od{1, 2}, {1, 3}, {4, 5}})
-    --target[e];
-  for (auto e : {Toe::Od{2, 3}, {1, 4}, {1, 5}})
-    ++target[e];
-  result =
-      Toe::Select(old, target, prefill, 2, [](const auto &) { return 1.; });
-  Check(old, target, result, prefill, 2);
-  assert(result.topology == target);
-  result =
-      Toe::Select(old, target, prefill, 1, [](const auto &) { return 1.; });
-  assert(result.topology == old); // Shared leaf needs two removals atomically.
-  result =
-      Toe::Select(old, target, prefill, 0, [](const auto &) { return 1.; });
-  assert(result.topology == old);
-  result = Toe::Select(old, target, prefill, 2,
-                       [&](const auto &t) { return t == old ? 1. : 2.; });
-  assert(result.topology == old); // Reject MLU regression.
-  bool rejected = false;
-  ++target[{1, 2}];
-  try {
-    Toe::Select(old, target, prefill, 2, [](const auto &) { return 1.; });
-  } catch (const std::invalid_argument &) {
-    rejected = true;
+struct Fixture {
+  Toe::Topology current;
+  std::map<unsigned, unsigned> groups;
+  std::set<unsigned> prefill, decode, storage;
+  std::vector<Planner::Circuit> circuits;
+  Fixture() {
+    std::map<unsigned, uint16_t> port;
+    for (unsigned a = 37; a <= 56; ++a) {
+      groups[a] = (a - 37) / 4;
+      port[a] = 64;
+      (a <= 48 ? prefill : a <= 52 ? decode : storage).insert(a);
+    }
+    for (unsigned a = 37; a <= 56; ++a)
+      for (unsigned b = a + 1; b <= 56; ++b)
+        if (groups.at(a) != groups.at(b)) {
+          current[{a, b}] = 4;
+          for (unsigned lane = 0; lane < 4; ++lane)
+            circuits.push_back({a, port[a]++, b, port[b]++});
+        }
   }
-  assert(rejected);
+  Toe::Result Select(const Toe::Topology &target, unsigned budget = 1) const {
+    return Toe::Select(current, target, prefill, decode, storage, budget);
+  }
+};
+
+static void Check(const Fixture &f, const Toe::Topology &target,
+                  const Toe::Result &result, unsigned budget = 1) {
+  std::map<unsigned, unsigned> before, after;
+  unsigned removed = 0;
+  for (const auto &[pair, count] : f.current) {
+    const auto value = result.topology.at(pair);
+    assert(value >= 1);
+    before[pair.first] += count;
+    before[pair.second] += count;
+    after[pair.first] += value;
+    after[pair.second] += value;
+    if (count > value) removed += count - value;
+    if (pair.first <= 48 && pair.second >= 53) // P-S follows LP reductions only.
+      assert(value <= count && value >= std::min(count, target.at(pair)));
+    if (pair.first >= 49) // D-S grows towards, never beyond, the LP target.
+      assert(value >= count && value <= std::max(count, target.at(pair)));
+    if (pair.second <= 48) assert(value >= count); // P-P balances freed endpoints.
+  }
+  assert(before == after && removed == result.changedCircuits);
+  assert(result.changedCircuits == 2 * result.allocations.size());
+  assert(Toe::WithinBudget(f.current, result.topology, f.prefill, budget));
+  auto replay = f.current;
+  for (const auto &step : result.allocations) {
+    assert(replay.at(step.ds) == step.before);
+    assert(target.at(step.ds) == step.target && step.before < step.target);
+    assert(f.prefill.count(step.pp.first) && f.prefill.count(step.pp.second));
+    --replay.at(step.pd); --replay.at(step.ps);
+    ++replay.at(step.ds); ++replay.at(step.pp);
+    assert(Toe::WithinBudget(f.current,replay,f.prefill,budget));
+  }
+  assert(replay == result.topology); // The allocation audit reconstructs the plan.
+  const auto plan = Planner::Build(f.circuits, result.topology);
+  assert(plan.removed.size() == result.changedCircuits);
+  assert(plan.added.size() == result.changedCircuits);
+  Toe::Topology readback;
+  std::map<unsigned, std::set<uint16_t>> endpoints;
+  for (const auto *part : {&plan.retained, &plan.added})
+    for (const auto &c : *part) {
+      assert(endpoints[c.a].insert(c.ap).second);
+      assert(endpoints[c.b].insert(c.bp).second);
+      ++readback[{c.a, c.b}];
+    }
+  assert(readback == result.topology);
+  for (const auto &[leaf, ports] : endpoints) {
+    (void)leaf;
+    assert(ports.size() == 64 && *ports.begin() == 64 && *ports.rbegin() == 127);
+  }
 }
 
-static void TestMooncake() {
-  Toe::Topology old;
-  std::map<unsigned, unsigned> groups;
-  std::set<unsigned> prefill;
-  std::vector<Planner::Circuit> circuits;
-  std::map<unsigned, uint16_t> port;
-  for (unsigned a = 37; a <= 56; ++a) {
-    groups[a] = (a - 37) / 4;
-    if (a <= 48)
-      prefill.insert(a);
-    for (unsigned b = a + 1; b <= 56; ++b)
-      if ((a - 37) / 4 != (b - 37) / 4) {
-        old[{a, b}] = 4;
-        for (unsigned c = 0; c < 4; ++c)
-          circuits.push_back({a, port[a]++, b, port[b]++});
-      }
+// Exact epoch-4 target reconstructed from the user-supplied topology snapshot.
+static Toe::Topology EpochFourTarget(const Fixture &f) {
+  auto t = f.current;
+  const unsigned pd[12][4] = {
+      {1,4,1,4}, {1,1,1,1}, {1,2,4,1}, {2,4,4,4},
+      {4,1,2,1}, {1,1,1,1}, {4,1,1,4}, {4,4,4,1},
+      {1,1,4,2}, {1,4,1,1}, {4,4,4,4}, {4,1,1,4}};
+  for (unsigned p = 37; p <= 48; ++p) {
+    for (unsigned d = 49; d <= 52; ++d) t[{p,d}] = pd[p-37][d-49];
+    for (unsigned s = 53; s <= 56; ++s) t[{p,s}] = p <= 40 ? 3 : 2;
   }
-  // Same-group traffic hashes over physical first-hop ports, then transits.
-  Near(Toe::EcmpMlu(old, groups, {{{37, 38}, 64 * 400e9}}), 1);
-  Near(Toe::EcmpMlu(old, groups, {{{37, 53}, 1600e9}}), 1);
-  std::mt19937 rng(123);
-  for (unsigned trial = 0; trial < 30; ++trial) {
-    auto target = old;
-    for (unsigned step = 0; step < 40; ++step) {
-      const unsigned a = 37 + rng() % 20, b = 37 + rng() % 20,
-                     c = 37 + rng() % 20, d = 37 + rng() % 20;
-      if (std::set<unsigned>{a, b, c, d}.size() != 4)
-        continue;
-      const Toe::Od ab = std::minmax(a, b), cd = std::minmax(c, d),
-                    ac = std::minmax(a, c), bd = std::minmax(b, d);
-      if (!target.count(ab) || !target.count(cd) || !target.count(ac) ||
-          !target.count(bd) || target[ab] <= 1 || target[cd] <= 1)
-        continue;
-      --target[ab];
-      --target[cd];
-      ++target[ac];
-      ++target[bd];
+  for (auto [pair, delta] : std::map<Toe::Od, unsigned>{
+      {{37,43},5}, {{37,47},5}, {{38,44},5}, {{38,48},11},
+      {{39,43},9}, {{39,48},3}, {{40,44},6}, {{41,45},16},
+      {{42,46},17}, {{42,47},3}}) t[pair] += delta;
+  for (unsigned d : f.decode)
+    for (unsigned s : f.storage) t[{d,s}] = 9;
+  return t;
+}
+
+// Construct a port-balanced LP reference by explicit legal swaps. The final
+// allocator may choose different P-D donors and P-P balancing links.
+static Toe::Topology Target(const Fixture &f, const std::map<Toe::Od,unsigned> &ds) {
+  auto t = f.current;
+  unsigned index = 0;
+  for (auto [pair, count] : ds)
+    for (unsigned n = 4; n < count; ++n) {
+      const unsigned pa = 37 + index % 12, pb = 37 + (index + 4) % 12;
+      assert(t.at({pa,pair.first}) > 1 && t.at({pb,pair.second}) > 1);
+      --t.at({pa,pair.first}); --t.at({pb,pair.second});
+      ++t.at(pair); ++t.at(std::minmax(pa,pb)); ++index;
     }
-    const std::map<Toe::Od, double> demand{
-        {{53, 49}, 1600e9}, {{37, 38}, 800e9}, {{54, 42}, 800e9}};
-    auto evaluate = [&](const auto &t) {
-      return Toe::EcmpMlu(t, groups, demand);
-    };
-    const auto result = Toe::Select(old, target, prefill, 2, evaluate);
-    Check(old, target, result, prefill, 2);
-    const auto plan = Planner::Build(circuits, result.topology);
-    assert(plan.removed.size() == result.changedCircuits &&
-           plan.added.size() == result.changedCircuits);
-    const auto repeated = Toe::Select(old, target, prefill, 2, evaluate);
-    assert(repeated.topology == result.topology);
+  return t;
+}
+
+static void TestEpochFour() {
+  Fixture f;
+  const auto t = EpochFourTarget(f);
+  const auto r = f.Select(t);
+  Check(f,t,r);
+  unsigned pp=0,pd=0,ps=0,ds=0;
+  bool independentPd=false, independentPp=false;
+  for (auto [pair,n] : r.topology) {
+    if (pair.second <= 48) { pp+=n; independentPp |= n>t.at(pair); }
+    else if (pair.first<=48 && pair.second<=52) { pd+=n; independentPd |= n<t.at(pair); }
+    else if (pair.first<=48) ps+=n;
+    else { ds+=n; assert(n==7); }
+  }
+  assert(pp==240 && pd==144 && ps==144 && ds==112);
+  assert(independentPd && independentPp);
+  for (auto p : f.prefill) assert(r.removed.at(p)==8);
+  assert(f.Select(t).topology == r.topology);
+  assert(f.Select(t,0).topology == f.current);
+  std::map<Toe::Od,double> demand;
+  for (auto d : f.decode) for (auto s : f.storage) demand[{s,d}]=1600e9;
+  Near(Toe::EcmpMlu(f.current,f.groups,demand),1);
+  Near(Toe::EcmpMlu(r.topology,f.groups,demand),4.0/7);
+}
+
+static void TestRatios() {
+  Fixture f;
+  const auto t=Target(f,{{{49,53},10},{{49,54},8},{{49,55},6},{{49,56},6}});
+  const auto r=f.Select(t); Check(f,t,r);
+  assert(r.topology.at({49,53})==9 && r.topology.at({49,54})==7);
+  assert(r.topology.at({49,55})==6 && r.topology.at({49,56})==6);
+  assert(r.allocations.front().ds == Toe::Od(49,53));
+  auto hot=Target(f,{{{49,53},10}});
+  const auto ten=f.Select(hot); Check(f,hot,ten);
+  assert(ten.topology.at({49,53})==10); // No hard-coded 6/7/9 ceiling.
+  assert(ten.allocations.size()==6);
+  const auto done=f.Select(f.current); assert(done.topology==f.current);
+
+  // A high-priority pair exhausts its P-S donors; other feasible pairs proceed.
+  auto limited=f.current;
+  for (unsigned pa : {37u,38u,39u}) {
+    --limited.at({pa,49}); --limited.at({41,53});
+    ++limited.at({49,53}); ++limited.at({pa,41});
+  }
+  for (unsigned i=0;i<2;++i) {
+    --limited.at({37+i,49}); --limited.at({42+i,54});
+    ++limited.at({49,54}); ++limited.at({37+i,42+i});
+  }
+  const auto skip=f.Select(limited); Check(f,limited,skip);
+  assert(skip.topology.at({49,53})==5 && skip.topology.at({49,54})==6);
+}
+
+static void TestBudgetsAndRandom() {
+  Fixture f;
+  const auto t=EpochFourTarget(f);
+  auto twice=f.Select(t,2); Check(f,t,twice,2);
+  for(auto d:f.decode) for(auto s:f.storage) assert(twice.topology.at({d,s})==9);
+  const auto first=f.Select(t);
+  const auto next=Toe::Select(first.topology,t,f.prefill,f.decode,f.storage,1);
+  assert(Toe::WithinBudget(first.topology,next.topology,f.prefill,1));
+  assert(!next.allocations.empty()); // Budget resets against the next actual topology.
+  auto floor=f.current;
+  // No growth and no P-S reduction means no unsolicited changes.
+  assert(f.Select(floor).allocations.empty());
+  bool rejected=false;
+  try { auto bad=t; ++bad.at({37,49}); f.Select(bad); }
+  catch(const std::invalid_argument &) { rejected=true; }
+  assert(rejected);
+  rejected=false;
+  try { auto bad=t; bad.erase({37,49}); f.Select(bad); }
+  catch(const std::invalid_argument &) { rejected=true; }
+  assert(rejected);
+  rejected=false;
+  try { auto bad=t; bad.at({37,49})=0; f.Select(bad); }
+  catch(const std::invalid_argument &) { rejected=true; }
+  assert(rejected);
+
+  std::mt19937 rng(20261119);
+  for(unsigned trial=0;trial<100;++trial) {
+    auto random=f.current;
+    for(unsigned step=0;step<50;++step) {
+      const unsigned pa=37+rng()%12,pb=37+rng()%12,d=49+rng()%4,s=53+rng()%4;
+      const Toe::Od pp=std::minmax(pa,pb);
+      if(!random.count(pp) || random.at({pa,d})<=1 || random.at({pb,s})<=1) continue;
+      --random.at({pa,d}); --random.at({pb,s}); ++random.at({d,s}); ++random.at(pp);
+    }
+    const unsigned budget=rng()%4;
+    const auto r=f.Select(random,budget); Check(f,random,r,budget);
+    assert(f.Select(random,budget).topology==r.topology);
   }
 }
 
 int main() {
-  TestWeights();
-  TestLongCircuits();
-  TestMooncake();
-  std::cout
-      << "PASS: TE probabilities, reversal/freeze/idle/fallback/cap/repair; "
-         "TOE long trails, budgets, ECMP transit, deterministic Mooncake "
-         "physical plans\n";
+  TestWeights(); TestEpochFour(); TestRatios(); TestBudgetsAndRandom();
+  std::cout << "PASS: TE weight limits; LP-ratio D-S allocation, epoch4 64-to-112, "
+               "nonuniform 9/7/6/6, target 10, donor budgets and physical readback\n";
 }

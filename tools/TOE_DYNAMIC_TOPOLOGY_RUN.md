@@ -215,12 +215,16 @@ python3 ../tools/make_toe_local_smoke.py --case-path scratch/mooncake_pd_ocs --o
 
 将输出用于单独的测试 case 的 `traffic.csv`。trace 含热点预热、29.999999 秒启动的热点任务、30 秒之后每 100us 开始的其它跨组 pair 流量及 31 秒收尾任务。用 `--toe-history-windows=1 --toe-recompute-seconds=30 --toe-switch-delay-seconds=0.002` 做检查。热点优化可能同时调整其它 pair，因此日志中的计数才是判断依据，不假定某个指定 pair 必然不变。
 
-本工作环境没有完整 ns-3 构建工具和运行产物：已执行端口规划回归、修改文件语法检查和 patch 应用检查；未执行此 trace 或大规模仿真。应用后先完成短 trace，再比较相同输入和参数下的 global/selective FCT。
+本次改动已完成 `ub-quick-example` 入口编译、独立分配/物理规划回归与分析脚本测试。当前构建未链接 HiGHS，未执行此 TOE trace 或大规模仿真；运行上述场景前仍需启用 HiGHS 后端。应用后先完成短 trace，再比较相同输入和参数下的 global/selective FCT。
 
 
 
 ## 可选的 Prefill 拆链上限
 
-显式指定 `--toe-max-prefill-remove=2`，每轮每台 Prefill Leaf 最多拆两根旧电路。不指定则完整执行原 LP 目标；此参数只进行一次受限重配，不自动追加阶段。
+显式指定 `--toe-max-prefill-remove=1`（remove1），每轮每个涉及 Prefill 的具体无向 Leaf Pair 最多拆一根旧电路。同一 P 可向不同 D、S 各拆一根；同 Pair 在本轮累计最多拆一根。`=2` 则将每 Pair 上限改为两根。不指定则完整执行原 LP 目标；此参数只进行一次受限重配，不自动追加阶段。
+
+注意：旧版本按每台 P 的拆链总数限制，当前按 Pair 限制。`toe_prefill_pair_remove.csv` 记录逐 Pair 预算验收，`toe_prefill_remove.csv` 保留逐 P 总量并追加 `budget_scope=pair,max_removed_per_pair`；逐 P 总量大于 1 不再意味着违反 remove1。
+
+本模式按已有 LP 的 D–S 目标满足率逐条分配，不预设每 Pair 加三根。P–D 可以脱离原 LP 目标回收，P–S 只沿 LP 要求减链，P–P 补边也不受原目标限制。新增 `toe_ds_allocation.csv` 可检查每根 D–S 的优先级与捐赠 Pair。分配不再调用候选 TE 预览求解；MLU 仅作 ECMP 算术诊断，with-TE 的值标为 `ecmp_proxy`，不保证单调下降。
 
 参数边界、算法、TE/TOE 联用、日志和验证见 [TE / TOE 每轮变化限幅](TE_TOE_CHANGE_LIMITS.md)。
