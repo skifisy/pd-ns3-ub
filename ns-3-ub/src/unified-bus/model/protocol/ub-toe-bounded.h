@@ -5,35 +5,35 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
-#include <functional>
-#include <limits>
 #include <map>
 #include <set>
 #include <stdexcept>
+#include <tuple>
 #include <utility>
 #include <vector>
 
 namespace ns3
 {
 
-/** Deterministic, bounded search over port-conserving alternating circuits.
- * This is a local postprocessor, not a replacement for the topology MIP. */
+/** LP-guided integer D-S allocation using port-conserving two-circuit swaps.
+ * This postprocessor never calls a solver or a topology evaluator. */
 class UbToeBounded
 {
   public:
     using Od = std::pair<uint32_t, uint32_t>;
     using Topology = std::map<Od, uint32_t>;
-    using Move = std::map<Od, int32_t>;
-    using Evaluator = std::function<double(const Topology&)>;
+    struct Allocation
+    {
+        Od ds, pd, ps, pp;
+        uint32_t before, target;
+    };
 
     struct Result
     {
         Topology topology;
         std::map<uint32_t, uint32_t> removed;
         uint64_t changedCircuits{0};
-        double beforeMlu{0}, plannedMlu{0};
-        uint32_t evaluations{0};
-        bool searchLimited{false};
+        std::vector<Allocation> allocations;
     };
 
     static std::map<uint32_t, uint32_t> Removed(const Topology& old, const Topology& next)
@@ -128,19 +128,30 @@ class UbToeBounded
     static Result Select(const Topology& current,
                          const Topology& target,
                          const std::set<uint32_t>& prefill,
-                         uint32_t budget,
-                         const Evaluator& evaluate,
-                         uint32_t maxEvaluations = 20000)
+                         const std::set<uint32_t>& decode,
+                         const std::set<uint32_t>& storage,
+                         uint32_t budget)
     {
         if (current.size() != target.size())
         {
             throw std::invalid_argument("TOE pair set changed");
         }
+        std::set<uint32_t> roles = prefill;
+        for (const auto* role : {&decode, &storage})
+        {
+            for (uint32_t leaf : *role)
+            {
+                if (!roles.insert(leaf).second)
+                {
+                    throw std::invalid_argument("overlapping TOE leaf roles");
+                }
+            }
+        }
         std::map<uint32_t, int64_t> balance;
         for (const auto& [pair, count] : current)
         {
             if (pair.first >= pair.second || count < 1 || !target.count(pair) ||
-                target.at(pair) < 1)
+                target.at(pair) < 1 || !roles.count(pair.first) || !roles.count(pair.second))
             {
                 throw std::invalid_argument("invalid bounded TOE topology");
             }
@@ -158,209 +169,102 @@ class UbToeBounded
         }
         Result result;
         result.topology = current;
-        result.beforeMlu = result.plannedMlu = evaluate(current);
-        if (!std::isfinite(result.beforeMlu))
+        Topology remaining;
+        for (uint32_t p : prefill)
         {
-            throw std::runtime_error("invalid current TOE MLU");
-        }
-        if (current == target)
-        {
-            return result;
-        }
-        // A legal complete target need not be rediscovered through thousands
-        // of individually neutral swaps. In particular, uniformly increasing
-        // all D-S pairs may leave MLU unchanged until every bottleneck moves.
-        if (maxEvaluations > 0 && WithinBudget(current, target, prefill, budget))
-        {
-            ++result.evaluations;
-            const double mlu = evaluate(target);
-            const double tolerance = 1e-12 * std::max(1.0, result.beforeMlu);
-            if (std::isfinite(mlu) && mlu <= result.beforeMlu + tolerance)
+            for (uint32_t d : decode)
             {
-                result.topology = target;
-                result.plannedMlu = mlu;
-                result.removed = Removed(current, target);
-                for (const auto& [pair, removed] : RemovedPairs(current, target))
+                const Od pair = std::minmax(p, d);
+                if (current.count(pair))
                 {
-                    (void)pair;
-                    result.changedCircuits += removed;
+                    // P-D donors are independent of the LP target.
+                    remaining[pair] = std::min(budget, current.at(pair) - 1);
                 }
-                return result;
+            }
+            for (uint32_t s : storage)
+            {
+                const Od pair = std::minmax(p, s);
+                if (current.count(pair))
+                {
+                    // Only P-S reductions requested by the LP may donate.
+                    const uint32_t reduction = current.at(pair) > target.at(pair)
+                                                   ? current.at(pair) - target.at(pair) : 0;
+                    remaining[pair] = std::min(budget, reduction);
+                }
             }
         }
         for (;;)
         {
-            std::set<Move> moves;
-            std::vector<Od> remove;
-            for (const auto& [pair, count] : result.topology)
+            std::vector<Od> candidates;
+            for (uint32_t d : decode)
             {
-                if (count > target.at(pair))
+                for (uint32_t s : storage)
                 {
-                    remove.push_back(pair);
-                }
-            }
-            // Enumerate all two-circuit swaps first.
-            for (size_t i = 0; i < remove.size(); ++i)
-            {
-                for (size_t j = i + 1; j < remove.size(); ++j)
-                {
-                    const auto [a, b] = remove[i];
-                    const auto [c, d] = remove[j];
-                    if (a == c || a == d || b == c || b == d)
+                    const Od pair = std::minmax(d, s);
+                    if (current.count(pair) && result.topology.at(pair) < target.at(pair))
                     {
-                        continue;
-                    }
-                    for (const auto& pairing :
-                         {std::make_pair(Od{a, c}, Od{b, d}), std::make_pair(Od{a, d}, Od{b, c})})
-                    {
-                        const Od x = std::minmax(pairing.first.first, pairing.first.second);
-                        const Od y = std::minmax(pairing.second.first, pairing.second.second);
-                        if (!target.count(x) || !target.count(y) ||
-                            result.topology.at(x) >= target.at(x) ||
-                            result.topology.at(y) >= target.at(y))
-                        {
-                            continue;
-                        }
-                        moves.insert({{remove[i], -1}, {remove[j], -1}, {x, 1}, {y, 1}});
+                        candidates.push_back(pair);
                     }
                 }
             }
-            // Also find longer alternating closed trails. A leaf may occur once
-            // in each color, allowing odd-cycle pairs sharing a leaf. Edge use
-            // is checked against the remaining multiplicity, including repeats.
-            uint32_t expansions = 0;
-            for (const auto& seed : remove)
+            // Compare target/current ratios exactly, without floating point.
+            std::sort(candidates.begin(), candidates.end(), [&](const Od& a, const Od& b) {
+                const uint64_t left = uint64_t{target.at(a)} * result.topology.at(b);
+                const uint64_t right = uint64_t{target.at(b)} * result.topology.at(a);
+                if (left != right) return left > right;
+                const uint32_t gapA = target.at(a) - result.topology.at(a);
+                const uint32_t gapB = target.at(b) - result.topology.at(b);
+                if (gapA != gapB) return gapA > gapB;
+                return a < b;
+            });
+            bool accepted = false;
+            for (const Od& ds : candidates)
             {
-                if (expansions >= 100000)
+                const uint32_t d = decode.count(ds.first) ? ds.first : ds.second;
+                const uint32_t s = storage.count(ds.first) ? ds.first : ds.second;
+                bool found = false;
+                Od bestPd, bestPs, bestPp;
+                std::tuple<uint32_t, uint32_t, Od, Od> bestScore;
+                for (uint32_t pa : prefill)
                 {
-                    result.searchLimited = true;
-                    break;
-                }
-                Move move;
-                std::set<std::pair<uint32_t, int>> visited;
-                const uint32_t start = seed.first;
-                std::function<bool(uint32_t, int)> walk = [&](uint32_t leaf, int sign) {
-                    if (++expansions > 100000)
+                    const Od pd = std::minmax(pa, d);
+                    if (!remaining.count(pd) || remaining.at(pd) == 0) continue;
+                    for (uint32_t pb : prefill)
                     {
-                        return false;
-                    }
-                    if (!move.empty() && leaf == start && sign == -1)
-                    {
-                        if (move.size() > 4)
+                        const Od ps = std::minmax(pb, s);
+                        const Od pp = std::minmax(pa, pb);
+                        if (!remaining.count(ps) || remaining.at(ps) == 0 ||
+                            !current.count(pp)) continue; // No self/intra-group P-P link.
+                        // Spread balancing links; fixed IDs make ties reproducible.
+                        const auto score = std::make_tuple(result.topology.at(pp),
+                            current.at(pd) - result.topology.at(pd) +
+                            current.at(ps) - result.topology.at(ps), pd, ps);
+                        if (!found || score < bestScore)
                         {
-                            moves.insert(move);
-                        }
-                        return true;
-                    }
-                    if (!visited.insert({leaf, sign}).second)
-                    {
-                        return false;
-                    }
-                    for (const auto& [pair, count] : result.topology)
-                    {
-                        if (pair.first != leaf && pair.second != leaf)
-                        {
-                            continue;
-                        }
-                        const int64_t remaining = static_cast<int64_t>(target.at(pair)) - count;
-                        const int64_t used = move.count(pair) ? move.at(pair) : 0;
-                        if ((sign < 0 && remaining - used >= 0) ||
-                            (sign > 0 && remaining - used <= 0))
-                        {
-                            continue;
-                        }
-                        if (move.empty() && pair != seed)
-                        {
-                            continue;
-                        }
-                        move[pair] += sign;
-                        bool withinBudget = true;
-                        if (sign < 0 && (prefill.count(pair.first) || prefill.count(pair.second)))
-                        {
-                            const uint32_t removed = current.at(pair) - count +
-                                                     static_cast<uint32_t>(-move.at(pair));
-                            withinBudget = removed <= budget;
-                        }
-                        const uint32_t next = pair.first == leaf ? pair.second : pair.first;
-                        if (withinBudget && walk(next, -sign))
-                        {
-                            return true;
-                        }
-                        move[pair] -= sign;
-                        if (move[pair] == 0)
-                        {
-                            move.erase(pair);
-                        }
-                        if (expansions >= 100000)
-                        {
-                            break;
+                            found = true;
+                            bestScore = score;
+                            bestPd = pd;
+                            bestPs = ps;
+                            bestPp = pp;
                         }
                     }
-                    visited.erase({leaf, sign});
-                    return false;
-                };
-                (void)walk(start, -1);
+                }
+                if (!found) continue; // Try the next feasible D-S pair.
+                result.allocations.push_back({ds, bestPd, bestPs, bestPp,
+                                              result.topology.at(ds), target.at(ds)});
+                --result.topology.at(bestPd);
+                --result.topology.at(bestPs);
+                ++result.topology.at(ds);
+                ++result.topology.at(bestPp);
+                --remaining.at(bestPd);
+                --remaining.at(bestPs);
+                result.changedCircuits += 2;
+                accepted = true;
+                break; // Re-rank after every allocated circuit.
             }
-            Topology best;
-            double bestMlu = std::numeric_limits<double>::infinity();
-            uint64_t bestChanges = std::numeric_limits<uint64_t>::max();
-            for (const auto& move : moves)
-            {
-                Topology candidate = result.topology;
-                for (const auto& [pair, delta] : move)
-                {
-                    candidate.at(pair) =
-                        static_cast<uint32_t>(static_cast<int64_t>(candidate.at(pair)) + delta);
-                }
-                const auto removed = Removed(current, candidate);
-                if (!WithinBudget(current, candidate, prefill, budget))
-                {
-                    continue;
-                }
-                if (result.evaluations >= maxEvaluations)
-                {
-                    result.searchLimited = true;
-                    break;
-                }
-                ++result.evaluations;
-                const double mlu = evaluate(candidate);
-                // Compare against both the initial and last accepted MLU to
-                // avoid accumulating a numerical tolerance over many moves.
-                const double tolerance = 1e-12 * std::max(1.0, result.beforeMlu);
-                if (!std::isfinite(mlu) || mlu > result.beforeMlu + tolerance ||
-                    mlu > result.plannedMlu + tolerance)
-                {
-                    continue;
-                }
-                uint64_t changes = 0;
-                for (const auto& [leaf, count] : removed)
-                {
-                    (void)leaf;
-                    changes += count;
-                }
-                changes /= 2;
-                if (best.empty() || mlu < bestMlu - tolerance ||
-                    (std::abs(mlu - bestMlu) <= tolerance && changes < bestChanges))
-                {
-                    best = std::move(candidate);
-                    bestMlu = mlu;
-                    bestChanges = changes;
-                }
-            }
-            if (best.empty())
-            {
-                break;
-            }
-            result.topology = std::move(best);
-            result.plannedMlu = bestMlu;
-            result.changedCircuits = bestChanges;
-            result.removed = Removed(current, result.topology);
-            if (result.evaluations >= maxEvaluations)
-            {
-                result.searchLimited = true;
-                break;
-            }
+            if (!accepted) break;
         }
+        result.removed = Removed(current, result.topology);
         return result;
     }
 };
