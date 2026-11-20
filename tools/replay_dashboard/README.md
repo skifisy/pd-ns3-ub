@@ -3,6 +3,10 @@
 FastAPI + 本地 ECharts。默认基础窗口 **10 ms**，三组共用仿真时间轴、拓扑位置和热度尺度。
 本次交付未运行仿真、导入器、网页或测试；附带合成 CSV 和供你自行执行的检查。
 
+如果需要同时比较所有 P–S / D–S 交换机对的流量曲线、原始窗口峰值和容量，
+可使用独立的 [Leaf Pair Demand Dashboard](../leaf_pair_demand_dashboard/README.md)。
+该工具直接读取已有 Replay CSV，支持所有小图统一缩放，不需要任务或性能汇总文件。
+
 ## 安装与启动
 
 将本目录放到仓库根目录 `tools/replay_dashboard/`。代码包包含本地 ECharts，不依赖 CDN。
