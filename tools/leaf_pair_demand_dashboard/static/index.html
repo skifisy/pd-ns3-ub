@@ -1,0 +1,59 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>P–S / D–S 流量分析</title>
+  <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+  <header>
+    <div class="eyebrow">LEAF PAIR ANALYSIS <span id="mode"></span></div>
+    <h1>P–S / D–S 流量分析</h1>
+    <p>对齐每一对交换机的时间轴，查看持续热点与短时突发。</p>
+    <div id="facts" class="facts"></div>
+    <div id="warnings" role="status"></div>
+  </header>
+  <main>
+    <section class="navigation panel" aria-label="全局时间控制">
+      <div class="toolbar">
+        <label>指标 <select id="metric"><option value="payload">业务载荷发送速率</option><option value="wire">物理链路吞吐</option></select></label>
+        <label>方向 <select id="direction"><option value="both">双向分别展示</option><option value="forward">P / D → S</option><option value="reverse">S → P / D</option></select></label>
+        <label>纵轴 <select id="yscale"><option value="shared">全局统一尺度</option><option value="auto">每图独立尺度</option></select></label>
+        <label><input id="showCapacity" type="checkbox" checked>容量虚线</label>
+        <label><input id="showPeak" type="checkbox" checked>原始窗口峰值</label>
+      </div>
+      <div id="metricNote" class="note"></div>
+      <div id="overview" aria-label="拖动选区可统一缩放时间轴"></div>
+      <form id="timeForm" class="toolbar timebar">
+        <label>开始 <input id="start" type="number" step="any" min="0" required> s</label>
+        <label>结束 <input id="end" type="number" step="any" min="0" required> s</label>
+        <button type="submit">应用范围</button>
+        <button type="button" id="zoomIn">放大 2×</button>
+        <button type="button" id="zoomOut">缩小 2×</button>
+        <button type="button" id="panLeft" aria-label="向前平移">← 平移</button>
+        <button type="button" id="panRight" aria-label="向后平移">平移 →</button>
+        <button type="button" id="reset" class="primary">全程</button>
+        <span id="rangeLabel" class="range"></span>
+      </form>
+      <div class="legend"><span class="forward">● P / D → S</span><span class="reverse">● S → P / D</span><span class="capacity">┄ 单方向容量</span><span>实线：区间均值 · 淡色线：区间内原始窗口峰值</span></div>
+      <div class="note">任一小图滚轮缩放、拖动平移会同步所有图；鼠标参考线也同步。缩放不能增加日志本身的时间精度。</div>
+      <div id="status" role="status">正在读取缓存…</div>
+    </section>
+    <section class="panel hotspots">
+      <div class="section-heading"><div><h2>热点概览</h2><p>全程统计；点击色块定位交换机对。颜色表示所选方向的峰值 / 直连容量。</p></div>
+        <label>小图排序 <select id="sort"><option value="matrix">矩阵顺序</option><option value="peak">峰值速率</option><option value="mean">平均速率</option><option value="hot">≥90% 持续时间</option></select></label>
+      </div>
+      <div id="heatmaps"></div>
+    </section>
+    <div id="groups"></div>
+    <section class="panel statistics">
+      <div class="section-heading"><div><h2>全程统计明细</h2><p id="statsNote"></p></div></div>
+      <div class="table-scroll"><table><thead><tr><th>方向</th><th>均值 Gbps</th><th>峰值 Gbps</th><th>P95 Gbps</th><th>P99 Gbps</th><th id="ratioTitle">均值 / 直连容量</th><th>峰值 / 容量</th><th>≥80% 时间 s</th><th>≥90% 时间 s</th></tr></thead><tbody id="statistics"></tbody></table></div>
+    </section>
+    <footer>基于已记录的采样窗口。业务载荷包含重传，不代表无网络背压的原始需求；物理吞吐包含协议开销与经过链路的其他业务。</footer>
+  </main>
+  <script src="/vendor/echarts.min.js"></script>
+  <script src="/static/app.js"></script>
+</body>
+</html>
