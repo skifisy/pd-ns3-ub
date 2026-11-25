@@ -11,9 +11,9 @@ from collections import defaultdict
 
 
 TOOLS = Path(__file__).resolve().parents[1]
-GENERATOR = TOOLS / "mooncake_trace_to_dag_v15.py"
-CONVERTER = TOOLS / "mooncake_dag_to_traffic_v15.py"
-CONFIG = TOOLS / "mooncake_pd_config_v15_glm51.json"
+GENERATOR = TOOLS / "generate_trace" / "mooncake_trace_to_dag_v15.py"
+CONVERTER = TOOLS / "generate_trace" / "mooncake_dag_to_traffic_v15.py"
+CONFIG = TOOLS / "generate_trace" / "mooncake_pd_config_v15_glm51.json"
 
 
 def read_csv(path):
@@ -169,8 +169,12 @@ class PrefillTrafficTest(unittest.TestCase):
                     self.assertEqual(detail["request_id"], origin["request_id"])
                     if native["opType"] == "TIMER":
                         self.assertEqual(detail["request_id"], "")
+                        self.assertEqual(native["sourcePort"], "")
+                        self.assertEqual(native["destPort"], "")
                     else:
                         self.assertIn(detail["request_id"], {"1", "2"})
+                        self.assertEqual(native["sourcePort"], origin["src_port"])
+                        self.assertEqual(native["destPort"], origin["dst_port"])
 
     def test_decode_reads_use_storage_latency_after_final_prefill_write(self):
         output = self.outputs["traffic-off"]

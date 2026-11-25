@@ -31,6 +31,10 @@ struct TrafficRecord
     uint32_t dstEntityId = 0;
     bool hasSrcEntityId{false};
     bool hasDstEntityId{false};
+    // Physical UB device indices. Zero is a valid port; UINT32_MAX means absent.
+    uint32_t sourcePort{UINT32_MAX};
+    uint32_t destPort{UINT32_MAX};
+    bool hasPorts{false};
 };
 
 // Lightweight CSV row view. string_view fields are valid only during the parser callback.
@@ -49,6 +53,10 @@ struct TrafficRecordView
     uint32_t dstEntityId{0};
     bool hasSrcEntityId{false};
     bool hasDstEntityId{false};
+    // Physical UB device indices. Zero is a valid port; UINT32_MAX means absent.
+    uint32_t sourcePort{UINT32_MAX};
+    uint32_t destPort{UINT32_MAX};
+    bool hasPorts{false};
 };
 
 constexpr long DEFAULT_PORT_BUFFER_SIZE = 2097152;

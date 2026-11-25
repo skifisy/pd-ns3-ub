@@ -143,6 +143,9 @@ void UbApp::SendTraffic(TrafficRecord record)
     task.dstEntityId = record.dstEntityId;
     task.hasSrcEntityId = record.hasSrcEntityId;
     task.hasDstEntityId = record.hasDstEntityId;
+    task.sourcePort = record.sourcePort;
+    task.destPort = record.destPort;
+    task.hasPorts = record.hasPorts;
     if (record.opType == "URMA_WRITE") {
         task.op = UbTrafficGen::RuntimeTaskOp::URMA_WRITE;
     } else if (record.opType == "URMA_READ") {
@@ -175,6 +178,9 @@ UbApp::SendCtpUrmaTraffic(TrafficRecord record)
     task.dstEntityId = record.dstEntityId;
     task.hasSrcEntityId = record.hasSrcEntityId;
     task.hasDstEntityId = record.hasDstEntityId;
+    task.sourcePort = record.sourcePort;
+    task.destPort = record.destPort;
+    task.hasPorts = record.hasPorts;
     if (record.opType == "URMA_WRITE") {
         task.op = UbTrafficGen::RuntimeTaskOp::URMA_WRITE;
     } else if (record.opType == "URMA_READ") {
@@ -188,6 +194,8 @@ UbApp::SendCtpUrmaTraffic(TrafficRecord record)
 void
 UbApp::SendCtpUrmaTraffic(UbTrafficGen::RuntimeTask task)
 {
+    NS_ABORT_MSG_IF(task.hasPorts,
+                    "taskId=" << task.taskId << ": explicit physical ports require RTP URMA traffic");
     NS_ABORT_MSG_IF(task.op != UbTrafficGen::RuntimeTaskOp::URMA_WRITE &&
                         task.op != UbTrafficGen::RuntimeTaskOp::URMA_READ,
                     "CTP URMA traffic requires URMA read/write op");
@@ -317,6 +325,13 @@ UbApp::GetOrCreateCtpUnboundJetty(uint32_t sourceNode,
 
 void UbApp::SendTraffic(UbTrafficGen::RuntimeTask task)
 {
+    if (task.hasPorts)
+    {
+        UbUtils::ValidateTrafficPorts(task.taskId, task.sourceNode, task.destNode,
+            task.sourcePort, task.destPort, m_transportMode == TransportMode::RTP &&
+                (task.op == UbTrafficGen::RuntimeTaskOp::URMA_WRITE ||
+                 task.op == UbTrafficGen::RuntimeTaskOp::URMA_READ));
+    }
     if (task.priority == 0) {
         NS_LOG_DEBUG("Task uses the highest priority, not recommended.");
     }
@@ -360,13 +375,17 @@ void UbApp::SendTraffic(UbTrafficGen::RuntimeTask task)
         ubFunc->CreateJetty(task.sourceNode, task.destNode, m_jettyNum);
         vector<uint32_t> tpns = GetNode()->GetObject<UbController>()->GetTpConnManager()->GetTpns(
             m_getTpnRule, m_useShortestPaths, m_multiPathEnable, task.sourceNode,
-            task.destNode, UINT32_MAX, UINT32_MAX, task.priority);
+            task.destNode, task.hasPorts ? task.sourcePort : UINT32_MAX,
+            task.hasPorts ? task.destPort : UINT32_MAX, task.priority, task.taskId);
         bool bindRst = ubTa->JettyBindTp(task.sourceNode, task.destNode, m_jettyNum, m_multiPathEnable, tpns);
         if (bindRst) {
             Ptr<UbJetty> curr_jetty = ubFunc->GetJetty(m_jettyNum);
             SetFinishCallback(MakeCallback(&UbApp::OnTaskCompleted, this), curr_jetty);
             NS_LOG_INFO("WQE Starts, jettyNum: " << m_jettyNum << " taskId: " << task.taskId);
-            NS_LOG_INFO("Src: " << task.sourceNode << " Dst: " << task.destNode);
+            NS_LOG_INFO("Src: " << task.sourceNode << " Dst: " << task.destNode
+                        << " sourcePort: " << task.sourcePort << " destPort: " << task.destPort);
+            NS_LOG_DEBUG("Bound taskId=" << task.taskId << " to " << tpns.size()
+                         << " endpoint-matched TP(s)");
             WqeTaskStartsNotify(GetNode()->GetId(), m_jettyNum, task.taskId);
             NS_LOG_INFO("[APPLICATION INFO] taskId: " << task.taskId << ",start time:" <<
                 Simulator::Now().GetNanoSeconds() << "ns");

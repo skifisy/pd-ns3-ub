@@ -12,7 +12,7 @@ Decode Read delay
 is storage latency only; batch-start forecasts are not replay constraints.
 
 Logical TP rows expand using tp_members; all physical rank flows are retained.
-The nine-column traffic.csv format is unchanged. TIMER is local control work
+traffic.csv appends sourcePort,destPort to the nine base columns. TIMER is local control work
 and never enters the network-send path.
 traffic_debug.csv mirrors every traffic row with an extra request_id column;
 batch-owned TIMERs have an empty request_id.
@@ -39,7 +39,7 @@ UINT32_MAX = (1 << 32) - 1
 SCHEMA = "v12-revised-stable-worker-unlimited"
 V14_SCHEMA = "v14-domain-serial-batch-tp-sharded"
 LOGICAL_SCHEMA = "v14-domain-serial-batch-tp-logical"
-VERSION = "v15-prefill-traffic-debug-decode-read-all-20261105-v8"
+VERSION = "v15-prefill-traffic-debug-physical-ports-20261125-v9"
 
 PREFILL_TASK_TYPES = frozenset({
     "P_BATCH_BEGIN", "P_LAYER_START", "PREFILL_LAYER", "P_LAYER_READY",
@@ -196,7 +196,7 @@ TYPE_TO_OP = {
 }
 OUTPUT_FIELDS = [
     "taskId", "sourceNode", "destNode", "dataSize(Byte)", "opType",
-    "priority", "delay", "phaseId", "dependOnPhases",
+    "priority", "delay", "phaseId", "dependOnPhases", "sourcePort", "destPort",
 ]
 DEBUG_OUTPUT_FIELDS = OUTPUT_FIELDS + ["request_id"]
 V14_MAPPING_FIELDS = ["batch_id", "batch_size", "batch_type", "request_ids", "batch_step_index", "tp_degree", "tp_group_id", "service_domain", "tp_rank", "kv_extent_kind", "kv_shard_offset_bytes", "kv_shard_bytes", "kv_shard_layer_ranges"]
@@ -235,11 +235,11 @@ class NativeTrafficWriter:
                   f"{row['delay']},{row['phaseId']},")
         self.write(prefix)
         self.write(row['dependOnPhases'])
-        self.write("\r\n")
+        self.write(f",{row['sourcePort']},{row['destPort']}\r\n")
         if self.debug_write:
             self.debug_write(prefix)
             self.debug_write(row['dependOnPhases'])
-            self.debug_write(f",{request_id}\r\n")
+            self.debug_write(f",{row['sourcePort']},{row['destPort']},{request_id}\r\n")
 
 
 def csv_limit():
@@ -301,9 +301,13 @@ def ub_endpoints(row, stage):
     dst = integer(row["dst_node"], "dst_node")
     if src > UINT32_MAX or dst > UINT32_MAX:
         raise ValueError("node ID exceeds uint32")
+    sp = integer(row.get("src_port"), "src_port (required for NETWORK)")
+    dp = integer(row.get("dst_port"), "dst_port (required for NETWORK)")
+    if sp >= 255 or dp >= 255:
+        raise ValueError("physical src_port/dst_port must be in 0..254")
     if TYPE_TO_OP[stage] == "URMA_READ":
-        return dst, src, row.get("dst_port", ""), row.get("src_port", "")
-    return src, dst, row.get("src_port", ""), row.get("dst_port", "")
+        return dst, src, dp, sp
+    return src, dst, sp, dp
 
 
 MAPPING_FIELDS += V14_MAPPING_FIELDS
@@ -865,7 +869,7 @@ class Compiler:
         dependency_text = " ".join(map(str, parents))
         record = dict(zip(OUTPUT_FIELDS, [
             self.next_task, node, node, 0, "TIMER", self.args.priority,
-            delay_text(delay), phase_id, dependency_text,
+            delay_text(delay), phase_id, dependency_text, "", "",
         ]))
         if isinstance(writer, NativeTrafficWriter):
             writer.writerow(record, request_id=request)
@@ -1055,7 +1059,7 @@ class Compiler:
                         emitted_bytes += chunk
                         record = dict(zip(OUTPUT_FIELDS, [
                             self.next_task, source, dest, chunk, TYPE_TO_OP[stage],
-                            self.args.priority, delay_text(delay), pid, dep_text,
+                            self.args.priority, delay_text(delay), pid, dep_text, src_port, dst_port,
                         ]))
                         if isinstance(writer, csv.DictWriter) and writer.fieldnames == OUTPUT_FIELDS:
                             writer.writer.writerow([record[key] for key in OUTPUT_FIELDS])
@@ -1404,6 +1408,8 @@ def convert(args):
                     "debug_output": str(debug_path),
                     "debug_request_id_policy": "DAG request_id; empty for batch-owned TIMERs",
                     "input_columns": reader.fieldnames,
+                    "output_columns": OUTPUT_FIELDS,
+                    "physical_port_policy": "DAG endpoints retained; READ swaps both nodes and ports",
                     "total_rows": compiler.counts["traffic_rows"] + compiler.counts["timer_rows"],
                     "prefill_batches": compiler.counts["prefill_control_phases"],
                     "prefill_metadata_validation": "required before phase pruning/TP expansion",

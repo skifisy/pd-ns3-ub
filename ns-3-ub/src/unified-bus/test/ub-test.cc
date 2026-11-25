@@ -1114,7 +1114,15 @@ class UbTrafficGenRuntimeTaskEntityFieldsTest : public TestCase
         record.hasSrcEntityId = true;
         record.hasDstEntityId = true;
 
+        record.hasPorts = true;
+        record.sourcePort = 0;
+        record.destPort = 11;
+
         UbTrafficGen::RuntimeTask task = gen.ConvertToRuntimeTask(record);
+
+        NS_TEST_ASSERT_MSG_EQ(task.hasPorts, true, "runtime task preserves physical port presence");
+        NS_TEST_ASSERT_MSG_EQ(task.sourcePort, 0u, "runtime task preserves physical port zero");
+        NS_TEST_ASSERT_MSG_EQ(task.destPort, 11u, "runtime task preserves destination port");
 
         NS_TEST_ASSERT_MSG_EQ(task.srcEntityId,
                               0u,
@@ -10719,7 +10727,7 @@ class UbEcmpSelectionRoutingTraceTest : public TestCase
             const uint32_t port = index < shortest.size()
                 ? shortest[index] : other[index - shortest.size()];
             NS_TEST_ASSERT_MSG_EQ(std::stoul(match[5].str()), port, "Log actual candidate port");
-            NS_TEST_ASSERT_MSG_EQ(match[6].str(), lines == 0 ? "0" : "1",
+            NS_TEST_ASSERT_MSG_EQ(match[6].str(), (lines == 0 ? "0" : "1"),
                                   "Port-input flag must cover both optional ports and spray mode");
             ++lines;
         }
@@ -15976,3 +15984,108 @@ class UbQuickExampleCompatTestSuite : public TestSuite
 };
 
 static UbQuickExampleCompatTestSuite g_ubQuickExampleCompatTestSuite;
+
+class UbTrafficPhysicalPortsCsvTest : public TestCase
+{
+  public:
+    UbTrafficPhysicalPortsCsvTest()
+        : TestCase("UnifiedBus - physical ports survive reordered CSV columns and row views")
+    {
+    }
+
+    void DoRun() override
+    {
+        const auto path = std::filesystem::temp_directory_path() / "ub-traffic-physical-ports.csv";
+        {
+            std::ofstream out(path);
+            out << "destPort,phaseId,sourcePort,taskId,sourceNode,destNode,dataSize(Byte),"
+                   "opType,priority,delay,dependOnPhases,srcEntityId,dstEntityId\r\n";
+            out << "11,100001,0,41,2,3,64,URMA_READ,7,150us,,5,6\r\n";
+            out << ",100002,,42,2,2,0,TIMER,7,1ns,100001,,\r\n";
+        }
+        auto rows = UbUtils::Get()->LoadTrafficConfig(path.string());
+        NS_TEST_ASSERT_MSG_EQ(rows.size(), 2u, "both rows should load");
+        NS_TEST_ASSERT_MSG_EQ(rows[0].hasPorts, true, "network endpoint pair must be explicit");
+        NS_TEST_ASSERT_MSG_EQ(rows[0].sourcePort, 0u, "physical port zero must remain explicit");
+        NS_TEST_ASSERT_MSG_EQ(rows[0].destPort, 11u, "destination port should survive parsing");
+        NS_TEST_ASSERT_MSG_EQ(rows[0].srcEntityId, 5u, "entity IDs are independent of physical ports");
+        NS_TEST_ASSERT_MSG_EQ(rows[1].hasPorts, false, "TIMER has no physical endpoints");
+        size_t index = 0;
+        UbUtils::Get()->ForEachTrafficRecordView(path.string(), [&](const TrafficRecordView& row) {
+            NS_TEST_ASSERT_MSG_EQ(row.taskId, static_cast<uint32_t>(rows[index].taskId),
+                                  "both readers must agree on reordered task IDs");
+            NS_TEST_ASSERT_MSG_EQ(row.sourcePort, rows[index].sourcePort,
+                                  "both readers must agree on source ports");
+            NS_TEST_ASSERT_MSG_EQ(row.destPort, rows[index].destPort,
+                                  "both readers must agree on destination ports");
+            NS_TEST_ASSERT_MSG_EQ(row.hasPorts, rows[index].hasPorts,
+                                  "both readers must agree on port presence");
+            ++index;
+        });
+        const auto stats = UbUtils::Get()->RegisterTrafficPhaseDependenciesAndGetStats(path.string());
+        NS_TEST_ASSERT_MSG_EQ(stats.recordCount, 2u, "index pass must read reordered columns");
+        NS_TEST_ASSERT_MSG_EQ(stats.maxTaskId, 42u, "index pass must not confuse phase with task");
+        std::filesystem::remove(path);
+        Simulator::Destroy();
+    }
+};
+
+class UbTrafficPhysicalPortsReservationTest : public TestCase
+{
+  public:
+    UbTrafficPhysicalPortsReservationTest()
+        : TestCase("UnifiedBus - explicit TP endpoints constrain cache hits and fallback creation")
+    {
+    }
+
+    void DoRun() override
+    {
+        auto sender = CreateObject<Node>(0);
+        auto receiver = CreateObject<Node>(0);
+        InitNode(sender, UB_DEVICE, 2);
+        InitNode(receiver, UB_DEVICE, 2);
+        auto rt = sender->GetObject<UbSwitch>()->GetRoutingProcess();
+        rt->AddShortestRoute(NodeIdToIp(receiver->GetId(), 0).Get(), {0, 1});
+        rt->AddShortestRoute(NodeIdToIp(receiver->GetId(), 1).Get(), {0, 1});
+        auto manager = sender->GetObject<UbController>()->GetTpConnManager();
+        manager->ReserveTpnsForTraffic(true, sender->GetId(), receiver->GetId(), 7);
+        // A node-only rule and multipath must still return the one pinned pair.
+        auto selected = manager->GetTpns(GetTpnRuleT::BY_PEERNODE, true, true,
+                                         sender->GetId(), receiver->GetId(), 1, 0, 7);
+        NS_TEST_ASSERT_MSG_EQ(selected.size(), 1u, "unrelated cached port pairs must be excluded");
+        auto tp = sender->GetObject<UbController>()->GetTpByTpn(selected[0]);
+        NS_TEST_ASSERT_MSG_EQ(tp->GetSport(), 1u, "source physical port must be pinned");
+        NS_TEST_ASSERT_MSG_EQ(tp->GetDport(), 0u, "destination physical port zero must be pinned");
+        NS_TEST_ASSERT_MSG_EQ(tp->GetSip(), NodeIdToIp(sender->GetId(), 1), "source IP must encode port");
+        NS_TEST_ASSERT_MSG_EQ(tp->GetDip(), NodeIdToIp(receiver->GetId(), 0), "destination IP must encode port");
+
+        // No priority-6 reservation exists: fallback must reserve only this pair.
+        selected = manager->GetTpns(GetTpnRuleT::BY_PEERNODE_PRIORITY, true, true,
+                                    sender->GetId(), receiver->GetId(), 0, 1, 6);
+        NS_TEST_ASSERT_MSG_EQ(selected.size(), 1u, "fallback must not expand the endpoint pair");
+        NS_TEST_ASSERT_MSG_EQ(manager->GetTpnsByPeerNodePriority(sender->GetId(), receiver->GetId(), 6).size(),
+                              1u, "fallback must create only the requested reservation");
+        auto reverse = receiver->GetObject<UbController>()->GetTpConnManager()
+            ->GetTpnsByFullCriteria(receiver->GetId(), sender->GetId(), 1, 0, 6);
+        NS_TEST_ASSERT_MSG_EQ(reverse.size(), 1u, "reverse reservation must swap physical ports");
+        const auto count = manager->GetConnectionCount();
+        manager->ReserveTpnsForTraffic(true, sender->GetId(), receiver->GetId(), 6, 0, 1);
+        NS_TEST_ASSERT_MSG_EQ(manager->GetConnectionCount(), count, "exact reservations must be reused");
+        Simulator::Destroy();
+        Config::Reset();
+    }
+};
+
+class UbTrafficPhysicalPortsTestSuite : public TestSuite
+{
+  public:
+    UbTrafficPhysicalPortsTestSuite() : TestSuite("unified-bus-traffic-ports", Type::UNIT)
+    {
+        AddTestCase(new UbTrafficConfigEntityFieldsTest(), TestCase::Duration::QUICK);
+        AddTestCase(new UbTrafficPhysicalPortsCsvTest(), TestCase::Duration::QUICK);
+        AddTestCase(new UbTrafficPhysicalPortsReservationTest(), TestCase::Duration::QUICK);
+        AddTestCase(new UbTrafficGenRuntimeTaskEntityFieldsTest(), TestCase::Duration::QUICK);
+    }
+};
+
+static UbTrafficPhysicalPortsTestSuite g_ubTrafficPhysicalPortsTestSuite;

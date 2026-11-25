@@ -375,6 +375,28 @@ Schema:
 taskId,sourceNode,destNode,dataSize(Byte),opType,priority,delay,phaseId,dependOnPhases
 ```
 
+RTP URMA tasks can append explicit physical endpoints:
+```
+taskId,sourceNode,destNode,dataSize(Byte),opType,priority,delay,phaseId,dependOnPhases,sourcePort,destPort
+0,0,1,4096,URMA_WRITE,7,0ns,0,,1,2
+1,0,1,4096,URMA_READ,7,0ns,1,0,1,2
+2,0,0,0,TIMER,7,1us,2,1,,
+```
+
+`sourcePort` and `destPort` are zero-based UB device indices, not UDP ports,
+TPNs or entity IDs. Both columns and both network-row values are required;
+TIMER values stay empty. Valid physical port IDs are `0..254` and must exist
+on their nodes. `URMA_READ` starts at `(sourceNode,sourcePort)` and returns
+payload from `(destNode,destPort)`. Explicit pairs constrain cached and new
+RTP connections even with multipath enabled; unreachable pairs fail instead
+of selecting another port. CTP and memory operations reject explicit pairs.
+
+All three traffic passes (phase indexing, owning records and streaming views)
+resolve fields by header name. `dataSize` is accepted as an alias for
+`dataSize(Byte)`. Legacy nine-column traffic keeps automatic port selection;
+the existing `srcEntityId,dstEntityId` columns remain independent and can
+coexist with physical ports. Additional diagnostic columns are ignored.
+
 Recommendation: Generate `traffic.csv` (e.g., all-to-all, RDMA-like patterns, collective-like workloads) via `scratch/ns-3-ub-tools/traffic_maker/`. See `traffic_maker/README.md` in the `open-usim/ns-3-ub-tools` submodule repository.
 - `taskId` — integer ID (unique per file).
 - `sourceNode` / `destNode` — end-host node IDs.

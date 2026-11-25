@@ -81,6 +81,9 @@ public:
         uint32_t dstEntityId{0};
         bool hasSrcEntityId{false};
         bool hasDstEntityId{false};
+        uint32_t sourcePort{UINT32_MAX};
+        uint32_t destPort{UINT32_MAX};
+        bool hasPorts{false};
         bool hasPhaseDependencies{false};
     };
 

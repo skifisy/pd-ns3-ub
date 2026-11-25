@@ -159,7 +159,8 @@
       11
     ],
     "port_bandwidth_gbps": 400,
-    "placement_policy": "hash_based"
+    "placement_policy": "hash_based",
+    "port_selection_seed": 1
   },
   "scheduling": {
     "prefill_scheduler": "ttft-aware",

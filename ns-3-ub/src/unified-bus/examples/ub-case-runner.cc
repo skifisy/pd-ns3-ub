@@ -775,6 +775,12 @@ uint32_t ActivateTrafficFromConfig(const std::string& configPath,
     const bool useShortestPaths = appDefaults->GetUseShortestPaths();
     UbUtils::Get()->PrintTimestamp("[traffic] Activate clients and enqueue tasks.");
     UbUtils::Get()->ForEachTrafficRecordView(trafficPath, [&](const TrafficRecordView& record) {
+        if (record.hasPorts)
+        {
+            UbUtils::ValidateTrafficPorts(record.taskId, record.sourceNode, record.destNode,
+                record.sourcePort, record.destPort, reserveRtpConnections &&
+                    (record.opType == "URMA_WRITE" || record.opType == "URMA_READ"));
+        }
         Ptr<Node> sourceNode = NodeList::GetNode(record.sourceNode);
         if (reserveRtpConnections &&
             (record.opType == "URMA_WRITE" || record.opType == "URMA_READ"))
@@ -783,7 +789,10 @@ uint32_t ActivateTrafficFromConfig(const std::string& configPath,
                 useShortestPaths,
                 record.sourceNode,
                 record.destNode,
-                record.priority);
+                record.priority,
+                record.hasPorts ? record.sourcePort : UINT32_MAX,
+                record.hasPorts ? record.destPort : UINT32_MAX,
+                record.taskId);
         }
 
         const bool localOwned =
