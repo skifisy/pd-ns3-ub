@@ -43,7 +43,7 @@ FIXED_P_DOMAIN_COUNT = 3
 FIXED_D_DOMAIN_COUNT = 1
 SCHEMA = "v14-domain-serial-batch-tp-logical"
 MAX_DEPENDENCY_FANIN = 512
-VERSION = "v15-decode-request-final-write-20261105-v9"
+VERSION = "v15-physical-ports-storage-spread-20261125-v10"
 
 FLOP_METRIC_FIELDS = (
     "mla_projection_flops", "indexer_projection_flops", "indexer_score_flops",
@@ -187,6 +187,7 @@ def local_batch_limit(settings, default, label):
 class Model:
     def __init__(self, cfg):
         self.choose_storage_endpoint = lru_cache(maxsize=32768, typed=True)(self.choose_storage_endpoint)
+        self.storage_port_base = lru_cache(maxsize=32768, typed=True)(self.storage_port_base)
         self.config = copy.deepcopy(cfg)
         model = cfg["model"]
         timing = cfg["timing"]
@@ -349,6 +350,15 @@ class Model:
         )
         self.storage_nodes = list(storage["nodes"])
         self.storage_ports = list(storage["ports"])
+        self.storage_port_seed = storage.get("port_selection_seed", self.random_seed)
+        if type(self.storage_port_seed) is not int or self.storage_port_seed < 0:
+            raise ValueError("storage.port_selection_seed must be a nonnegative integer")
+        if any(type(p) is not int or not 0 <= p < 255 for p in self.storage_ports + self.server_ports):
+            raise ValueError("physical ports must be integer UB port IDs in 0..254")
+        if len(set(self.storage_ports)) != len(self.storage_ports):
+            raise ValueError("storage.ports must not contain duplicate ports")
+        if len(set(self.storage_nodes)) != len(self.storage_nodes):
+            raise ValueError("storage.nodes must not contain duplicate nodes")
         pd_analysis = cfg.get("pd_analysis", {})
         self.pd_window_ms = int(pd_analysis.get("window_ms", 600_000))
         self.p_group_tps_config = self._optional_positive_float(
@@ -1104,6 +1114,35 @@ class Model:
         idx = stable_hash_int("kv-storage-endpoint", tag) % endpoint_count
         node_idx, port_idx = divmod(idx, len(self.storage_ports))
         return self.storage_nodes[node_idx], self.storage_ports[port_idx]
+    def choose_storage_node(self, key):
+        # Preserve EXACTLY the old block-to-node mapping for the same config.
+        # Ports are shared access paths to this node's complete KV contents.
+        return self.choose_storage_endpoint(key)[0]
+
+    def storage_port_base(self, key, request_id, stage):
+        return stable_hash_int("storage-access-port-v1", self.storage_port_seed,
+                               request_id, key, stage) % len(self.storage_ports)
+
+    def storage_access_endpoint(self, key, request_id, stage, layer, rank):
+        index = (self.storage_port_base(key, request_id, stage) + max(0, layer) + rank) % len(self.storage_ports)
+        return self.choose_storage_node(key), self.storage_ports[index]
+
+    def storage_read_endpoints(self, key, request_id, stage, degree, total_bytes):
+        # Used once per request/block during candidate scoring, never per TP
+        # candidate. Deduplicate the small set of physical access endpoints.
+        base = self.storage_port_base(key, request_id, stage)
+        indices = set()
+        if self.num_layers >= len(self.storage_ports) and total_bytes >= self.num_layers:
+            # Rank zero alone visits every port in one complete layer cycle.
+            indices.update(range(len(self.storage_ports)))
+        else:
+            for layer in range(self.num_layers):
+                size = self.layer_bytes(total_bytes, layer)
+                for rank in range(min(degree, size)):
+                    indices.add((base + layer + rank) % len(self.storage_ports))
+        node = self.choose_storage_node(key)
+        return tuple((node, self.storage_ports[i]) for i in sorted(indices))
+
     def group_physical_bytes(self, logical_bytes, endpoints):
         if not tuple(endpoints):
             raise ValueError("service domain must expose at least one endpoint")
@@ -1579,6 +1618,7 @@ class DagWriter:
             defaultdict(lambda: PortCalendar(self.active_calendars)) for _ in range(3))
         self.counts, self.bytes = Counter(), Counter()
         self.physical_counts = Counter()
+        self.storage_flow_counts, self.storage_byte_counts = Counter(), Counter()
 
     def add(self, base, kind, stage, deps=(), release="", duration=0, **fields):
         if isinstance(deps, (list, tuple)) and len(deps) <= 1:
@@ -1699,6 +1739,8 @@ class DagWriter:
                 compute, storage = (dst, src) if read else (src, dst)
                 compute_calendar = calendars[compute]
                 storage_calendar = self.storage[storage]
+                self.storage_flow_counts[(stage, *storage)] += 1
+                self.storage_byte_counts[(stage, *storage)] += nbytes
                 flow_duration = self.flow_duration(nbytes)
                 start = ready
                 while True:
@@ -1845,8 +1887,10 @@ class Placement:
                 raise RuntimeError("Only an unbound new Decode request may select a TP group")
             for block in state["blocks"]:
                 has_reads = True
-                storage = self.model.choose_storage_endpoint(block["hash_id"])
-                peer = max(peer, self.dag.storage[storage].first_free(now, 1))
+                for storage in self.model.storage_read_endpoints(
+                        block["hash_id"], state["req"]["request_id"], "STORAGE_TO_D", degree,
+                        block["tokens"] * self.model.kv_bytes_per_token):
+                    peer = max(peer, self.dag.storage[storage].first_free(now, 1))
                 for rank in range(degree):
                     _, size = split_exact(block["tokens"] * self.model.kv_bytes_per_token, degree, rank)
                     loads[rank] += self.model.transfer_duration_us(size, bandwidth)
@@ -1899,8 +1943,11 @@ class Placement:
                 if role == "P" and not block["hit"]:
                     continue
                 has_reads = True
-                storage = self.model.choose_storage_endpoint(block["hash_id"])
-                peer = max(peer, self.dag.storage[storage].first_free(now, 1))
+                for storage in self.model.storage_read_endpoints(
+                        block["hash_id"], state["req"]["request_id"],
+                        "PREFIX_READ" if role == "P" else "STORAGE_TO_D", degree,
+                        block["tokens"] * self.model.kv_bytes_per_token):
+                    peer = max(peer, self.dag.storage[storage].first_free(now, 1))
                 entry = block.get("producer_entry")
                 if role == "P" and entry and entry["producer"] is not None:
                     peer = max(peer, self.dag.finish[entry["producer"]])
@@ -2004,7 +2051,6 @@ class BatchBuilder:
     def network(self, base, state, domain, gi, stage, block, layer, deps, wave, token="", key=None):
         read = stage in {"PREFIX_READ", "STORAGE_TO_D"}
         key = block["hash_id"] if key is None else key
-        storage = self.model.choose_storage_endpoint(key)
         # Canonical address is (key, layer, byte range). P/D may have different
         # TP degrees without inventing incompatible per-rank storage objects.
         layer_bytes = self.model.layer_bytes(block["tokens"] * self.model.kv_bytes_per_token, layer)
@@ -2017,6 +2063,8 @@ class BatchBuilder:
             nbytes = q + int(rank < r)
             if nbytes == 0:
                 continue
+            storage = self.model.storage_access_endpoint(
+                key, state["req"]["request_id"], stage, layer, rank)
             src, dst = (storage, worker) if read else (worker, storage)
             members.append([rank, src[0], src[1], dst[0], dst[1], nbytes])
         return self.dag.add_group(self.owned(base, state), "NETWORK", stage, deps, common, members)
@@ -2038,8 +2086,7 @@ class BatchBuilder:
                 split_exact(self.model.layer_bytes(self.model.kv_bytes_per_token, layer), degree, rank)[1]
                 for layer in range(self.model.num_layers)) for rank in range(degree)]
         key = f"decode:{state['req']['request_id']}:output"
-        storage = self.model.choose_storage_endpoint(key)
-        common = dict(dst_node=storage[0], dst_port=storage[1], storage_read_latency_us=0,
+        common = dict(storage_read_latency_us=0,
             layer_index=-1, block_index=-1, decode_token_index=tokens - 1,
             storage_key=key, kv_extent_kind="all_output_tokens_all_layers",
             kv_token_offset=0, kv_token_bytes=self.model.kv_bytes_per_token,
@@ -2048,6 +2095,8 @@ class BatchBuilder:
         for rank, worker in enumerate(domain.groups[gi]):
             nbytes = self.token_shards[degree][rank] * tokens
             if nbytes:
+                storage = self.model.storage_access_endpoint(
+                    key, state["req"]["request_id"], "DECODE_WRITE", -1, rank)
                 members.append([rank, worker[0], worker[1], storage[0], storage[1], nbytes])
         return self.dag.add_group(self.owned(base, state), "NETWORK", "DECODE_WRITE",
                                   [compute_done], common, members)
@@ -2485,6 +2534,12 @@ def _generate(reqs, model, out_dir, warmup=0, prewarm_ratio=0, rounding="ceil", 
             implementation_revision=VERSION, max_dependency_fanin=MAX_DEPENDENCY_FANIN,
             base_implementation_revision="v14.7-cohort-pinned-decode-tp-20261020",
             physical_tp_task_counts=dict(dag.physical_counts),
+            storage_node_policy="legacy block-key endpoint hash; node component preserved",
+            storage_port_policy="rank-round-robin-v1: hash(seed,request,key,stage)+layer+rank",
+            storage_port_selection_seed=model.storage_port_seed,
+            storage_access=[dict(stage=stage, node=node, port=port,
+                                 flows=count, bytes=dag.storage_byte_counts[(stage, node, port)])
+                            for (stage, node, port), count in sorted(dag.storage_flow_counts.items())],
             network_rows=sum(dag.counts.get(k, 0) for k in dag.bytes),
             expanded_network_flows=sum(dag.physical_counts.get(k, 0) for k in dag.bytes),
             tp_representation="logical ALL-completion rows; exact rank members and ordered endpoint forecasts",
@@ -2614,7 +2669,8 @@ def generate(reqs, model, out_dir, warmup=0, prewarm_ratio=0, rounding="ceil", p
             "prefill_compute_time_interpretation", "prefill_efficiency_assumption",
             "prefill_compute_efficiency",
             "decode_compute_efficiency", "decode_shared_expert_tp_degree", "decode_context_convention",
-            "decode_input_read_policy",
+            "decode_input_read_policy", "storage_node_policy", "storage_port_policy",
+            "storage_port_selection_seed",
             "indexer_key_cache_resident")}
         (Path(temporary) / "effective_config.json").write_text(
             json.dumps(effective, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")

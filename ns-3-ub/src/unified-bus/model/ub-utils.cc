@@ -236,6 +236,76 @@ AppendDependencyPhases(std::string_view field, TrafficRecord& record)
     }
 }
 
+struct TrafficCsvLayout
+{
+    std::vector<int> fields;
+    bool hasPorts{false};
+};
+
+TrafficCsvLayout
+ParseTrafficCsvHeader(const std::string& line)
+{
+    static const std::array<std::string, 13> names = {
+        "taskId", "sourceNode", "destNode", "dataSize(Byte)", "opType", "priority",
+        "delay", "phaseId", "dependOnPhases", "srcEntityId", "dstEntityId",
+        "sourcePort", "destPort"};
+    TrafficCsvLayout layout;
+    std::array<bool, 13> present{};
+    for (const auto& raw : SplitCsvRow(line))
+    {
+        std::string name(TrimField(raw));
+        if (layout.fields.empty() && name.starts_with("\xef\xbb\xbf"))
+        {
+            name.erase(0, 3);
+        }
+        if (name == "dataSize")
+        {
+            name = "dataSize(Byte)";
+        }
+        const auto it = std::find(names.begin(), names.end(), name);
+        const int field = it == names.end() ? -1 : static_cast<int>(it - names.begin());
+        NS_ABORT_MSG_IF(field >= 0 && present[field], "Duplicate traffic.csv column: " << name);
+        if (field >= 0)
+        {
+            present[field] = true;
+        }
+        layout.fields.push_back(field); // Additional diagnostic columns are ignored.
+    }
+    for (size_t i = 0; i < 9; ++i)
+    {
+        NS_ABORT_MSG_IF(!present[i], "traffic.csv missing required column: " << names[i]);
+    }
+    NS_ABORT_MSG_IF(present[11] != present[12],
+                    "traffic.csv requires both sourcePort and destPort columns");
+    layout.hasPorts = present[11];
+    return layout;
+}
+
+template <typename Record>
+void
+ValidateTrafficCsvRow(const TrafficCsvLayout& layout, size_t fieldCount,
+                       const Record& record, const std::string& filename, uint64_t lineNumber)
+{
+    NS_ABORT_MSG_IF(fieldCount > layout.fields.size(),
+                    filename << ':' << lineNumber << " has more fields than its header");
+    for (size_t i = fieldCount; i < layout.fields.size(); ++i)
+    {
+        NS_ABORT_MSG_IF(layout.fields[i] >= 0 && layout.fields[i] < 9,
+                        filename << ':' << lineNumber << " is missing a required field");
+    }
+    const bool sourcePresent = record.sourcePort != UINT32_MAX;
+    const bool destPresent = record.destPort != UINT32_MAX;
+    NS_ABORT_MSG_IF(sourcePresent != destPresent ||
+                        (layout.hasPorts && record.opType != "TIMER" && !sourcePresent),
+                    filename << ':' << lineNumber << " taskId=" << record.taskId
+                             << " requires both sourcePort and destPort values");
+    NS_ABORT_MSG_IF(sourcePresent && (record.sourcePort >= 255 || record.destPort >= 255),
+                    filename << ':' << lineNumber << " taskId=" << record.taskId
+                             << " physical ports must be 0..254 (port-IP encoding)");
+    NS_ABORT_MSG_IF(record.opType == "TIMER" && sourcePresent,
+                    filename << ':' << lineNumber << " TIMER physical ports must be empty");
+}
+
 void
 SetTrafficRecordField(int fieldCount, std::string_view rawField, TrafficRecord& record)
 {
@@ -276,6 +346,12 @@ SetTrafficRecordField(int fieldCount, std::string_view rawField, TrafficRecord& 
     case 10:
         record.dstEntityId = field.empty() ? 0 : ParseUint32Field(field);
         record.hasDstEntityId = true;
+        break;
+    case 11:
+        record.sourcePort = field.empty() ? UINT32_MAX : ParseUint32Field(field);
+        break;
+    case 12:
+        record.destPort = field.empty() ? UINT32_MAX : ParseUint32Field(field);
         break;
     }
 }
@@ -522,6 +598,12 @@ SetTrafficRecordViewField(int fieldCount, std::string_view rawField, TrafficReco
     case 10:
         record.dstEntityId = field.empty() ? 0 : ParseUint32Field(field);
         record.hasDstEntityId = true;
+        break;
+    case 11:
+        record.sourcePort = field.empty() ? UINT32_MAX : ParseUint32Field(field);
+        break;
+    case 12:
+        record.destPort = field.empty() ? UINT32_MAX : ParseUint32Field(field);
         break;
     }
 }
@@ -2379,6 +2461,30 @@ UbUtils::ForEachTrafficRecord(const string& filename,
 }
 
 void
+UbUtils::ValidateTrafficPorts(uint32_t taskId, uint32_t sourceNode, uint32_t destNode,
+                               uint32_t sourcePort, uint32_t destPort, bool supportedTransport)
+{
+    const auto context = [&]() {
+        return "taskId=" + std::to_string(taskId) + " endpoints=" +
+            std::to_string(sourceNode) + ":" + std::to_string(sourcePort) + " -> " +
+            std::to_string(destNode) + ":" + std::to_string(destPort);
+    };
+    NS_ABORT_MSG_IF(!supportedTransport,
+                    context() << ": explicit physical ports require RTP URMA_READ/URMA_WRITE");
+    NS_ABORT_MSG_IF(sourceNode >= NodeList::GetNNodes() || destNode >= NodeList::GetNNodes(),
+                    context() << ": invalid node");
+    for (const auto& endpoint : {std::make_pair(sourceNode, sourcePort),
+                                  std::make_pair(destNode, destPort)})
+    {
+        auto node = NodeList::GetNode(endpoint.first);
+        NS_ABORT_MSG_IF(endpoint.second >= 255 || endpoint.second >= node->GetNDevices(),
+                        context() << ": port outside node device range or port-IP encoding");
+        NS_ABORT_MSG_IF(DynamicCast<UbPort>(node->GetDevice(endpoint.second)) == nullptr,
+                        context() << ": physical port must reference a UB device");
+    }
+}
+
+void
 UbUtils::ForEachTrafficRecordView(const string& filename,
                                   const std::function<void(const TrafficRecordView&)>& callback)
 {
@@ -2416,7 +2522,10 @@ UbUtils::ForEachTrafficPhaseIndexRecord(const string& filename,
 
     string line;
     getline(file, line);
+    const auto layout = ParseTrafficCsvHeader(line);
+    uint64_t lineNumber = 1;
     while (getline(file, line)) {
+        ++lineNumber;
         if (line.empty() || line[0] == '#' || line.find_first_not_of(" \t") == string::npos) {
             continue;
         }
@@ -2434,8 +2543,10 @@ UbUtils::ForEachTrafficPhaseIndexRecord(const string& filename,
                 fieldEnd = line.size();
             }
 
-            if (fieldCount == static_cast<int>(FIELDCOUNT::TASKID) ||
-                fieldCount == static_cast<int>(FIELDCOUNT::PHASEID)) {
+            NS_ABORT_MSG_IF(static_cast<size_t>(fieldCount) >= layout.fields.size(),
+                            filename << ':' << lineNumber << " has too many fields");
+            const int fieldId = layout.fields[fieldCount];
+            if (fieldId == 0 || fieldId == 7) {
                 size_t valueStart = fieldStart;
                 while (valueStart < fieldEnd &&
                        (line[valueStart] == ' ' || line[valueStart] == '\t')) {
@@ -2443,12 +2554,13 @@ UbUtils::ForEachTrafficPhaseIndexRecord(const string& filename,
                 }
                 size_t valueEnd = fieldEnd;
                 while (valueEnd > valueStart &&
-                       (line[valueEnd - 1] == ' ' || line[valueEnd - 1] == '\t')) {
+                       (line[valueEnd - 1] == ' ' || line[valueEnd - 1] == '\t' ||
+                        line[valueEnd - 1] == '\r')) {
                     --valueEnd;
                 }
                 if (valueStart < valueEnd) {
                     const uint32_t value = ParseUint32Field(line, valueStart, valueEnd);
-                    if (fieldCount == static_cast<int>(FIELDCOUNT::TASKID)) {
+                    if (fieldId == 0) {
                         taskId = value;
                         hasTaskId = true;
                     } else {
@@ -2468,9 +2580,9 @@ UbUtils::ForEachTrafficPhaseIndexRecord(const string& filename,
             ++fieldCount;
         }
 
-        if (hasTaskId && hasPhaseId) {
-            callback(taskId, phaseId);
-        }
+        NS_ABORT_MSG_IF(!hasTaskId || !hasPhaseId,
+                        filename << ':' << lineNumber << " missing taskId or phaseId");
+        callback(taskId, phaseId);
     }
 }
 
@@ -2486,9 +2598,12 @@ UbUtils::ForEachTrafficRecordInternal(const string& filename,
         return;
     }
     string line;
-    getline(file, line);  // 跳过标题行
+    getline(file, line);
+    const auto layout = ParseTrafficCsvHeader(line);
+    uint64_t lineNumber = 1;
     TrafficRecord record;
     while (getline(file, line)) {
+        ++lineNumber;
         if (line.empty() || line[0] == '#' || line.find_first_not_of(" \t") == string::npos) {
             continue;
         }
@@ -2506,6 +2621,9 @@ UbUtils::ForEachTrafficRecordInternal(const string& filename,
         record.dstEntityId = 0;
         record.hasSrcEntityId = false;
         record.hasDstEntityId = false;
+        record.sourcePort = UINT32_MAX;
+        record.destPort = UINT32_MAX;
+        record.hasPorts = false;
 
         int fieldCount = 0;
         size_t fieldStart = 0;
@@ -2515,7 +2633,9 @@ UbUtils::ForEachTrafficRecordInternal(const string& filename,
                 fieldEnd = line.size();
             }
 
-            SetTrafficRecordField(fieldCount,
+            NS_ABORT_MSG_IF(static_cast<size_t>(fieldCount) >= layout.fields.size(),
+                            filename << ':' << lineNumber << " has too many fields");
+            SetTrafficRecordField(layout.fields[fieldCount],
                                   std::string_view(line).substr(fieldStart,
                                                                 fieldEnd - fieldStart),
                                   record);
@@ -2526,9 +2646,8 @@ UbUtils::ForEachTrafficRecordInternal(const string& filename,
             }
             fieldStart = fieldEnd + 1;
         }
-        NS_ABORT_MSG_IF(
-            fieldCount != 9 && fieldCount != 11,
-            "traffic.csv row must have 9 base fields or 11 fields with srcEntityId,dstEntityId");
+        ValidateTrafficCsvRow(layout, fieldCount, record, filename, lineNumber);
+        record.hasPorts = record.sourcePort != UINT32_MAX;
         callback(record);
     }
     file.close();
@@ -2547,8 +2666,11 @@ UbUtils::ForEachTrafficRecordViewInternal(
         return;
     }
     string line;
-    getline(file, line);  // 跳过标题行
+    getline(file, line);
+    const auto layout = ParseTrafficCsvHeader(line);
+    uint64_t lineNumber = 1;
     while (getline(file, line)) {
+        ++lineNumber;
         if (line.empty() || line[0] == '#' || line.find_first_not_of(" \t") == string::npos) {
             continue;
         }
@@ -2562,7 +2684,9 @@ UbUtils::ForEachTrafficRecordViewInternal(
                 fieldEnd = line.size();
             }
 
-            SetTrafficRecordViewField(fieldCount,
+            NS_ABORT_MSG_IF(static_cast<size_t>(fieldCount) >= layout.fields.size(),
+                            filename << ':' << lineNumber << " has too many fields");
+            SetTrafficRecordViewField(layout.fields[fieldCount],
                                       std::string_view(line).substr(fieldStart,
                                                                     fieldEnd - fieldStart),
                                       record);
@@ -2573,9 +2697,8 @@ UbUtils::ForEachTrafficRecordViewInternal(
             }
             fieldStart = fieldEnd + 1;
         }
-        NS_ABORT_MSG_IF(
-            fieldCount != 9 && fieldCount != 11,
-            "traffic.csv row must have 9 base fields or 11 fields with srcEntityId,dstEntityId");
+        ValidateTrafficCsvRow(layout, fieldCount, record, filename, lineNumber);
+        record.hasPorts = record.sourcePort != UINT32_MAX;
         callback(record);
     }
     file.close();

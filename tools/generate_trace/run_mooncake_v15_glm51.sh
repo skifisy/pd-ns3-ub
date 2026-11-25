@@ -7,9 +7,10 @@ TRACE="/mnt/liujiaxin/scratch/mooncake_agent_v14_pipeline_tp_logical_dspread_10m
 # DAG_SCRIPT="/mnt/yuhaoze/tools-2/mooncake_trace_to_dag_v15.py"
 # TRAFFIC_SCRIPT="/mnt/yuhaoze/tools-2/mooncake_dag_to_traffic_v15.py"
 
-CONFIG="/mnt/yuhaoze/pd-ns3-ub-main/tools/mooncake_pd_config_v15_glm51.json"
-DAG_SCRIPT="/mnt/yuhaoze/pd-ns3-ub-main/tools/mooncake_trace_to_dag_v15.py"
-TRAFFIC_SCRIPT="/mnt/yuhaoze/pd-ns3-ub-main/tools/mooncake_dag_to_traffic_v15.py"
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+CONFIG="${CONFIG:-${SCRIPT_DIR}/mooncake_pd_config_v15_glm51.json}"
+DAG_SCRIPT="${SCRIPT_DIR}/mooncake_trace_to_dag_v15.py"
+TRAFFIC_SCRIPT="${SCRIPT_DIR}/mooncake_dag_to_traffic_v15.py"
 
 OUT_DIR="/mnt/yuhaoze/pd-ns3-ub/ns-3-ub/scratch/mooncake_agent_v18_pipeline"
 WORK_DIR="${OUT_DIR}/traffic_work"

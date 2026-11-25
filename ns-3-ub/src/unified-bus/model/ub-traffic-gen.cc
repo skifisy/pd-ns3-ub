@@ -317,6 +317,9 @@ UbTrafficGen::ConvertToRuntimeTask(const TrafficRecord& record)
     task.dstEntityId = record.dstEntityId;
     task.hasSrcEntityId = record.hasSrcEntityId;
     task.hasDstEntityId = record.hasDstEntityId;
+    task.sourcePort = record.sourcePort;
+    task.destPort = record.destPort;
+    task.hasPorts = record.hasPorts;
     task.hasPhaseDependencies = !record.dependOnPhases.empty();
 
     return task;
@@ -342,6 +345,9 @@ UbTrafficGen::ConvertToRuntimeTask(const TrafficRecordView& record)
     task.dstEntityId = record.dstEntityId;
     task.hasSrcEntityId = record.hasSrcEntityId;
     task.hasDstEntityId = record.hasDstEntityId;
+    task.sourcePort = record.sourcePort;
+    task.destPort = record.destPort;
+    task.hasPorts = record.hasPorts;
     task.hasPhaseDependencies = !record.dependOnPhases.empty();
 
     return task;

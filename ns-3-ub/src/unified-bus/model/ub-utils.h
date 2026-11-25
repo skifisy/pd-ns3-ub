@@ -87,6 +87,11 @@ public:
     void ForEachTrafficRecordView(const std::string& filename,
                                   const std::function<void(const TrafficRecordView&)>& callback);
 
+    // Validate explicit physical endpoints for RTP URMA traffic (also used by direct callers).
+    static void ValidateTrafficPorts(uint32_t taskId, uint32_t sourceNode, uint32_t destNode,
+                                     uint32_t sourcePort, uint32_t destPort,
+                                     bool supportedTransport);
+
     // Pre-registers phase membership before streaming AddTask calls.
     void RegisterTrafficPhaseDependencies(const std::string& filename);
 

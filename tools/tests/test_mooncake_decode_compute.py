@@ -12,10 +12,10 @@ import tempfile
 import unittest
 
 TOOLS = Path(__file__).resolve().parents[1]
-SPEC = importlib.util.spec_from_file_location("mooncake_model_v7", TOOLS / "mooncake_trace_to_dag_v15.py")
+SPEC = importlib.util.spec_from_file_location("mooncake_model_v7", TOOLS / "generate_trace" / "mooncake_trace_to_dag_v15.py")
 MODULE = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(MODULE)
-CONFIG = json.loads((TOOLS / "mooncake_pd_config_v15_glm51.json").read_text())
+CONFIG = json.loads((TOOLS / "generate_trace" / "mooncake_pd_config_v15_glm51.json").read_text())
 
 
 def state(request=0, context=1024, token=1, group=0):
@@ -157,10 +157,10 @@ class DecodeTraceTest(unittest.TestCase):
                     dict(request_id=1, timestamp=1, input_length=1536, output_length=3, hash_ids=["cached", "a", "a2"]),
                     dict(request_id=2, timestamp=1, input_length=2048, output_length=3, hash_ids=["cached", "b", "b2", "b3"])]
         cls.trace.write_text("".join(json.dumps(row) + "\n" for row in requests))
-        cls.run_command([TOOLS / "mooncake_trace_to_dag_v15.py", cls.trace, "--config", cls.config,
+        cls.run_command([TOOLS / "generate_trace" / "mooncake_trace_to_dag_v15.py", cls.trace, "--config", cls.config,
                          "--warmup-requests", "1", "--out-dir", cls.root, "--no-progress",
                          "--decode-compute-detail", "layer"])
-        cls.run_command([TOOLS / "mooncake_dag_to_traffic_v15.py", cls.root / "task_dag.csv",
+        cls.run_command([TOOLS / "generate_trace" / "mooncake_dag_to_traffic_v15.py", cls.root / "task_dag.csv",
                          "--out-dir", cls.root, "--mapping-output", cls.root / "mapping.csv",
                          "--summary-output", cls.root / "traffic_summary.json", "--no-progress"])
 
@@ -208,7 +208,7 @@ class DecodeTraceTest(unittest.TestCase):
         self.assertIn("decode_compute.csv", dag_summary["outputs"])
 
     def test_fixed_duration_cli_conflicts_with_flops(self):
-        result = self.run_command([TOOLS / "mooncake_trace_to_dag_v15.py", self.trace,
+        result = self.run_command([TOOLS / "generate_trace" / "mooncake_trace_to_dag_v15.py", self.trace,
                                    "--config", self.config, "--decode-ms-per-token", "10"], expected=1)
         self.assertIn("conflicts", result.stderr)
 
@@ -245,7 +245,7 @@ class DecodeTraceTest(unittest.TestCase):
 
     def test_default_detail_is_one_row_per_batch(self):
         output = self.root / "no-layer-detail"
-        self.run_command([TOOLS / "mooncake_trace_to_dag_v15.py", self.trace, "--config", self.config,
+        self.run_command([TOOLS / "generate_trace" / "mooncake_trace_to_dag_v15.py", self.trace, "--config", self.config,
                           "--warmup-requests", "1", "--out-dir", output, "--no-progress"])
         self.assertFalse((output / "decode_layer_compute.csv").exists())
         self.assertEqual(len(read_csv(output / "decode_compute.csv")), 4)
@@ -262,9 +262,9 @@ class DecodeFinalWriteBoundaryTest(unittest.TestCase):
         trace = root / "trace.jsonl"
         trace.write_text(json.dumps(dict(request_id=9, timestamp=0, input_length=1,
                                         output_length=tokens, hash_ids=["input"])) + "\n")
-        DecodeTraceTest.run_command([TOOLS / "mooncake_trace_to_dag_v15.py", trace,
+        DecodeTraceTest.run_command([TOOLS / "generate_trace" / "mooncake_trace_to_dag_v15.py", trace,
                                     "--config", config, "--out-dir", root, "--dag-detail", "full", "--no-progress"])
-        DecodeTraceTest.run_command([TOOLS / "mooncake_dag_to_traffic_v15.py", root / "task_dag.csv",
+        DecodeTraceTest.run_command([TOOLS / "generate_trace" / "mooncake_dag_to_traffic_v15.py", root / "task_dag.csv",
                                     "--out-dir", root, "--mapping-output", root / "mapping.csv",
                                     "--data-size-divisor", divisor, "--no-progress"])
         return MODULE.Model(cfg)
@@ -291,7 +291,8 @@ class DecodeFinalWriteBoundaryTest(unittest.TestCase):
                             and row["taskId"] in {m["taskId"] for m in mapping}))
         sizes = []
         members = json.loads(write["tp_members"])
-        self.assertEqual(len({tuple(member[3:5]) for member in members}), 1)
+        self.assertEqual(len({member[3] for member in members}), 1)
+        self.assertEqual(len({member[4] for member in members}), len(members))
         for rank in range(model.d_tp_degree):
             expected = tokens * sum(MODULE.split_exact(model.layer_bytes(model.kv_bytes_per_token, layer),
                                                        model.d_tp_degree, rank)[1]
@@ -305,6 +306,10 @@ class DecodeFinalWriteBoundaryTest(unittest.TestCase):
                 chunks.append((chunk + divisor - 1) // divisor)
                 remaining -= chunk
             rows = [row for row in mapping if int(row["tp_rank"]) == rank]
+            for row in rows:
+                native = traffic[row["taskId"]]
+                self.assertEqual(int(native["sourcePort"]), member[2])
+                self.assertEqual(int(native["destPort"]), member[4])
             self.assertEqual([int(traffic[row["taskId"]]["dataSize(Byte)"]) for row in rows], chunks)
             self.assertTrue(all(row["delay"] == "0us" for row in rows))
             sizes.extend(chunks)
